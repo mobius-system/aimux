@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aimux"
+version = "0.1.0"
+description = "AI-agent-friendly tmux wrapper: unified local + remote sessions, single-pane sessions, safe primitives."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "aimux" }]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.scripts]
+aimux = "aimux.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aimux"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/aimux/aimux.conf" = "aimux/aimux.conf"
