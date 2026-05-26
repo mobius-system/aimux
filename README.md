@@ -39,6 +39,7 @@ python3 -m pytest
 ```
 
 For the issue server `root@localhost:8824`, see the human-readable manual test
-in `tests/manual_localhost_8824_remote.md`.
+in `tests/manual_localhost_8824_remote.md`. To verify a remote session by
+listing files on the target host, see `tests/remote_test.md`.
 
 Final command surface: 7 session commands + 3 remote commands. See `design.md`.
