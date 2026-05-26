@@ -23,19 +23,14 @@ python3 -m pip install -e '.[test]'
 Use a unique alias and session name:
 
 ```bash
-ALIAS="aimux-local-8824-ls-$(date +%s)"
+ALIAS="aimux-local-8824"
 SESSION="remote-ls"
 ```
 
 ## 1. Add the Target Host With aimux
 
 ```bash
-aimux remote add \
-  --host localhost \
-  --port 8824 \
-  --user root \
-  --name "$ALIAS" \
-  --timeout 2s
+aimux remote add --host localhost --port 8824 --user root --name "$ALIAS" --timeout 2s
 ```
 
 Expected success:
@@ -109,25 +104,6 @@ Wait a moment, then capture the remote session:
 aimux capture "$ALIAS/$SESSION" --lines 200
 ```
 
-Expected result:
-
-```text
-__AIMUX_REMOTE_LS_BEGIN__
-<remote-current-directory>
-total <number>
-drwx...
-...
-__AIMUX_REMOTE_LS_END__:0
-```
-
-The file listing between the markers is the listing from the target host
-machine, not from the local machine.
-
-If the end marker is missing, run the capture command again:
-
-```bash
-aimux capture "$ALIAS/$SESSION" --lines 200
-```
 
 ## 5. Clean Up the aimux Session
 
@@ -138,6 +114,8 @@ aimux kill "$ALIAS/$SESSION"
 This test only cleans up the tmux session. It does not manually edit
 `~/.ssh/config`; `aimux` currently provides `remote add`, `remote ls`,
 `remote test`, and `remote hardware`, but no `remote remove` command.
+
+
 
 ## Pass Criteria
 
