@@ -115,3 +115,105 @@ def test_send_file_gitignore_skips_ignored_files(tmp_path):
     assert [entry.remote for entry in plan.files] == ["/srv/payload/keep.txt"]
     assert plan.skipped_files == 2
     assert "/srv/payload/ignored_dir" not in plan.dirs
+
+
+def test_send_files_uploads_multiple_paths_to_remote_directory(tmp_path, monkeypatch):
+    config = _write_ssh_config(tmp_path, "Host worker\n    HostName localhost\n")
+    monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
+    monkeypatch.setattr(transfer.shutil, "which", lambda name: "/usr/bin/sftp" if name == "sftp" else None)
+
+    first = tmp_path / "a.txt"
+    second = tmp_path / "b.txt"
+    first.write_text("a\n", encoding="utf-8")
+    second.write_text("b\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def fake_run(args, *, input, capture_output, text):
+        seen["args"] = args
+        seen["batch"] = input
+        assert capture_output is True
+        assert text is True
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(transfer.subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(app, ["send_files", "worker", "/tmp/out", str(first), str(second)])
+
+    assert result.exit_code == EXIT_OK
+    assert "uploaded 2 file(s) to worker:/tmp/out" in result.stdout
+    assert seen["args"] == ["sftp", "-o", "BatchMode=yes", "-b", "-", "worker"]
+    assert seen["batch"] == (
+        f'-mkdir "/tmp"\n'
+        f'-mkdir "/tmp/out"\n'
+        f'put "{first}" "/tmp/out/a.txt"\n'
+        f'put "{second}" "/tmp/out/b.txt"\n'
+    )
+
+
+def test_send_files_maps_directories_under_their_basename(tmp_path):
+    project = tmp_path / "project"
+    nested = project / "nested"
+    nested.mkdir(parents=True)
+    (project / "root.txt").write_text("root\n", encoding="utf-8")
+    (nested / "child.txt").write_text("child\n", encoding="utf-8")
+
+    plan = transfer.build_send_files_plan([project], "/srv/uploads")
+
+    assert [entry.remote for entry in plan.files] == [
+        "/srv/uploads/project/nested/child.txt",
+        "/srv/uploads/project/root.txt",
+    ]
+    assert "/srv/uploads/project" in plan.dirs
+    assert "/srv/uploads/project/nested" in plan.dirs
+
+
+def test_send_files_rejects_duplicate_remote_destinations(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "same.txt").write_text("left\n", encoding="utf-8")
+    (right / "same.txt").write_text("right\n", encoding="utf-8")
+
+    with pytest.raises(transfer.TransferError, match="multiple local files map"):
+        transfer.build_send_files_plan([left / "same.txt", right / "same.txt"], "/srv/uploads")
+
+
+def test_get_files_downloads_multiple_remote_paths_to_local_directory(tmp_path, monkeypatch):
+    config = _write_ssh_config(tmp_path, "Host worker\n    HostName localhost\n")
+    monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
+    monkeypatch.setattr(transfer.shutil, "which", lambda name: "/usr/bin/sftp" if name == "sftp" else None)
+
+    destination = tmp_path / "downloads"
+    seen: dict[str, object] = {}
+
+    def fake_run(args, *, input, capture_output, text):
+        seen["args"] = args
+        seen["batch"] = input
+        assert capture_output is True
+        assert text is True
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(transfer.subprocess, "run", fake_run)
+
+    result = CliRunner().invoke(
+        app,
+        ["get_files", "worker", str(destination), "/var/log/app.log", "/srv/data/"],
+    )
+
+    assert result.exit_code == EXIT_OK
+    assert destination.is_dir()
+    assert f"downloaded 2 path(s) from worker to {destination}" in result.stdout
+    assert seen["args"] == ["sftp", "-o", "BatchMode=yes", "-b", "-", "worker"]
+    assert seen["batch"] == (
+        f'get -r "/var/log/app.log" "{destination}/app.log"\n'
+        f'get -r "/srv/data/" "{destination}/data"\n'
+    )
+
+
+def test_get_files_rejects_local_destination_file(tmp_path):
+    destination = tmp_path / "download"
+    destination.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(transfer.TransferError, match="local destination is not a directory"):
+        transfer.build_get_files_plan(["/tmp/file.txt"], destination)

@@ -25,7 +25,7 @@ aimux 不替换 tmux，**代理** tmux：把"对 agent 友好"的命令映射成
 | Agent-first | 输出可机读，命令幂等，错误码语义清晰 |
 | 本地远程透明 | 同一套命令操作两类会话，区别只在 location 标签 |
 | 极简模型 | 一 session 一 pane；id 就是 `<location>/<name>`，不可变 |
-| 极简表面 | 7 个会话子命令 + 1 个文件传输命令 + 4 个 `remote` 子命令；每个命令的语义可在一句话内说清 |
+| 极简表面 | 7 个会话子命令 + 3 个文件传输命令 + 4 个 `remote` 子命令；每个命令的语义可在一句话内说清 |
 | 零持久化状态 | 无 registry、无配置文件、无审计日志；元数据全部由 tmux 持有 |
 | 安全围栏 | 禁用 kill-server，独占 socket，解绑分裂/新建 window 的快捷键 |
 | 极简实现 | Python + stdlib + typer；调用 `tmux` 子进程 |
@@ -149,7 +149,7 @@ aimux 不暴露 `set-option` 子命令，因此这些元数据在 CLI 表面不�
 
 ## 5. 命令设计
 
-aimux 总共 **7 个会话子命令** + **1 个文件传输命令** + **4 个远端主机子命令**：
+aimux 总共 **7 个会话子命令** + **3 个文件传输命令** + **4 个远端主机子命令**：
 
 ```
 aimux ls                            列出会话
@@ -157,6 +157,8 @@ aimux new                           创建会话
 aimux attach                        attach（仅限人类）
 aimux send-keys                     发送按键（不修改用户输入）
 aimux send_file                     用 sftp 上传本地文件/目录到 remote
+aimux send_files                    用 sftp 批量上传本地文件/目录到 remote 目录
+aimux get_files                     用 sftp 批量下载 remote 文件/目录到本地目录
 aimux capture                       抓取 pane 内容
 aimux kill                          销毁会话
 aimux wait-last-command-complete    阻塞等待命令完成（仅本地，基于 pane 前台进程）
@@ -988,6 +990,8 @@ $ aimux new --remote=worker-2 --name=task-1
 | `aimux attach <id>` | attach 到 session | ❌ **仅限人类** |
 | `aimux send-keys <id> [tmux-flags] -- <keys...>` | 发送按键（**执行入口**）；行为与 `tmux send-keys` 完全一致，支持 `-F/-H/-K/-l/-M/-R/-X/-N` | ✅ |
 | `aimux send_file <local> <remote> <remote-path> [--gitignore]` | 用 sftp 上传本地文件或目录到 ssh-config host；`--gitignore` 会跳过被 git ignore 的文件 | ✅ |
+| `aimux send_files <remote> <remote-dir> <local>... [--gitignore]` | 用一次 sftp batch 上传多个本地文件或目录到 ssh-config host 的远端目录；目录会放在远端目录下自己的 basename 中 | ✅ |
+| `aimux get_files <remote> <local-dir> <remote-path>...` | 用一次 sftp batch 下载多个远端文件或目录到本地目录；下载目标名来自远端路径 basename | ✅ |
 | `aimux capture <id> --lines=<N>` | 抓取 pane 最后 N 行（必填） | ✅ |
 | `aimux kill <id>` | 销毁 session（**一次只允许 kill 一个**，不支持通配符/批量） | ✅ |
 | `aimux wait-last-command-complete <id> --timeout=<dur> [--print-lines=<N>]` | 阻塞等待命令完成（基于 `pane_current_command`，**仅本地 session**）；`--print-lines` 完成后顺带打印最后 N 行 | ✅ |
@@ -1025,7 +1029,7 @@ aimux 的最终形态来自一系列简化决策：
 | 自检 | `aimux doctor` | 删除 | 错误自然暴露即可 |
 | attach | 通用命令 | 标注"仅限人类" | agent 应只用 send-keys + capture |
 
-最终：**7 个会话子命令 + 1 个文件传输命令 + 4 个 remote 子命令、0 个 aimux 自有状态文件、1 个 tmux socket**。`remote add` 会写 `~/.ssh/config`（且仅追加），那是用户的文件，不是 aimux 的状态。命令完成检测靠 tmux 自带的 `pane_current_command`，不引入任何持久化文件。
+最终：**7 个会话子命令 + 3 个文件传输命令 + 4 个 remote 子命令、0 个 aimux 自有状态文件、1 个 tmux socket**。`remote add` 会写 `~/.ssh/config`（且仅追加），那是用户的文件，不是 aimux 的状态。命令完成检测靠 tmux 自带的 `pane_current_command`，不引入任何持久化文件。
 
 ---
 

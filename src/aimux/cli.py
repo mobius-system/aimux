@@ -229,6 +229,16 @@ def cmd_send_keys(
 
 # ---------- send_file ----------
 
+def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> None:
+    status = ssh_mod._classify(e.returncode, "\n".join([e.stderr, e.stdout]))
+    err(f"error: sftp {action} to {remote!r} failed: {e}")
+    if status == "auth-required":
+        raise typer.Exit(EXIT_AUTH_REQUIRED)
+    if status == "unreachable":
+        raise typer.Exit(EXIT_SSH_UNREACHABLE)
+    raise typer.Exit(EXIT_USER_ERROR)
+
+
 @app.command("send_file", help="Upload a local file or directory to an SSH host using sftp.")
 def cmd_send_file(
     local_path: Annotated[str, typer.Argument(help="Local file or directory to upload.")],
@@ -246,13 +256,7 @@ def cmd_send_file(
     try:
         result = transfer.send_path(remote, local_path, remote_path, gitignore=gitignore)
     except transfer.SftpUploadError as e:
-        status = ssh_mod._classify(e.returncode, "\n".join([e.stderr, e.stdout]))
-        err(f"error: sftp upload to {remote!r} failed: {e}")
-        if status == "auth-required":
-            raise typer.Exit(EXIT_AUTH_REQUIRED)
-        if status == "unreachable":
-            raise typer.Exit(EXIT_SSH_UNREACHABLE)
-        raise typer.Exit(EXIT_USER_ERROR)
+        _classify_and_exit_sftp(remote, "upload", e)
     except transfer.TransferError as e:
         err(f"error: {e}")
         raise typer.Exit(EXIT_USER_ERROR)
@@ -260,6 +264,58 @@ def cmd_send_file(
     print(f"uploaded {result.uploaded_files} file(s) to {remote}:{remote_path}")
     if result.skipped_files:
         print(f"skipped {result.skipped_files} gitignored file(s)")
+
+
+# ---------- send_files ----------
+
+@app.command("send_files", help="Upload multiple local files or directories to an SSH host using sftp.")
+def cmd_send_files(
+    remote: Annotated[str, typer.Argument(help="SSH host name from ~/.ssh/config.")],
+    remote_path: Annotated[str, typer.Argument(help="Destination directory on the remote host.")],
+    local_paths: Annotated[list[str], typer.Argument(help="Local files or directories to upload.")],
+    gitignore: Annotated[
+        bool,
+        typer.Option("--gitignore", help="Skip files ignored by git ignore rules when uploading."),
+    ] = False,
+):
+    if not ssh_mod.host_exists(remote):
+        err(f"error: host {remote!r} not found in ~/.ssh/config")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    try:
+        result = transfer.send_paths(remote, local_paths, remote_path, gitignore=gitignore)
+    except transfer.SftpUploadError as e:
+        _classify_and_exit_sftp(remote, "upload", e)
+    except transfer.TransferError as e:
+        err(f"error: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    print(f"uploaded {result.uploaded_files} file(s) to {remote}:{remote_path}")
+    if result.skipped_files:
+        print(f"skipped {result.skipped_files} gitignored file(s)")
+
+
+# ---------- get_files ----------
+
+@app.command("get_files", help="Download multiple remote files or directories from an SSH host using sftp.")
+def cmd_get_files(
+    remote: Annotated[str, typer.Argument(help="SSH host name from ~/.ssh/config.")],
+    local_dir: Annotated[str, typer.Argument(help="Local destination directory.")],
+    remote_paths: Annotated[list[str], typer.Argument(help="Remote files or directories to download.")],
+):
+    if not ssh_mod.host_exists(remote):
+        err(f"error: host {remote!r} not found in ~/.ssh/config")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    try:
+        result = transfer.get_paths(remote, remote_paths, local_dir)
+    except transfer.SftpDownloadError as e:
+        _classify_and_exit_sftp(remote, "download", e)
+    except transfer.TransferError as e:
+        err(f"error: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    print(f"downloaded {result.downloaded_paths} path(s) from {remote} to {result.plan.local_dir}")
 
 
 # ---------- capture ----------

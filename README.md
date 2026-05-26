@@ -23,6 +23,8 @@ aimux ls
 
 # upload a file or directory to an SSH host via sftp
 aimux send_file ./dist worker /tmp/dist --gitignore
+aimux send_files worker /tmp/upload ./dist ./README.md --gitignore
+aimux get_files worker ./downloads /tmp/upload/README.md /tmp/upload/dist
 
 # done
 aimux kill local/dev
@@ -45,5 +47,5 @@ For the issue server `root@localhost:8824`, see the human-readable manual test
 in `tests/manual_localhost_8824_remote.md`. To verify a remote session by
 listing files on the target host, see `tests/remote_test.md`.
 
-Command surface: session commands, `send_file`, and remote host commands. See
+Command surface: session commands, file transfer commands, and remote host commands. See
 `design.md`.
