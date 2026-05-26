@@ -3,8 +3,9 @@ name: aimux
 description: |
     Use aimux when you need a long-lived shell session — a REPL, a build/server you
     want to interact with across multiple commands, or anything running on a remote
-    SSH host. Use bash directly for one-shot commands. aimux gives you 6 session
-    primitives + 3 remote-host helpers; this skill explains how to combine them.
+    SSH host. Use bash directly for one-shot commands. aimux gives you session
+    primitives, file-transfer helpers, and remote-host helpers; this skill
+    explains how to combine them.
 ---
 
 
@@ -27,6 +28,8 @@ ls                          List all aimux sessions.
 new                         Create a new session.
 attach                      Attach to a session. ⚠️  Human use only — agents should use send-keys + capture.
 send-keys                   Send keys to a session. Behaves exactly like 'tmux send-keys': supports -F/-H/-K/-l/-M/-R/-X/-N <count>. Pass 'Enter' as a key to submit a line.     
+send_files                  Upload multiple local files or directories to an SSH host using sftp.
+get_files                   Download multiple remote files or directories from an SSH host using sftp.
 capture                     Capture pane output (last N lines).
 kill                        Destroy a single session. Does not accept wildcards or batch.
 wait-last-command-complete  Block until the pane's foreground process is back at a shell. Local sessions only.
@@ -68,7 +71,22 @@ aimux send-keys "local-8824/testsession" -- 'ls -la' Enter
 aimux capture "local-8824/testsession" --lines 200
 ```
 
-3. clean up 
+3. Upload and download files.
+
+```bash
+# aimux send_files REMOTE REMOTE_DIR LOCAL_PATH... [--gitignore]
+# aimux get_files REMOTE LOCAL_DIR REMOTE_PATH...
+aimux send_files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests
+aimux get_files local-8824 /home/fuqingxu/cc-workspace/aimux /tmp/upload
+```
+
+Use `--gitignore` on upload when ignored files should be skipped:
+
+```bash
+aimux send_files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests --gitignore
+```
+
+4. Clean up.
 
 ```bash
 aimux kill "local-8824/testsession"
