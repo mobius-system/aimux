@@ -12,7 +12,7 @@
 2. **元数据存在 tmux user options 里**（`@aimux-location`、`@aimux-host` 等）—— 没有 registry，没有状态同步
 3. **一 session 一 window 一 pane** —— 不暴露 window/pane 管理；server 配置层解绑分屏快捷键
 4. **session 不可变** —— 创建后名字不能改；执行命令只能用 `send-keys`，观察只能用 `capture`，没有任何"高层封装"
-5. **7 个命令足矣**
+5. **少量命令足矣**
 
 aimux 不替换 tmux，**代理** tmux：把"对 agent 友好"的命令映射成等价的 `tmux -L aimux ...` 调用。
 
@@ -25,7 +25,7 @@ aimux 不替换 tmux，**代理** tmux：把"对 agent 友好"的命令映射成
 | Agent-first | 输出可机读，命令幂等，错误码语义清晰 |
 | 本地远程透明 | 同一套命令操作两类会话，区别只在 location 标签 |
 | 极简模型 | 一 session 一 pane；id 就是 `<location>/<name>`，不可变 |
-| 极简表面 | 7 个会话子命令 + 3 个 `remote` 子命令；每个命令的语义可在一句话内说清 |
+| 极简表面 | 7 个会话子命令 + 1 个文件传输命令 + 4 个 `remote` 子命令；每个命令的语义可在一句话内说清 |
 | 零持久化状态 | 无 registry、无配置文件、无审计日志；元数据全部由 tmux 持有 |
 | 安全围栏 | 禁用 kill-server，独占 socket，解绑分裂/新建 window 的快捷键 |
 | 极简实现 | Python + stdlib + typer；调用 `tmux` 子进程 |
@@ -149,13 +149,14 @@ aimux 不暴露 `set-option` 子命令，因此这些元数据在 CLI 表面不�
 
 ## 5. 命令设计
 
-aimux 总共 **7 个会话子命令** + **3 个远端主机子命令**：
+aimux 总共 **7 个会话子命令** + **1 个文件传输命令** + **4 个远端主机子命令**：
 
 ```
 aimux ls                            列出会话
 aimux new                           创建会话
 aimux attach                        attach（仅限人类）
 aimux send-keys                     发送按键（不修改用户输入）
+aimux send_file                     用 sftp 上传本地文件/目录到 remote
 aimux capture                       抓取 pane 内容
 aimux kill                          销毁会话
 aimux wait-last-command-complete    阻塞等待命令完成（仅本地，基于 pane 前台进程）
@@ -986,6 +987,7 @@ $ aimux new --remote=worker-2 --name=task-1
 | `aimux new --name=<n> [--remote=<host>] [--output-sync-to-file=<path>]` | 创建 session：不带 `--remote` 是本地，带 `--remote=<host>` 是远程；`--output-sync-to-file` 启用 pipe-pane 实时录到文件 | ✅ |
 | `aimux attach <id>` | attach 到 session | ❌ **仅限人类** |
 | `aimux send-keys <id> [tmux-flags] -- <keys...>` | 发送按键（**执行入口**）；行为与 `tmux send-keys` 完全一致，支持 `-F/-H/-K/-l/-M/-R/-X/-N` | ✅ |
+| `aimux send_file <local> <remote> <remote-path> [--gitignore]` | 用 sftp 上传本地文件或目录到 ssh-config host；`--gitignore` 会跳过被 git ignore 的文件 | ✅ |
 | `aimux capture <id> --lines=<N>` | 抓取 pane 最后 N 行（必填） | ✅ |
 | `aimux kill <id>` | 销毁 session（**一次只允许 kill 一个**，不支持通配符/批量） | ✅ |
 | `aimux wait-last-command-complete <id> --timeout=<dur> [--print-lines=<N>]` | 阻塞等待命令完成（基于 `pane_current_command`，**仅本地 session**）；`--print-lines` 完成后顺带打印最后 N 行 | ✅ |
@@ -996,6 +998,7 @@ $ aimux new --remote=worker-2 --name=task-1
 |---|---|---|
 | `aimux remote ls` | 枚举 ssh-config 中所有 host 并并行探测可达性 | ✅ |
 | `aimux remote test <name>` | 探测单个 ssh-config host | ✅ |
+| `aimux remote hardware <name>` | 探测主机硬件（GPU 数量/型号、CPU 数量、内存大小） | ✅ |
 | `aimux remote add --host=<h> --port=<p> --user=<u> [--name=<n>]` | 探测通过后将新 host 追加到 `~/.ssh/config` | ✅ |
 
 被有意删除的命令（不暴露）：`run`、`rename`、`respawn`、`has`、`new-window`、`list-windows`、`select-window`、`rename-window`、`kill-window`、`split-window`、`list-panes`、`select-pane`、`kill-pane`、`kill-server`、`hosts`（被 `remote ls` 取代）、`prune`、`set-option`、`history`、`log`、`config`、`doctor`。
@@ -1022,7 +1025,7 @@ aimux 的最终形态来自一系列简化决策：
 | 自检 | `aimux doctor` | 删除 | 错误自然暴露即可 |
 | attach | 通用命令 | 标注"仅限人类" | agent 应只用 send-keys + capture |
 
-最终：**7 个会话子命令 + 3 个 remote 子命令、0 个 aimux 自有状态文件、1 个 tmux socket**。`remote add` 会写 `~/.ssh/config`（且仅追加），那是用户的文件，不是 aimux 的状态。命令完成检测靠 tmux 自带的 `pane_current_command`，不引入任何持久化文件。
+最终：**7 个会话子命令 + 1 个文件传输命令 + 4 个 remote 子命令、0 个 aimux 自有状态文件、1 个 tmux socket**。`remote add` 会写 `~/.ssh/config`（且仅追加），那是用户的文件，不是 aimux 的状态。命令完成检测靠 tmux 自带的 `pane_current_command`，不引入任何持久化文件。
 
 ---
 
