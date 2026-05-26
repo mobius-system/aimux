@@ -217,7 +217,7 @@ aimux new --name=<name> [--remote=<host>] [--cwd=<dir>] [--cmd=<initial-cmd>] \
 行为：
 - 不带 `--remote` → 本地：`tmux -L aimux new-session -d -s <name> [-c <cwd>] [<cmd>]`
 - 带 `--remote=<host>`：
-  1. `ssh -G <host>` 校验配置可解析（不实际连接）
+  1. 校验 `<host>` 是 `~/.ssh/config` 中的具体 Host，并用 `ssh -G <host>` 校验配置可解析（不实际连接）
   2. 构造 ssh 启动命令（见 §7.3）
   3. `tmux -L aimux new-session -d -s <name> "<ssh-cmd>"`
   4. 设置 user options：`@aimux-location`、`@aimux-host`、`@aimux-created-at`、`@aimux-created-by`

@@ -8,8 +8,14 @@ pytest.importorskip("typer")
 from typer.testing import CliRunner
 
 from aimux import ssh as ssh_mod
+from aimux import tmux
 from aimux.cli import app
-from aimux.constants import EXIT_AUTH_REQUIRED, EXIT_OK, EXIT_USER_ERROR
+from aimux.constants import (
+    EXIT_AUTH_REQUIRED,
+    EXIT_OK,
+    EXIT_SSH_UNREACHABLE,
+    EXIT_USER_ERROR,
+)
 
 
 def _write_ssh_config(tmp_path, text: str = ""):
@@ -17,6 +23,13 @@ def _write_ssh_config(tmp_path, text: str = ""):
     path.parent.mkdir(parents=True)
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _combined_output(result) -> str:
+    try:
+        return result.output + result.stderr
+    except ValueError:
+        return result.output
 
 
 def test_remote_test_json_reports_auth_required(tmp_path, monkeypatch):
@@ -51,6 +64,61 @@ def test_remote_test_json_rejects_missing_host(tmp_path, monkeypatch):
     payload = json.loads(result.stdout)
     assert payload["error"]["kind"] == "host_not_found"
     assert "missing" in payload["error"]["message"]
+
+
+def test_new_remote_missing_host_fails_before_tmux_create(tmp_path, monkeypatch):
+    config = _write_ssh_config(tmp_path)
+    monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
+    monkeypatch.setattr(tmux, "has_session", lambda name: False)
+    monkeypatch.setattr(
+        tmux,
+        "new_session",
+        lambda *args, **kwargs: pytest.fail("tmux.new_session should not run for a missing remote host"),
+    )
+
+    result = CliRunner().invoke(app, ["new", "--remote", "missing", "--name", "task"])
+
+    combined_output = _combined_output(result)
+    assert result.exit_code == EXIT_USER_ERROR
+    assert "host 'missing' not found in ~/.ssh/config" in combined_output
+    assert "tmux failed" not in combined_output
+
+
+def test_new_remote_reuse_returns_success_even_if_host_config_was_removed(tmp_path, monkeypatch):
+    config = _write_ssh_config(tmp_path)
+    monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
+    monkeypatch.setattr(tmux, "has_session", lambda name: True)
+    monkeypatch.setattr(
+        tmux,
+        "new_session",
+        lambda *args, **kwargs: pytest.fail("tmux.new_session should not run when --reuse matches"),
+    )
+
+    result = CliRunner().invoke(app, ["new", "--remote", "missing", "--name", "task", "--reuse"])
+
+    assert result.exit_code == EXIT_OK
+    assert result.output == ""
+
+
+def test_new_remote_session_that_exits_immediately_reports_ssh_error(tmp_path, monkeypatch):
+    config = _write_ssh_config(tmp_path, "Host bad\n    HostName missing.invalid\n")
+    monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
+    monkeypatch.setattr(ssh_mod, "is_resolvable", lambda host: True)
+    monkeypatch.setattr(tmux, "has_session", lambda name: False)
+    monkeypatch.setattr(tmux, "new_session", lambda *args, **kwargs: None)
+
+    def fail_set_option(*args, **kwargs):
+        raise tmux.TmuxError(1, "no server running on /tmp/tmux-test/aimux", ["tmux"])
+
+    monkeypatch.setattr(tmux, "set_option", fail_set_option)
+
+    result = CliRunner().invoke(app, ["new", "--remote", "bad", "--name", "task"])
+
+    combined_output = _combined_output(result)
+    assert result.exit_code == EXIT_SSH_UNREACHABLE
+    assert "remote session 'bad'/'task' exited before aimux could initialize it" in combined_output
+    assert "aimux remote test bad" in combined_output
+    assert "tmux failed" not in combined_output
 
 
 def test_remote_add_appends_localhost_8824_after_reachable_probe(tmp_path, monkeypatch):
@@ -124,6 +192,6 @@ def test_remote_add_does_not_append_when_probe_needs_auth(tmp_path, monkeypatch)
     )
 
     assert result.exit_code == EXIT_AUTH_REQUIRED
-    combined_output = result.output + getattr(result, "stderr", "")
+    combined_output = _combined_output(result)
     assert "auth-required" in combined_output
     assert not config.exists()
