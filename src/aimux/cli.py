@@ -57,6 +57,11 @@ def _actor() -> str:
     return os.environ.get("AIMUX_ACTOR") or os.environ.get("USER") or "unknown"
 
 
+def _tmux_target_gone(e: tmux.TmuxError) -> bool:
+    msg = e.stderr.lower()
+    return "no server running" in msg or "can't find session" in msg
+
+
 def _resolve_or_die(spec: str, *, json_mode: bool = False) -> session_mod.Session:
     try:
         return session_mod.resolve(spec)
@@ -118,35 +123,51 @@ def cmd_new(
         err(f"error: session {name!r} already exists")
         raise typer.Exit(EXIT_USER_ERROR)
 
-    if remote:
-        if not ssh_mod.is_resolvable(remote):
-            err(f"error: ssh host {remote!r} is not resolvable via ssh -G")
+    if remote and not ssh_mod.host_exists(remote):
+        err(f"error: host {remote!r} not found in ~/.ssh/config")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    try:
+        if remote:
+            if not ssh_mod.is_resolvable(remote):
+                err(f"error: ssh host {remote!r} is not resolvable via ssh -G")
+                raise typer.Exit(EXIT_SSH_UNREACHABLE)
+            launch = ssh_mod.build_remote_launch(remote, cwd=cwd, cmd=cmd)
+            tmux.new_session(name, cwd=None, command=launch)
+            location = remote
+            host_val = remote
+        else:
+            tmux.new_session(name, cwd=cwd, command=cmd)
+            location = "local"
+            host_val = ""
+
+        tmux.set_option(name, OPT_LOCATION, location)
+        tmux.set_option(name, OPT_HOST, host_val)
+        tmux.set_option(name, OPT_CREATED_AT, _now_iso())
+        tmux.set_option(name, OPT_CREATED_BY, _actor())
+
+        if output_sync_to_file:
+            path = Path(output_sync_to_file).expanduser().resolve()
+            if not path.parent.exists():
+                err(f"error: parent directory does not exist: {path.parent}")
+                # session was created — keep it; user can kill if they want a clean slate
+                raise typer.Exit(EXIT_USER_ERROR)
+            # Use absolute path quoted via shlex for the pipe command.
+            import shlex
+            pipe_cmd = f"cat >> {shlex.quote(str(path))}"
+            tmux.pipe_pane(name, pipe_cmd)
+            tmux.set_option(name, OPT_OUTPUT_SYNC_FILE, str(path))
+    except tmux.TmuxError as e:
+        if remote and _tmux_target_gone(e):
+            err(
+                f"error: remote session {remote!r}/{name!r} exited before aimux could initialize it; "
+                f"run 'aimux remote test {remote}' to check SSH reachability"
+            )
             raise typer.Exit(EXIT_SSH_UNREACHABLE)
-        launch = ssh_mod.build_remote_launch(remote, cwd=cwd, cmd=cmd)
-        tmux.new_session(name, cwd=None, command=launch)
-        location = remote
-        host_val = remote
-    else:
-        tmux.new_session(name, cwd=cwd, command=cmd)
-        location = "local"
-        host_val = ""
-
-    tmux.set_option(name, OPT_LOCATION, location)
-    tmux.set_option(name, OPT_HOST, host_val)
-    tmux.set_option(name, OPT_CREATED_AT, _now_iso())
-    tmux.set_option(name, OPT_CREATED_BY, _actor())
-
-    if output_sync_to_file:
-        path = Path(output_sync_to_file).expanduser().resolve()
-        if not path.parent.exists():
-            err(f"error: parent directory does not exist: {path.parent}")
-            # session was created — keep it; user can kill if they want a clean slate
+        if not remote and _tmux_target_gone(e):
+            err(f"error: session {name!r} exited before aimux could initialize it")
             raise typer.Exit(EXIT_USER_ERROR)
-        # Use absolute path quoted via shlex for the pipe command.
-        import shlex
-        pipe_cmd = f"cat >> {shlex.quote(str(path))}"
-        tmux.pipe_pane(name, pipe_cmd)
-        tmux.set_option(name, OPT_OUTPUT_SYNC_FILE, str(path))
+        raise
 
 
 # ---------- attach ----------
