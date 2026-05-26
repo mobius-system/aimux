@@ -28,50 +28,24 @@ def _combined_output(result) -> str:
         return result.output
 
 
-def test_send_file_uploads_file_with_sftp_batch(tmp_path, monkeypatch):
-    config = _write_ssh_config(tmp_path, "Host worker\n    HostName localhost\n")
-    monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
-    monkeypatch.setattr(transfer.shutil, "which", lambda name: "/usr/bin/sftp" if name == "sftp" else None)
-
-    local_file = tmp_path / "hello.txt"
-    local_file.write_text("hello\n", encoding="utf-8")
-    seen: dict[str, object] = {}
-
-    def fake_run(args, *, input, capture_output, text):
-        seen["args"] = args
-        seen["batch"] = input
-        assert capture_output is True
-        assert text is True
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(transfer.subprocess, "run", fake_run)
-
-    result = CliRunner().invoke(app, ["send_file", str(local_file), "worker", "/tmp/out.txt"])
-
-    assert result.exit_code == EXIT_OK
-    assert "uploaded 1 file(s) to worker:/tmp/out.txt" in result.stdout
-    assert seen["args"] == ["sftp", "-o", "BatchMode=yes", "-b", "-", "worker"]
-    assert seen["batch"] == f'-mkdir "/tmp"\nput "{local_file}" "/tmp/out.txt"\n'
-
-
-def test_send_file_rejects_missing_host_before_sftp(tmp_path, monkeypatch):
+def test_send_files_rejects_missing_host_before_sftp(tmp_path, monkeypatch):
     config = _write_ssh_config(tmp_path)
     monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
     local_file = tmp_path / "hello.txt"
     local_file.write_text("hello\n", encoding="utf-8")
     monkeypatch.setattr(
         transfer,
-        "send_path",
-        lambda *args, **kwargs: pytest.fail("send_path should not run for a missing host"),
+        "send_paths",
+        lambda *args, **kwargs: pytest.fail("send_paths should not run for a missing host"),
     )
 
-    result = CliRunner().invoke(app, ["send_file", str(local_file), "missing", "/tmp/out.txt"])
+    result = CliRunner().invoke(app, ["send_files", "missing", "/tmp/out", str(local_file)])
 
     assert result.exit_code == EXIT_USER_ERROR
     assert "host 'missing' not found in ~/.ssh/config" in _combined_output(result)
 
 
-def test_send_file_reports_auth_required_from_sftp(tmp_path, monkeypatch):
+def test_send_files_reports_auth_required_from_sftp(tmp_path, monkeypatch):
     config = _write_ssh_config(tmp_path, "Host worker\n    HostName localhost\n")
     monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
     monkeypatch.setattr(transfer.shutil, "which", lambda name: "/usr/bin/sftp" if name == "sftp" else None)
@@ -89,13 +63,13 @@ def test_send_file_reports_auth_required_from_sftp(tmp_path, monkeypatch):
 
     monkeypatch.setattr(transfer.subprocess, "run", fake_run)
 
-    result = CliRunner().invoke(app, ["send_file", str(local_file), "worker", "/tmp/out.txt"])
+    result = CliRunner().invoke(app, ["send_files", "worker", "/tmp/out", str(local_file)])
 
     assert result.exit_code == EXIT_AUTH_REQUIRED
     assert "sftp upload to 'worker' failed" in _combined_output(result)
 
 
-def test_send_file_gitignore_skips_ignored_files(tmp_path):
+def test_send_files_gitignore_skips_ignored_files(tmp_path):
     if shutil.which("git") is None:
         pytest.skip("git is not installed")
 
@@ -110,7 +84,7 @@ def test_send_file_gitignore_skips_ignored_files(tmp_path):
     ignored_dir.mkdir()
     (ignored_dir / "nested.txt").write_text("ignored\n", encoding="utf-8")
 
-    plan = transfer.build_send_plan(payload, "/srv/payload", gitignore=True)
+    plan = transfer.build_send_files_plan([payload], "/srv", gitignore=True)
 
     assert [entry.remote for entry in plan.files] == ["/srv/payload/keep.txt"]
     assert plan.skipped_files == 2

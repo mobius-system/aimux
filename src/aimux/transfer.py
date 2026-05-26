@@ -40,26 +40,6 @@ class UploadEntry:
 
 
 @dataclass(frozen=True)
-class SendPlan:
-    local_path: Path
-    remote_path: str
-    files: tuple[UploadEntry, ...]
-    dirs: tuple[str, ...]
-    skipped_files: int
-
-    @property
-    def has_work(self) -> bool:
-        return bool(self.files or self.dirs)
-
-
-@dataclass(frozen=True)
-class SendResult:
-    plan: SendPlan
-    uploaded_files: int
-    skipped_files: int
-
-
-@dataclass(frozen=True)
 class SendFilesPlan:
     local_paths: tuple[Path, ...]
     remote_path: str
@@ -102,18 +82,6 @@ class GetFilesResult:
     downloaded_paths: int
 
 
-def send_path(host: str, local_path: str | Path, remote_path: str, *, gitignore: bool = False) -> SendResult:
-    """Upload `local_path` to `host:remote_path` using sftp."""
-    plan = build_send_plan(local_path, remote_path, gitignore=gitignore)
-    if plan.has_work:
-        _run_sftp_batch(host, build_sftp_batch(plan), SftpUploadError)
-    return SendResult(
-        plan=plan,
-        uploaded_files=len(plan.files),
-        skipped_files=plan.skipped_files,
-    )
-
-
 def send_paths(
     host: str,
     local_paths: Iterable[str | Path],
@@ -138,53 +106,6 @@ def get_paths(host: str, remote_paths: Iterable[str], local_dir: str | Path) -> 
     if plan.has_work:
         _run_sftp_batch(host, build_get_files_batch(plan), SftpDownloadError)
     return GetFilesResult(plan=plan, downloaded_paths=len(plan.entries))
-
-
-def build_send_plan(local_path: str | Path, remote_path: str, *, gitignore: bool = False) -> SendPlan:
-    source = Path(local_path).expanduser()
-    if not source.exists():
-        raise TransferError(f"local path does not exist: {source}")
-    source = source.resolve()
-    _validate_sftp_path(str(source))
-    _validate_sftp_path(remote_path)
-    if not remote_path:
-        raise TransferError("remote path must not be empty")
-
-    if source.is_file():
-        files = _included_files(source, gitignore=gitignore)
-        skipped = 1 - len(files)
-        entries = tuple(
-            UploadEntry(local=file_path, remote=_remote_file_destination(remote_path, file_path.name))
-            for file_path in files
-        )
-        dirs = _collect_remote_dirs(_remote_parent(entry.remote) for entry in entries)
-        return SendPlan(source, remote_path, entries, dirs, skipped)
-
-    if not source.is_dir():
-        raise TransferError(f"local path is not a regular file or directory: {source}")
-
-    all_files = _all_files(source)
-    files = _included_files(source, gitignore=gitignore)
-    skipped = len(all_files) - len(files)
-
-    entries = tuple(
-        UploadEntry(
-            local=file_path,
-            remote=_remote_join(remote_path, file_path.relative_to(source).as_posix()),
-        )
-        for file_path in files
-    )
-
-    dirs: set[str] = set()
-    for remote_dir in _remote_dir_ancestors(remote_path):
-        dirs.add(remote_dir)
-    if not gitignore:
-        for local_dir in sorted(p for p in source.rglob("*") if p.is_dir()):
-            dirs.update(_remote_dir_ancestors(_remote_join(remote_path, local_dir.relative_to(source).as_posix())))
-    for entry in entries:
-        dirs.update(_remote_dir_ancestors(_remote_parent(entry.remote)))
-
-    return SendPlan(source, remote_path, entries, _sort_remote_dirs(dirs), skipped)
 
 
 def build_send_files_plan(
@@ -255,7 +176,7 @@ def build_get_files_plan(remote_paths: Iterable[str], local_dir: str | Path) -> 
     return GetFilesPlan(remotes, destination, tuple(entries))
 
 
-def build_sftp_batch(plan: SendPlan | SendFilesPlan) -> str:
+def build_sftp_batch(plan: SendFilesPlan) -> str:
     lines: list[str] = []
     for remote_dir in plan.dirs:
         lines.append(f"-mkdir {_sftp_quote(remote_dir)}")
@@ -362,12 +283,6 @@ def _git_root(source: Path) -> Path | None:
         return None
     root = result.stdout.strip()
     return Path(root).resolve() if root else None
-
-
-def _remote_file_destination(remote_path: str, local_name: str) -> str:
-    if remote_path.endswith("/"):
-        return _remote_join(remote_path, local_name)
-    return remote_path
 
 
 def _remote_join(base: str, rel: str) -> str:

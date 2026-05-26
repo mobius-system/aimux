@@ -21,8 +21,7 @@ aimux wait-last-command-complete local/dev --timeout=5m --print-lines=200
 # list everything
 aimux ls
 
-# upload a file or directory to an SSH host via sftp
-aimux send_file ./dist worker /tmp/dist --gitignore
+# upload files or directories to an SSH host via sftp
 aimux send_files worker /tmp/upload ./dist ./README.md --gitignore
 aimux get_files worker ./downloads /tmp/upload/README.md /tmp/upload/dist
 

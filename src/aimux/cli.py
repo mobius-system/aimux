@@ -227,7 +227,7 @@ def cmd_send_keys(
     tmux.send_keys(s.name, keys, flags=flags)
 
 
-# ---------- send_file ----------
+# ---------- file transfers ----------
 
 def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> None:
     status = ssh_mod._classify(e.returncode, "\n".join([e.stderr, e.stdout]))
@@ -238,35 +238,6 @@ def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> 
         raise typer.Exit(EXIT_SSH_UNREACHABLE)
     raise typer.Exit(EXIT_USER_ERROR)
 
-
-@app.command("send_file", help="Upload a local file or directory to an SSH host using sftp.")
-def cmd_send_file(
-    local_path: Annotated[str, typer.Argument(help="Local file or directory to upload.")],
-    remote: Annotated[str, typer.Argument(help="SSH host name from ~/.ssh/config.")],
-    remote_path: Annotated[str, typer.Argument(help="Destination path on the remote host.")],
-    gitignore: Annotated[
-        bool,
-        typer.Option("--gitignore", help="Skip files ignored by git ignore rules when uploading."),
-    ] = False,
-):
-    if not ssh_mod.host_exists(remote):
-        err(f"error: host {remote!r} not found in ~/.ssh/config")
-        raise typer.Exit(EXIT_USER_ERROR)
-
-    try:
-        result = transfer.send_path(remote, local_path, remote_path, gitignore=gitignore)
-    except transfer.SftpUploadError as e:
-        _classify_and_exit_sftp(remote, "upload", e)
-    except transfer.TransferError as e:
-        err(f"error: {e}")
-        raise typer.Exit(EXIT_USER_ERROR)
-
-    print(f"uploaded {result.uploaded_files} file(s) to {remote}:{remote_path}")
-    if result.skipped_files:
-        print(f"skipped {result.skipped_files} gitignored file(s)")
-
-
-# ---------- send_files ----------
 
 @app.command("send_files", help="Upload multiple local files or directories to an SSH host using sftp.")
 def cmd_send_files(
