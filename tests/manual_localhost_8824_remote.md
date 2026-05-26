@@ -1,22 +1,24 @@
 # Manual Test: localhost:8824 Remote Server
 
 This test is meant to be read and run by a human. It verifies the server
-described in the issue:
+described in the issue by using the public `aimux` commands only.
 
-```sshconfig
-Host <alias>
-    HostName localhost
-    Port 8824
-    User root
+Do not edit `~/.ssh/config` by hand for this test. `aimux remote add` is the
+only step that should add the SSH host entry.
+
+Target server:
+
+```text
+HostName localhost
+Port 8824
+User root
 ```
 
-The test has three parts:
+The test has two levels:
 
-1. A safe probe that does not modify your real `~/.ssh/config`.
-2. An `aimux remote` host-management check, only if SSH key authentication
-   works for `root@localhost:8824`.
-3. An end-to-end `aimux` remote-session check, only if SSH key authentication
-   works for `root@localhost:8824`.
+1. Host-management behavior with `aimux remote add` and `aimux remote test`.
+2. End-to-end remote session behavior with `aimux new --remote`, when SSH key
+   authentication works.
 
 ## Prerequisites
 
@@ -28,56 +30,19 @@ The test has three parts:
 python3 -m pip install -e '.[test]'
 ```
 
-If you already installed the package, you can skip that command.
+If `aimux` is already installed, you can skip that command.
 
-## Part 1: Safe SSH Probe
-
-This uses a temporary home directory so `StrictHostKeyChecking=accept-new` does
-not write to your real `~/.ssh/known_hosts`.
-
-```bash
-TEST_HOME="$(mktemp -d)"
-mkdir -p "$TEST_HOME/.ssh"
-chmod 700 "$TEST_HOME/.ssh"
-
-HOME="$TEST_HOME" ssh \
-  -o BatchMode=yes \
-  -o ConnectTimeout=2 \
-  -o StrictHostKeyChecking=accept-new \
-  -p 8824 \
-  root@localhost \
-  true
-
-echo "ssh exit code: $?"
-```
-
-Expected result:
-
-- Exit code `0`: the server is reachable and key authentication works.
-- Exit code `255` with `Permission denied`: the server is reachable, but key
-  authentication is not configured. This is enough to prove the endpoint exists,
-  but `aimux remote add` will refuse to append the host.
-- Exit code `255` with `Connection refused`, `timed out`, or `Could not resolve`:
-  the server is not reachable from this machine.
-
-Clean up:
-
-```bash
-rm -rf "$TEST_HOME"
-```
-
-## Part 2: Check aimux Remote Host Commands
-
-Run this part only when Part 1 exits with `0`.
-
-Use a unique alias so the test does not collide with existing SSH config hosts:
+Use a unique alias so repeated manual runs do not collide with existing SSH
+config hosts:
 
 ```bash
 ALIAS="aimux-local-8824-manual-$(date +%s)"
 SESSION="manual-remote-8824"
 ```
 
-Add the host through `aimux`:
+## Part 1: Add the Host Through aimux
+
+Run:
 
 ```bash
 aimux remote add \
@@ -86,36 +51,77 @@ aimux remote add \
   --user root \
   --name "$ALIAS" \
   --timeout 2s
+
+echo "remote add exit code: $?"
 ```
 
-Expected result:
+Expected result when the server is reachable and SSH key authentication works:
 
 ```text
 <alias>    reachable    rtt=<number>ms
 appended to ~/.ssh/config (backup: <path>)
+remote add exit code: 0
 ```
 
-If the command exits with code `4` and prints `auth-required`, key
-authentication is not configured. Configure SSH key login for
-`root@localhost:8824`, then rerun this part.
+Expected result when the server is reachable but SSH key authentication is not
+configured:
 
-Verify the host can be tested:
+```text
+error: probe to root@localhost:8824 got auth-required (network OK but no key auth)
+...
+remote add exit code: 4
+```
+
+That `auth-required` result is useful: it proves the network endpoint is there,
+and it proves `aimux remote add` correctly refuses to add an unusable host.
+
+Expected result when the server is not reachable:
+
+```text
+error: probe to root@localhost:8824 -> unreachable
+remote add exit code: 2
+```
+
+Stop here if the exit code is `2`. Fix the server or port before continuing.
+
+Stop here if the exit code is `4` unless you want to set up SSH key
+authentication for `root@localhost:8824` and rerun this manual test.
+
+## Part 2: Test the Added Host
+
+Run this part only when Part 1 exits with `0`.
 
 ```bash
 aimux remote test "$ALIAS" --timeout 2s
-echo "aimux remote test exit code: $?"
+echo "remote test exit code: $?"
 ```
 
 Expected result:
 
 ```text
 <alias>    reachable    rtt=<number>ms
-aimux remote test exit code: 0
+remote test exit code: 0
 ```
 
-## Part 3: Check an aimux Remote Session
+Also check that it appears in the host list:
 
-Create a remote session:
+```bash
+aimux remote ls --timeout 2s
+```
+
+Expected result:
+
+```text
+HOST                      USER  HOSTNAME   PORT  STATUS     RTT
+...
+<alias>                   root  localhost  8824  reachable  <number>ms
+```
+
+## Part 3: Create a Remote Session
+
+Run this part only when Part 1 and Part 2 exit with `0`.
+
+Create the remote session:
 
 ```bash
 aimux new --remote "$ALIAS" --name "$SESSION"
@@ -157,21 +163,29 @@ error: wait-last-command-complete only supports local sessions; for remote sessi
 wait exit code: 3
 ```
 
-Clean up:
+Clean up the tmux session:
 
 ```bash
 aimux kill "$ALIAS/$SESSION"
 ```
 
-`aimux remote add` prints the backup path it created before modifying
-`~/.ssh/config`. If you want to remove the test alias, either restore that backup
-or delete the appended `Host $ALIAS` block manually.
+This test intentionally does not include a manual `~/.ssh/config` cleanup step.
+`aimux` currently has `remote add`, `remote ls`, `remote test`, and
+`remote hardware`, but no `remote remove` command.
 
 ## Pass Criteria
 
-Pass the manual test when:
+Pass the host-management part when:
 
-- Part 1 proves `root@localhost:8824` is reachable.
-- Part 2 reports `reachable` with exit code `0`.
-- Part 3 captures `__AIMUX_REMOTE_OK__:root:<remote-hostname>`.
+- `aimux remote add` exits `0` and prints `reachable`, or exits `4` and prints
+  `auth-required` for a reachable server without key authentication.
+- `aimux remote add` exits `2` only when the server is genuinely unreachable.
+
+Pass the full end-to-end remote-session part when:
+
+- `aimux remote add` exits `0`.
+- `aimux remote test "$ALIAS"` exits `0`.
+- `aimux remote ls` shows the alias with `localhost`, port `8824`, user `root`,
+  and status `reachable`.
+- The remote session captures `__AIMUX_REMOTE_OK__:root:<remote-hostname>`.
 - `wait-last-command-complete` returns exit code `3` for the remote session.
