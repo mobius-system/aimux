@@ -25,8 +25,8 @@ aimux 不替换 tmux，**代理** tmux：把"对 agent 友好"的命令映射成
 | Agent-first | 输出可机读，命令幂等，错误码语义清晰 |
 | 本地远程透明 | 同一套命令操作两类会话，区别只在 location 标签 |
 | 极简模型 | 一 session 一 pane；id 就是 `<location>/<name>`，不可变 |
-| 极简表面 | 7 个会话子命令 + 2 个文件传输命令 + 4 个 `remote` 子命令；每个命令的语义可在一句话内说清 |
-| 零持久化状态 | 无 registry、无配置文件、无审计日志；元数据全部由 tmux 持有 |
+| 极简表面 | 会话命令保持稳定；新增 `bridge deploy` 与 `reverse connect` 只负责反向连接 |
+| 最小持久化状态 | tmux session 元数据仍在 tmux user options；bridge 只写一个本机 runtime 文件用于发现 broker |
 | 安全围栏 | 禁用 kill-server，独占 socket，解绑分裂/新建 window 的快捷键 |
 | 极简实现 | Python + stdlib + typer；调用 `tmux` 子进程 |
 
@@ -34,7 +34,7 @@ aimux 不替换 tmux，**代理** tmux：把"对 agent 友好"的命令映射成
 - 不做 tmux 完整功能镜像
 - 不支持分屏、多 window、多 pane
 - 不做命令执行的高层封装（无 `run`、无 prompt 检测、无超时管理）
-- 不做远端 agent 守护进程
+- 不做 SSH 远端 agent 守护进程；bridge reverse client 是显式启动的前台进程
 - 不做权限/多租户
 - 不做配置系统、自检命令、审计日志读取
 
@@ -93,8 +93,11 @@ session 内只允许 attach、detach、滚动浏览、send-keys。需要新环�
 
 ### 3.3 远端如何访问
 
-- 通过 `~/.ssh/config` 中的 host 名（`--remote=<host>`）
-- aimux 不维护自己的主机表，强烈建议用户在 ssh config 里配 `ControlMaster auto` + `ControlPersist 60s`
+- SSH remote 通过 `~/.ssh/config` 中的 host 名访问（`--remote=<host>`）
+- Bridge remote 通过 `aimux reverse connect --identifier=<name>` 注册到正在运行的 bridge broker，仍然用 `--remote=<name>` 创建 session
+- SSH remote 不需要 `--profile`；bridge remote 必须显式指定 `--profile`
+- bridge runtime remote 不写入 `~/.ssh/config`，但会出现在 `aimux remote ls/test` 中
+- 强烈建议 SSH 用户在 ssh config 里配 `ControlMaster auto` + `ControlPersist 60s`
 
 ---
 
@@ -113,6 +116,7 @@ staging-db/repl
 - `location`：来自 tmux session 的 `@aimux-location` user option
   - `local` —— 本地 shell
   - `<host>` —— SSH 到该 host（同 ssh config 中的 host 名）
+  - `<bridge-identifier>` —— bridge reverse client 注册名
 - `name` —— tmux session 名，**创建后不可变**
 
 CLI 引用：
@@ -141,15 +145,21 @@ tmux -L aimux ls -F '#{session_name}|#{@aimux-location}|#{@aimux-host}|#{@aimux-
 
 aimux 不暴露 `set-option` 子命令，因此这些元数据在 CLI 表面不可被修改。
 
-### 4.3 SSH 主机来源
+### 4.3 SSH 与 bridge remote 来源
 
 `~/.ssh/config` 是唯一来源。`--remote=<host>` 必须能被 `ssh -G <host>` 解析；否则 aimux 拒绝。
+
+Bridge remote 来自当前 bridge broker 的 runtime registry。`aimux bridge deploy`
+启动 broker 后会写入 `~/.aimux/bridge/runtime.json`（可用
+`AIMUX_BRIDGE_RUNTIME` 覆盖），`aimux reverse connect` 成功连接后注册
+`identifier`。Bridge identifier 不允许为 `local`，不允许包含 `/`，并且不能
+和已有 SSH Host 同名。
 
 ---
 
 ## 5. 命令设计
 
-aimux 总共 **7 个会话子命令** + **2 个文件传输命令** + **4 个远端主机子命令**：
+核心会话命令保持不变；bridge 新增两个连接管理命令：
 
 ```
 aimux ls                            列出会话
@@ -166,6 +176,9 @@ aimux remote ls                     列出 ssh-config 主机并探测可达性
 aimux remote test                   探测单个 ssh-config 主机
 aimux remote add                    探测后追加新主机到 ssh-config
 aimux remote hardware               探测主机硬件（GPU 数量/型号、CPU 数量、内存大小）
+
+aimux bridge deploy                 启动 SSE/HTTP bridge broker
+aimux reverse connect               反向连接本机到 bridge broker
 ```
 
 存在性检查：直接用 `aimux ls --json` 解析，或 `aimux ls --json | jq -e '.[] | select(.id=="...")'`。aimux 不再单独提供 `has` 子命令——`ls` 已经覆盖此用途。
@@ -213,16 +226,23 @@ JSON：
 
 ```bash
 aimux new --name=<name> [--remote=<host>] [--cwd=<dir>] [--cmd=<initial-cmd>] \
-          [--output-sync-to-file=<path>] [--reuse]
+          [--profile=<bridge-profile>] [--output-sync-to-file=<path>] [--reuse]
 ```
 
 行为：
 - 不带 `--remote` → 本地：`tmux -L aimux new-session -d -s <name> [-c <cwd>] [<cmd>]`
-- 带 `--remote=<host>`：
+- 带 `--remote=<host>` 且 `<host>` 是 SSH Host：
   1. 校验 `<host>` 是 `~/.ssh/config` 中的具体 Host，并用 `ssh -G <host>` 校验配置可解析（不实际连接）
   2. 构造 ssh 启动命令（见 §7.3）
   3. `tmux -L aimux new-session -d -s <name> "<ssh-cmd>"`
   4. 设置 user options：`@aimux-location`、`@aimux-host`、`@aimux-created-at`、`@aimux-created-by`
+- 带 `--remote=<identifier>` 且 `<identifier>` 是 bridge remote：
+  1. 必须提供 `--profile`
+  2. broker 校验 client 在线且支持该 profile
+  3. broker 通过 SSE 下发 `session.create` 给 reverse client
+  4. session id 仍是 `<identifier>/<name>`
+- `--profile` 只允许用于 bridge remote；本地 session 和 SSH remote 传入 `--profile` 会被拒绝
+- `--output-sync-to-file` 只支持 tmux-backed local/SSH session；bridge session 会被拒绝
 - **始终 detach 创建**；不提供 `--attach`（attach 只为人类，见 §5.3）
 - 同名已存在 → 退出码 1；`--reuse` 时返回 0
 
@@ -254,7 +274,9 @@ tmux -L aimux pipe-pane -t <name> 'cat >> <path>'
 aimux attach <id> [--read-only]
 ```
 
-实现：`tmux -L aimux attach -t <name>`。远程 session 的 ssh 体验由其 pane 提供，对用户透明。
+实现：tmux-backed session 执行 `tmux -L aimux attach -t <name>`。bridge
+session 没有本地 tmux pane，`attach` 直接拒绝，提示使用 `send-keys` +
+`capture`。
 
 **这条命令不应被 AI agent 调用**。理由：
 - attach 进入交互式终端，会接管整个 stdin/stdout，agent 无法以非交互方式与之配合
@@ -446,15 +468,14 @@ aimux wait-last-command-complete local/dev --timeout=5m --print-lines=500
 aimux remote ls [--json] [--timeout=5s]
 ```
 
-枚举 `~/.ssh/config`（含 `Include` 引入的文件）中所有具体 `Host` 条目（跳过含 `*` / `?` 的通配模式），并行探测可达性。
+枚举 `~/.ssh/config`（含 `Include` 引入的文件）中所有具体 `Host` 条目（跳过含 `*` / `?` 的通配模式），并行探测可达性；如果 bridge broker 正在运行，同时列出 bridge reverse clients。
 
 输出：
 
 ```
-HOST          USER     HOSTNAME              PORT   STATUS         RTT
-prod-api      deploy   10.0.1.5              22     reachable      45ms
-staging-db    admin    db.staging.example    22     auth-required  120ms
-old-server    root     203.0.113.99          22     unreachable    -
+HOST          TYPE     USER/PLATFORM  HOSTNAME/PROFILES          PORT   STATUS         RTT
+prod-api      ssh      deploy         10.0.1.5                   22     reachable      45ms
+winbox        bridge   windows        cmd,powershell,pwsh        -      connected      -
 ```
 
 状态分类（探测命令：`ssh -o BatchMode=yes -o ConnectTimeout=<N> <host> true`）：
@@ -470,8 +491,8 @@ JSON：
 
 ```json
 [
-  {"name":"prod-api","user":"deploy","hostname":"10.0.1.5","port":22,"status":"reachable","rtt_ms":45},
-  {"name":"old-server","user":"root","hostname":"203.0.113.99","port":22,"status":"unreachable","rtt_ms":null}
+  {"name":"prod-api","type":"ssh","user":"deploy","hostname":"10.0.1.5","port":22,"status":"reachable","rtt_ms":45},
+  {"name":"winbox","type":"bridge","status":"connected","platform":"windows","profiles":[{"name":"cmd","available":true}]}
 ]
 ```
 
@@ -481,7 +502,7 @@ JSON：
 aimux remote test <name> [--timeout=5s] [--json]
 ```
 
-对单个 `~/.ssh/config` 中的 host 做一次探测，输出与 `remote ls` 单行相同。退出码：
+对单个 remote 做一次探测。SSH remote 执行 SSH probe；bridge remote 检查 reverse client 是否 connected。退出码：
 - `0` —— `reachable`
 - `1` —— host 名在 ssh config 中不存在
 - `2` —— `unreachable`
@@ -985,8 +1006,8 @@ $ aimux new --remote=worker-2 --name=task-1
 | 命令 | 作用 | 可被 agent 调用 |
 |---|---|---|
 | `aimux ls` | 列出所有 session | ✅ |
-| `aimux new --name=<n> [--remote=<host>] [--output-sync-to-file=<path>]` | 创建 session：不带 `--remote` 是本地，带 `--remote=<host>` 是远程；`--output-sync-to-file` 启用 pipe-pane 实时录到文件 | ✅ |
-| `aimux attach <id>` | attach 到 session | ❌ **仅限人类** |
+| `aimux new --name=<n> [--remote=<name>] [--profile=<p>] [--output-sync-to-file=<path>]` | 创建 session：不带 `--remote` 是本地，SSH remote 保持旧 API；bridge remote 必须带 `--profile`；`--output-sync-to-file` 只支持 tmux-backed session | ✅ |
+| `aimux attach <id>` | attach 到 tmux-backed session；bridge session 直接拒绝 | ❌ **仅限人类** |
 | `aimux send-keys <id> [tmux-flags] -- <keys...>` | 发送按键（**执行入口**）；行为与 `tmux send-keys` 完全一致，支持 `-F/-H/-K/-l/-M/-R/-X/-N` | ✅ |
 | `aimux send_files <remote> <remote-dir> <local>... [--gitignore]` | 用一次 sftp batch 上传多个本地文件或目录到 ssh-config host 的远端目录；目录会放在远端目录下自己的 basename 中 | ✅ |
 | `aimux get_files <remote> <local-dir> <remote-path>...` | 用一次 sftp batch 下载多个远端文件或目录到本地目录；下载目标名来自远端路径 basename | ✅ |
@@ -998,10 +1019,17 @@ $ aimux new --remote=worker-2 --name=task-1
 
 | 命令 | 作用 | 可被 agent 调用 |
 |---|---|---|
-| `aimux remote ls` | 枚举 ssh-config 中所有 host 并并行探测可达性 | ✅ |
-| `aimux remote test <name>` | 探测单个 ssh-config host | ✅ |
+| `aimux remote ls` | 枚举 ssh-config host 并列出 bridge reverse clients | ✅ |
+| `aimux remote test <name>` | 探测单个 SSH 或 bridge remote | ✅ |
 | `aimux remote hardware <name>` | 探测主机硬件（GPU 数量/型号、CPU 数量、内存大小） | ✅ |
 | `aimux remote add --host=<h> --port=<p> --user=<u> [--name=<n>]` | 探测通过后将新 host 追加到 `~/.ssh/config` | ✅ |
+
+**Bridge 连接管理**
+
+| 命令 | 作用 | 可被 agent 调用 |
+|---|---|---|
+| `aimux bridge deploy --port=<p>` | 在服务器侧启动 HTTP/SSE broker，监听 reverse client | ✅ |
+| `aimux reverse connect <url> --identifier=<name> --token=<token>` | 在 client 侧反向连接 broker，并注册 bridge remote | ✅ |
 
 被有意删除的命令（不暴露）：`run`、`rename`、`respawn`、`has`、`new-window`、`list-windows`、`select-window`、`rename-window`、`kill-window`、`split-window`、`list-panes`、`select-pane`、`kill-pane`、`kill-server`、`hosts`（被 `remote ls` 取代）、`prune`、`set-option`、`history`、`log`、`config`、`doctor`。
 

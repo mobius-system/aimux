@@ -36,6 +36,28 @@ aimux remote add --host=10.0.1.5 --port=22 --user=deploy --name=worker
 aimux new --remote=worker --name=task-1
 ```
 
+Bridge remotes are reverse-connected clients. Start a broker on the server,
+connect a client back to it, then create sessions through the same `--remote`
+API. Bridge remotes require an explicit profile:
+
+```bash
+# server
+aimux bridge deploy --port=8765
+
+# client
+aimux reverse connect http://SERVER:8765 --identifier=winbox --token=<token>
+
+# server
+aimux remote ls
+aimux new --remote=winbox --profile=cmd --name=cmd-1
+aimux send-keys winbox/cmd-1 -- "echo hello" Enter
+aimux capture winbox/cmd-1 --lines=50
+```
+
+Windows bridge profiles include `cmd`, `powershell`, `pwsh`, and `mingw64`
+when available. macOS exposes `mac-pty` and `mac-terminal`; Linux exposes
+`posix-pty`.
+
 ## Tests
 
 ```bash

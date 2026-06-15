@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from . import bridge
 from . import tmux
 from .constants import (
     OPT_CREATED_AT,
@@ -36,6 +37,10 @@ class Session:
     created_by: str | None
     output_sync_file: str | None
     managed: bool  # False if @aimux-location was unset (created outside aimux)
+    backend: str = "tmux"  # tmux | bridge
+    transport: str = "local"  # local | ssh | bridge
+    profile: str | None = None
+    client_status: str | None = None
 
     @property
     def id(self) -> str:
@@ -60,6 +65,27 @@ class Session:
             created_by=created_by or None,
             output_sync_file=sync_file or None,
             managed=managed,
+            backend="tmux",
+            transport="local" if location == "local" else "ssh",
+        )
+
+    @classmethod
+    def from_bridge(cls, data: dict) -> "Session":
+        location = str(data.get("location") or data.get("remote") or data.get("host") or "")
+        name = str(data.get("name") or "")
+        return cls(
+            name=name,
+            attached=False,
+            location=location,
+            host=str(data.get("host") or location) if location else None,
+            created_at=data.get("created_at"),
+            created_by=data.get("created_by"),
+            output_sync_file=None,
+            managed=True,
+            backend="bridge",
+            transport="bridge",
+            profile=data.get("profile"),
+            client_status=data.get("client_status"),
         )
 
     def to_dict(self) -> dict:
@@ -73,11 +99,21 @@ class Session:
             "created_by": self.created_by,
             "output_sync_file": self.output_sync_file,
             "managed": self.managed,
+            "backend": self.backend,
+            "transport": self.transport,
+            "profile": self.profile,
+            "client_status": self.client_status,
         }
 
 
 def list_sessions() -> list[Session]:
-    return [Session.from_line(ln) for ln in tmux.list_sessions_raw(_LS_FORMAT)]
+    sessions = [Session.from_line(ln) for ln in tmux.list_sessions_raw(_LS_FORMAT)]
+    try:
+        client = bridge.BridgeControlClient.from_runtime()
+        sessions.extend(Session.from_bridge(row) for row in client.list_sessions(timeout=1.0))
+    except bridge.BridgeError:
+        pass
+    return sessions
 
 
 class IdError(Exception):

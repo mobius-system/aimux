@@ -13,6 +13,9 @@ from typing import Annotated
 import click
 import typer
 
+from . import bridge
+from . import bridge_client
+from . import bridge_server
 from . import session as session_mod
 from . import ssh as ssh_mod
 from . import tmux
@@ -47,6 +50,20 @@ remote_app = typer.Typer(
 )
 app.add_typer(remote_app, name="remote")
 
+bridge_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Bridge broker management.",
+)
+app.add_typer(bridge_app, name="bridge")
+
+reverse_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Reverse-connect this machine to an aimux bridge broker.",
+)
+app.add_typer(reverse_app, name="reverse")
+
 
 # ---------- helpers ----------
 
@@ -74,6 +91,31 @@ def _resolve_or_die(spec: str, *, json_mode: bool = False) -> session_mod.Sessio
         raise typer.Exit(EXIT_USER_ERROR)
 
 
+def _exit_bridge_error(e: bridge.BridgeError, *, json_mode: bool = False) -> None:
+    if json_mode:
+        print_error_json(e.exit_code, e.kind, e.message)
+    else:
+        err(f"error: {e.message}")
+    raise typer.Exit(e.exit_code)
+
+
+def _bridge_client_or_none() -> bridge.BridgeControlClient | None:
+    try:
+        return bridge.BridgeControlClient.from_runtime()
+    except bridge.BridgeError:
+        return None
+
+
+def _bridge_remote(name: str) -> tuple[bridge.BridgeControlClient | None, dict | None]:
+    client = _bridge_client_or_none()
+    if client is None:
+        return None, None
+    try:
+        return client, client.get_remote(name, timeout=2.0)
+    except bridge.BridgeError:
+        return None, None
+
+
 # ---------- ls ----------
 
 @app.command("ls", help="List all aimux sessions.")
@@ -96,8 +138,9 @@ def cmd_ls(
     for s in sessions:
         loc = s.location if s.managed else f"{s.location} (unmanaged)"
         created = s.created_at or "-"
-        rows.append([loc, s.name, "attached" if s.attached else "detached", created])
-    emit_table(["LOCATION", "NAME", "STATUS", "CREATED"], rows)
+        status = "attached" if s.attached else "detached"
+        rows.append([loc, s.transport, s.name, status, created])
+    emit_table(["LOCATION", "TYPE", "NAME", "STATUS", "CREATED"], rows)
 
 
 # ---------- new ----------
@@ -106,6 +149,10 @@ def cmd_ls(
 def cmd_new(
     name: Annotated[str, typer.Option("--name", help="Session name.")],
     remote: Annotated[Optional[str], typer.Option("--remote", help="SSH host name from ~/.ssh/config.")] = None,
+    profile: Annotated[
+        Optional[str],
+        typer.Option("--profile", help="Bridge remote profile, required for bridge remotes."),
+    ] = None,
     cwd: Annotated[Optional[str], typer.Option("--cwd", help="Initial working directory.")] = None,
     cmd: Annotated[Optional[str], typer.Option("--cmd", help="Initial command to run.")] = None,
     output_sync_to_file: Annotated[
@@ -118,15 +165,67 @@ def cmd_new(
         err("error: --name must not contain '/'")
         raise typer.Exit(EXIT_USER_ERROR)
 
+    if profile and not remote:
+        err("error: --profile is only valid for bridge remotes")
+        raise typer.Exit(EXIT_USER_ERROR)
+
     if tmux.has_session(name):
         if reuse:
             return
         err(f"error: session {name!r} already exists")
         raise typer.Exit(EXIT_USER_ERROR)
 
-    if remote and not ssh_mod.host_exists(remote):
-        err(f"error: host {remote!r} not found in ~/.ssh/config")
-        raise typer.Exit(EXIT_USER_ERROR)
+    bridge_client_ctl: bridge.BridgeControlClient | None = None
+    bridge_remote_info: dict | None = None
+    ssh_exists = False
+    if remote:
+        ssh_exists = ssh_mod.host_exists(remote)
+        bridge_client_ctl, bridge_remote_info = _bridge_remote(remote)
+
+        if bridge_remote_info is not None:
+            if ssh_exists:
+                err(f"error: remote {remote!r} exists as both ssh and bridge; rename one of them")
+                raise typer.Exit(EXIT_USER_ERROR)
+            if not profile:
+                err(f"error: --profile is required for bridge remote {remote!r}")
+                raise typer.Exit(EXIT_USER_ERROR)
+            if output_sync_to_file:
+                err("error: --output-sync-to-file is not supported for bridge remotes")
+                raise typer.Exit(EXIT_USER_ERROR)
+            if bridge_remote_info.get("status") != "connected":
+                err(f"error: bridge remote {remote!r} is disconnected")
+                raise typer.Exit(EXIT_SSH_UNREACHABLE)
+            if reuse:
+                try:
+                    existing = bridge_client_ctl.list_sessions(timeout=2.0) if bridge_client_ctl else []
+                except bridge.BridgeError:
+                    existing = []
+                if any(s.get("location") == remote and s.get("name") == name for s in existing):
+                    return
+            try:
+                assert bridge_client_ctl is not None
+                bridge_client_ctl.create_session(
+                    remote=remote,
+                    name=name,
+                    profile=profile,
+                    cmd=cmd,
+                    cwd=cwd,
+                    created_at=_now_iso(),
+                    created_by=_actor(),
+                )
+                return
+            except bridge.BridgeError as e:
+                _exit_bridge_error(e)
+
+        if profile:
+            err("error: --profile is only valid for bridge remotes")
+            raise typer.Exit(EXIT_USER_ERROR)
+        if not ssh_exists:
+            if bridge_client_ctl is None:
+                err(f"error: host {remote!r} not found in ~/.ssh/config")
+            else:
+                err(f"error: remote {remote!r} not found in ~/.ssh/config or bridge registry")
+            raise typer.Exit(EXIT_USER_ERROR)
 
     try:
         if remote:
@@ -179,6 +278,9 @@ def cmd_attach(
     read_only: Annotated[bool, typer.Option("--read-only", help="Attach in read-only mode.")] = False,
 ):
     s = _resolve_or_die(target)
+    if s.backend == "bridge":
+        err("error: attach does not support bridge remote sessions; use send-keys + capture")
+        raise typer.Exit(EXIT_SAFETY_DENIED)
     tmux.attach(s.name, read_only=read_only)
 
 
@@ -224,6 +326,17 @@ def cmd_send_keys(
         err("error: send-keys requires at least one key argument")
         raise typer.Exit(EXIT_USER_ERROR)
     s = _resolve_or_die(target)
+    if s.backend == "bridge":
+        try:
+            bridge.BridgeControlClient.from_runtime().send_keys(
+                remote=s.location,
+                name=s.name,
+                keys=keys,
+                flags=flags,
+            )
+            return
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
     tmux.send_keys(s.name, keys, flags=flags)
 
 
@@ -306,6 +419,32 @@ def cmd_capture(
             err(f"error: {msg}")
         raise typer.Exit(EXIT_USER_ERROR)
     s = _resolve_or_die(target, json_mode=json_out)
+    if s.backend == "bridge":
+        try:
+            payload = bridge.BridgeControlClient.from_runtime().capture(
+                remote=s.location,
+                name=s.name,
+                lines=lines,
+                ansi=ansi,
+            )
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e, json_mode=json_out)
+        content = str(payload.get("content") or "")
+        if json_out:
+            print_json(
+                {
+                    "id": s.id,
+                    "lines": lines,
+                    "content": content,
+                    "ansi": bool(payload.get("ansi")),
+                    "source": payload.get("source"),
+                }
+            )
+        else:
+            sys.stdout.write(content)
+            if not content.endswith("\n"):
+                sys.stdout.write("\n")
+        return
     content = tmux.capture_pane(s.name, lines=lines, ansi=ansi)
     if json_out:
         print_json({"id": s.id, "lines": lines, "content": content})
@@ -322,6 +461,12 @@ def cmd_kill(
     target: Annotated[str, typer.Argument(help="Session id.")],
 ):
     s = _resolve_or_die(target)
+    if s.backend == "bridge":
+        try:
+            bridge.BridgeControlClient.from_runtime().kill_session(remote=s.location, name=s.name)
+            return
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
     tmux.kill_session(s.name)
 
 
@@ -439,6 +584,14 @@ def cmd_remote_ls(
         raise typer.Exit(EXIT_USER_ERROR)
 
     hosts = ssh_mod.list_hosts()
+    bridge_remotes: list[dict] = []
+    bridge_client_ctl = _bridge_client_or_none()
+    if bridge_client_ctl is not None:
+        try:
+            bridge_remotes = bridge_client_ctl.list_remotes(timeout=2.0)
+        except bridge.BridgeError:
+            bridge_remotes = []
+
     results: dict[str, ssh_mod.ProbeResult] = {}
     if hosts:
         with ThreadPoolExecutor(max_workers=min(16, len(hosts))) as pool:
@@ -452,6 +605,7 @@ def cmd_remote_ls(
             out.append(
                 {
                     "name": h.name,
+                    "type": "ssh",
                     "user": h.user,
                     "hostname": h.hostname,
                     "port": h.port,
@@ -459,6 +613,8 @@ def cmd_remote_ls(
                     "rtt_ms": r.rtt_ms if r else None,
                 }
             )
+        for remote in bridge_remotes:
+            out.append(remote)
         print_json(out)
         return
 
@@ -467,8 +623,25 @@ def cmd_remote_ls(
         r = results.get(h.name)
         rtt = f"{r.rtt_ms}ms" if r and r.rtt_ms is not None else "-"
         status = r.status if r else "unknown"
-        rows.append([h.name, h.user or "-", h.hostname or h.name, h.port, status, rtt])
-    emit_table(["HOST", "USER", "HOSTNAME", "PORT", "STATUS", "RTT"], rows)
+        rows.append([h.name, "ssh", h.user or "-", h.hostname or h.name, h.port, status, rtt])
+    for remote in bridge_remotes:
+        profiles = ",".join(
+            str(p.get("name"))
+            for p in remote.get("profiles", [])
+            if isinstance(p, dict) and p.get("available", True)
+        )
+        rows.append(
+            [
+                remote.get("name"),
+                "bridge",
+                remote.get("platform") or "-",
+                profiles or "-",
+                "-",
+                remote.get("status") or "unknown",
+                "-",
+            ]
+        )
+    emit_table(["HOST", "TYPE", "USER/PLATFORM", "HOSTNAME/PROFILES", "PORT", "STATUS", "RTT"], rows)
 
 
 # ---------- remote test ----------
@@ -486,6 +659,27 @@ def cmd_remote_test(
         raise typer.Exit(EXIT_USER_ERROR)
 
     if not ssh_mod.host_exists(name):
+        bridge_client_ctl, remote = _bridge_remote(name)
+        if remote is not None:
+            status = str(remote.get("status") or "unknown")
+            if json_out:
+                print_json(
+                    {
+                        "name": name,
+                        "type": "bridge",
+                        "status": status,
+                        "platform": remote.get("platform"),
+                        "profiles": remote.get("profiles", []),
+                    }
+                )
+            else:
+                profiles = ",".join(
+                    str(p.get("name"))
+                    for p in remote.get("profiles", [])
+                    if isinstance(p, dict) and p.get("available", True)
+                )
+                print(f"{name}\tbridge\t{status}\tprofiles={profiles or '-'}")
+            raise typer.Exit(EXIT_OK if status == "connected" else EXIT_SSH_UNREACHABLE)
         msg = f"host {name!r} not found in ~/.ssh/config"
         if json_out:
             print_error_json(EXIT_USER_ERROR, "host_not_found", msg)
@@ -588,6 +782,10 @@ def cmd_remote_add(
     if ssh_mod.host_exists(alias):
         err(f"error: host {alias!r} already exists in ssh config; pick another --name")
         raise typer.Exit(EXIT_USER_ERROR)
+    _, existing_bridge = _bridge_remote(alias)
+    if existing_bridge is not None:
+        err(f"error: host {alias!r} conflicts with an active bridge remote; pick another --name")
+        raise typer.Exit(EXIT_USER_ERROR)
 
     r = ssh_mod.probe_raw(host, port, user, identity, timeout_s)
     if r.status == "auth-required":
@@ -605,3 +803,45 @@ def cmd_remote_add(
     rtt = f"{r.rtt_ms}ms" if r.rtt_ms is not None else "-"
     print(f"{alias}\treachable\trtt={rtt}")
     print(f"appended to ~/.ssh/config (backup: {backup})")
+
+
+# ---------- bridge deploy ----------
+
+@bridge_app.command("deploy", help="Start an aimux bridge broker and listen for reverse clients.")
+def cmd_bridge_deploy(
+    port: Annotated[int, typer.Option("--port", help="Port to listen on.")],
+    host: Annotated[str, typer.Option("--host", help="Listen address.")] = "0.0.0.0",
+    token: Annotated[Optional[str], typer.Option("--token", help="Shared bridge token.")] = None,
+):
+    try:
+        bridge_server.serve(host, port, token=token)
+    except OSError as e:
+        err(f"error: failed to start bridge broker: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+
+# ---------- reverse connect ----------
+
+@reverse_app.command("connect", help="Reverse-connect this machine to an aimux bridge broker.")
+def cmd_reverse_connect(
+    url: Annotated[str, typer.Argument(help="Bridge broker URL, e.g. http://server:8765.")],
+    identifier: Annotated[str, typer.Option("--identifier", help="Bridge remote name to register.")],
+    token: Annotated[str, typer.Option("--token", help="Shared bridge token from bridge deploy.")],
+    default_profile: Annotated[
+        Optional[str],
+        typer.Option("--default-profile", help="Default profile reported by this client."),
+    ] = None,
+    replace: Annotated[bool, typer.Option("--replace", help="Replace an existing client with the same identifier.")] = False,
+):
+    try:
+        bridge_client.connect(
+            url,
+            identifier=identifier,
+            token=token,
+            default_profile=default_profile,
+            replace=replace,
+        )
+    except bridge.BridgeError as e:
+        _exit_bridge_error(e)
+    except KeyboardInterrupt:
+        raise typer.Exit(EXIT_OK)
