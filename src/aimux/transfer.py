@@ -1,12 +1,17 @@
 """SFTP transfer helpers for aimux file commands."""
 from __future__ import annotations
 
+import base64
+import os
 import posixpath
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:
+    from . import bridge as bridge_mod
 
 
 class TransferError(RuntimeError):
@@ -360,6 +365,180 @@ def _sftp_quote(path: str) -> str:
     return f'"{escaped}"'
 
 
-def _validate_sftp_path(path: str) -> None:
+def validate_transfer_path(path: str) -> None:
+    """Reject paths containing control characters that break sftp / bridge protocols."""
     if "\0" in path or "\n" in path or "\r" in path:
-        raise TransferError("sftp paths must not contain control newlines or NUL bytes")
+        raise TransferError("paths must not contain control newlines or NUL bytes")
+
+
+def validate_bridge_path(path: str) -> None:
+    """Stricter check for bridge transfers: also reject '..' to prevent traversal.
+
+    Bridge clients touch their local filesystem directly via Path(), unlike
+    sftp which is mediated by the remote sshd's path resolution. We must
+    therefore refuse '..' segments that could escape an intended directory.
+    """
+    validate_transfer_path(path)
+    parts = path.replace("\\", "/").split("/")
+    if any(part == ".." for part in parts):
+        raise TransferError(f"bridge paths must not contain '..' segments: {path!r}")
+
+
+# Backwards-compat alias used elsewhere in this module.
+_validate_sftp_path = validate_transfer_path
+
+
+# ---------------------------------------------------------------------------
+# Bridge remote transfer (HTTP/SSE broker instead of sftp)
+# ---------------------------------------------------------------------------
+
+DEFAULT_BRIDGE_MAX_FILE_SIZE = 16 * 1024 * 1024
+
+
+def bridge_send_files(
+    client: "bridge_mod.BridgeControlClient",
+    remote: str,
+    local_paths: Iterable[str | Path],
+    remote_path: str,
+    *,
+    gitignore: bool = False,
+    max_file_size: int = DEFAULT_BRIDGE_MAX_FILE_SIZE,
+) -> SendFilesResult:
+    """Upload local paths to a bridge remote via the file.write message family.
+
+    Reuses the same planning logic as send_paths; the sftp batch is replaced by
+    per-file base64-encoded writes through the broker.
+    """
+    plan = build_send_files_plan(local_paths, remote_path, gitignore=gitignore)
+    if not plan.has_work:
+        return SendFilesResult(
+            plan=plan,
+            uploaded_files=0,
+            skipped_files=plan.skipped_files,
+        )
+    for remote_dir in plan.dirs:
+        validate_bridge_path(remote_dir)
+        client.file_mkdir(remote=remote, path=remote_dir)
+    for entry in plan.files:
+        validate_bridge_path(entry.remote)
+        data = entry.local.read_bytes()
+        if len(data) > max_file_size:
+            raise TransferError(
+                f"file exceeds bridge size limit ({len(data)} > {max_file_size} bytes): {entry.local}"
+            )
+        content_b64 = base64.b64encode(data).decode("ascii")
+        client.file_write(
+            remote=remote,
+            path=entry.remote,
+            content_b64=content_b64,
+            mode=0o644,
+            max_size=max_file_size,
+        )
+    return SendFilesResult(
+        plan=plan,
+        uploaded_files=len(plan.files),
+        skipped_files=plan.skipped_files,
+    )
+
+
+def bridge_get_files(
+    client: "bridge_mod.BridgeControlClient",
+    remote: str,
+    remote_paths: Iterable[str],
+    local_dir: str | Path,
+    *,
+    max_file_size: int = DEFAULT_BRIDGE_MAX_FILE_SIZE,
+) -> GetFilesResult:
+    """Download remote paths from a bridge remote via the file.read message family."""
+    remotes = tuple(remote_paths)
+    if not remotes:
+        raise TransferError("get_files requires at least one remote path")
+    destination = Path(local_dir).expanduser().resolve()
+    if destination.exists() and not destination.is_dir():
+        raise TransferError(f"local destination is not a directory: {destination}")
+    destination.mkdir(parents=True, exist_ok=True)
+    validate_transfer_path(str(destination))
+
+    entries: list[DownloadEntry] = []
+    for remote_path in remotes:
+        validate_bridge_path(remote_path)
+        if not remote_path:
+            raise TransferError("remote path must not be empty")
+        stat = client.file_stat(remote=remote, path=remote_path)
+        rtype = str(stat.get("type") or "none")
+        if rtype == "dir":
+            _bridge_download_dir(client, remote, remote_path, destination, max_file_size, entries)
+        elif rtype == "file":
+            local_file = destination / _remote_basename(remote_path)
+            _bridge_download_one(client, remote, remote_path, local_file, int(stat.get("size") or 0), max_file_size)
+            entries.append(DownloadEntry(remote=remote_path, local=local_file))
+        else:
+            raise TransferError(f"remote path does not exist: {remote_path}")
+
+    plan = GetFilesPlan(remotes, destination, tuple(entries))
+    return GetFilesResult(plan=plan, downloaded_paths=len(entries))
+
+
+def _bridge_download_dir(
+    client: "bridge_mod.BridgeControlClient",
+    remote: str,
+    remote_root: str,
+    destination: Path,
+    max_file_size: int,
+    entries: list[DownloadEntry],
+) -> None:
+    base_name = _remote_basename(remote_root)
+    listing = client.file_list(remote=remote, path=remote_root, recursive=True)
+    items = listing.get("entries") if isinstance(listing, dict) else None
+    if not isinstance(items, list):
+        raise TransferError(f"bridge file.list returned no entries for {remote_root!r}")
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        item_path = str(item.get("path") or "")
+        if item_type != "file" or not item_path:
+            continue
+        rel = _remote_relpath(remote_root, item_path)
+        local_file = destination / base_name / rel
+        local_file.parent.mkdir(parents=True, exist_ok=True)
+        size = int(item.get("size") or 0)
+        _bridge_download_one(client, remote, item_path, local_file, size, max_file_size)
+        entries.append(DownloadEntry(remote=item_path, local=local_file))
+
+
+def _bridge_download_one(
+    client: "bridge_mod.BridgeControlClient",
+    remote: str,
+    remote_path: str,
+    local_file: Path,
+    size: int,
+    max_file_size: int,
+) -> None:
+    if size and size > max_file_size:
+        raise TransferError(
+            f"file exceeds bridge size limit ({size} > {max_file_size} bytes): {remote_path}"
+        )
+    response = client.file_read(remote=remote, path=remote_path)
+    content_b64 = str(response.get("content_b64") or "")
+    try:
+        data = base64.b64decode(content_b64, validate=True)
+    except (ValueError, base64.binascii.Error) as e:
+        raise TransferError(f"invalid base64 from bridge for {remote_path!r}: {e}")
+    if len(data) > max_file_size:
+        raise TransferError(
+            f"file exceeds bridge size limit ({len(data)} > {max_file_size} bytes): {remote_path}"
+        )
+    local_file.parent.mkdir(parents=True, exist_ok=True)
+    local_file.write_bytes(data)
+
+
+def _remote_relpath(base: str, target: str) -> str:
+    """Return target path relative to base, normalized to forward slashes."""
+    base_norm = base.rstrip("/")
+    target_norm = target.rstrip("/")
+    if target_norm == base_norm:
+        return ""
+    if target_norm.startswith(base_norm + "/"):
+        return target_norm[len(base_norm) + 1:]
+    return posixpath.basename(target_norm)

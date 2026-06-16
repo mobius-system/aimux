@@ -1,6 +1,7 @@
 """Reverse bridge client and terminal profile adapters."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import platform
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .bridge import BridgeError, validate_identifier
+from .transfer import validate_bridge_path
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -457,6 +459,16 @@ class ReverseClientRuntime:
             return self._kill(payload)
         if message_type == "session.list":
             return {"sessions": [session.to_dict() for session in self.sessions.values()]}
+        if message_type == "file.stat":
+            return self._file_stat(payload)
+        if message_type == "file.read":
+            return self._file_read(payload)
+        if message_type == "file.write":
+            return self._file_write(payload)
+        if message_type == "file.mkdir":
+            return self._file_mkdir(payload)
+        if message_type == "file.list":
+            return self._file_list(payload)
         raise BridgeError(f"unsupported bridge message type {message_type!r}")
 
     def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -512,6 +524,88 @@ class ReverseClientRuntime:
             session.adapter.kill(session)
         self.sessions.pop(name, None)
         return {"ok": True}
+
+    def _file_path(self, payload: dict[str, Any]) -> Path:
+        raw = str(payload.get("path") or "")
+        if not raw:
+            raise BridgeError("file path is required", kind="bad_request")
+        try:
+            validate_bridge_path(raw)
+        except Exception as e:
+            raise BridgeError(str(e), kind="bad_request")
+        return Path(raw).expanduser()
+
+    def _file_stat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        if path.is_symlink() or not path.exists():
+            return {"exists": False, "type": "none", "size": 0}
+        if path.is_file():
+            return {"exists": True, "type": "file", "size": path.stat().st_size}
+        if path.is_dir():
+            return {"exists": True, "type": "dir", "size": 0}
+        return {"exists": True, "type": "other", "size": path.stat().st_size}
+
+    def _file_read(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        if not path.is_file():
+            raise BridgeError(f"not a regular file: {path}", kind="not_found")
+        data = path.read_bytes()
+        return {
+            "content_b64": base64.b64encode(data).decode("ascii"),
+            "size": len(data),
+        }
+
+    def _file_write(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        content_b64 = str(payload.get("content_b64") or "")
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except (ValueError, base64.binascii.Error) as e:
+            raise BridgeError(f"invalid base64 payload: {e}", kind="bad_request")
+        max_size = int(payload.get("max_size") or 0) or 0
+        if max_size and len(data) > max_size:
+            raise BridgeError(
+                f"file size {len(data)} exceeds bridge limit {max_size}", kind="too_large"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        mode_value = payload.get("mode")
+        if isinstance(mode_value, int) and 0 <= mode_value <= 0o777:
+            try:
+                os.chmod(path, mode_value)
+            except OSError:
+                pass
+        return {"size": len(data)}
+
+    def _file_mkdir(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        path.mkdir(parents=True, exist_ok=True)
+        return {"ok": True}
+
+    def _file_list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        if not path.exists():
+            raise BridgeError(f"path does not exist: {path}", kind="not_found")
+        if path.is_file():
+            entries = [{"path": str(path), "type": "file", "size": path.stat().st_size}]
+            return {"entries": entries}
+        if not path.is_dir():
+            raise BridgeError(f"not a directory: {path}", kind="bad_request")
+        recursive = bool(payload.get("recursive", True))
+        entries: list[dict[str, Any]] = []
+        if recursive:
+            children = sorted(path.rglob("*"))
+        else:
+            children = sorted(path.iterdir())
+        for child in children:
+            if child.is_symlink():
+                entries.append({"path": str(child), "type": "symlink", "size": 0})
+                continue
+            if child.is_file():
+                entries.append({"path": str(child), "type": "file", "size": child.stat().st_size})
+            elif child.is_dir():
+                entries.append({"path": str(child), "type": "dir", "size": 0})
+        return {"entries": entries}
 
 
 def _post_json(url: str, token: str, payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:

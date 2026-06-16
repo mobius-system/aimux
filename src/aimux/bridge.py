@@ -293,6 +293,72 @@ class BridgeControlClient:
             timeout=timeout,
         )
 
+    def file_stat(self, *, remote: str, path: str, timeout: float = 60.0) -> dict[str, Any]:
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/stat",
+            self.runtime.token,
+            {"path": path},
+            timeout=timeout,
+        )
+
+    def file_read(self, *, remote: str, path: str, timeout: float = 180.0) -> dict[str, Any]:
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/read",
+            self.runtime.token,
+            {"path": path},
+            timeout=timeout,
+        )
+
+    def file_write(
+        self,
+        *,
+        remote: str,
+        path: str,
+        content_b64: str,
+        mode: int | None = None,
+        max_size: int | None = None,
+        timeout: float = 180.0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"path": path, "content_b64": content_b64}
+        if mode is not None:
+            payload["mode"] = int(mode)
+        if max_size is not None:
+            payload["max_size"] = int(max_size)
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/write",
+            self.runtime.token,
+            payload,
+            timeout=timeout,
+        )
+
+    def file_mkdir(self, *, remote: str, path: str, timeout: float = 60.0) -> dict[str, Any]:
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/mkdir",
+            self.runtime.token,
+            {"path": path},
+            timeout=timeout,
+        )
+
+    def file_list(
+        self,
+        *,
+        remote: str,
+        path: str,
+        recursive: bool = True,
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/list",
+            self.runtime.token,
+            {"path": path, "recursive": recursive},
+            timeout=timeout,
+        )
+
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

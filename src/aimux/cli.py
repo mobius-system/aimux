@@ -352,9 +352,9 @@ def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> 
     raise typer.Exit(EXIT_USER_ERROR)
 
 
-@app.command("send_files", help="Upload multiple local files or directories to an SSH host using sftp.")
+@app.command("send_files", help="Upload multiple local files or directories to an SSH or bridge remote.")
 def cmd_send_files(
-    remote: Annotated[str, typer.Argument(help="SSH host name from ~/.ssh/config.")],
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
     remote_path: Annotated[str, typer.Argument(help="Destination directory on the remote host.")],
     local_paths: Annotated[list[str], typer.Argument(help="Local files or directories to upload.")],
     gitignore: Annotated[
@@ -362,8 +362,24 @@ def cmd_send_files(
         typer.Option("--gitignore", help="Skip files ignored by git ignore rules when uploading."),
     ] = False,
 ):
+    bridge_client_ctl, bridge_info = _bridge_remote(remote)
+    if bridge_client_ctl is not None and bridge_info is not None:
+        try:
+            result = transfer.bridge_send_files(
+                bridge_client_ctl, remote, local_paths, remote_path, gitignore=gitignore
+            )
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+        print(f"uploaded {result.uploaded_files} file(s) to bridge remote {remote}:{remote_path}")
+        if result.skipped_files:
+            print(f"skipped {result.skipped_files} gitignored file(s)")
+        return
+
     if not ssh_mod.host_exists(remote):
-        err(f"error: host {remote!r} not found in ~/.ssh/config")
+        err(f"error: host {remote!r} not found in ~/.ssh/config or bridge registry")
         raise typer.Exit(EXIT_USER_ERROR)
 
     try:
@@ -381,14 +397,26 @@ def cmd_send_files(
 
 # ---------- get_files ----------
 
-@app.command("get_files", help="Download multiple remote files or directories from an SSH host using sftp.")
+@app.command("get_files", help="Download multiple remote files or directories from an SSH or bridge remote.")
 def cmd_get_files(
-    remote: Annotated[str, typer.Argument(help="SSH host name from ~/.ssh/config.")],
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
     local_dir: Annotated[str, typer.Argument(help="Local destination directory.")],
     remote_paths: Annotated[list[str], typer.Argument(help="Remote files or directories to download.")],
 ):
+    bridge_client_ctl, bridge_info = _bridge_remote(remote)
+    if bridge_client_ctl is not None and bridge_info is not None:
+        try:
+            result = transfer.bridge_get_files(bridge_client_ctl, remote, remote_paths, local_dir)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+        print(f"downloaded {result.downloaded_paths} path(s) from bridge remote {remote} to {result.plan.local_dir}")
+        return
+
     if not ssh_mod.host_exists(remote):
-        err(f"error: host {remote!r} not found in ~/.ssh/config")
+        err(f"error: host {remote!r} not found in ~/.ssh/config or bridge registry")
         raise typer.Exit(EXIT_USER_ERROR)
 
     try:

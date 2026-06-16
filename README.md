@@ -21,7 +21,7 @@ aimux wait-last-command-complete local/dev --timeout=5m --print-lines=200
 # list everything
 aimux ls
 
-# upload files or directories to an SSH host via sftp
+# upload files or directories to an SSH or bridge host
 aimux send_files worker /tmp/upload ./dist ./README.md --gitignore
 aimux get_files worker ./downloads /tmp/upload/README.md /tmp/upload/dist
 
@@ -57,6 +57,28 @@ aimux capture winbox/cmd-1 --lines=50
 Windows bridge profiles include `cmd`, `powershell`, `pwsh`, and `mingw64`
 when available. macOS exposes `mac-pty` and `mac-terminal`; Linux exposes
 `posix-pty`.
+
+### File transfer for bridge remotes
+
+`aimux send_files` and `aimux get_files` work the same way for bridge remotes
+as for SSH hosts — the CLI auto-detects the remote type and dispatches
+accordingly. Bridge transfers use a base64-encoded `file.*` message family
+over the existing SSE+POST channel, with no sftp dependency on the client.
+
+```bash
+aimux send_files winbox 'C:\Users\dev\proj' ./src --gitignore
+aimux get_files winbox ./logs 'C:\Users\dev\proj\logs'
+```
+
+Differences vs the SSH path:
+
+- Single-file size limit defaults to 16 MiB (configurable via
+  `AIMUX_BRIDGE_MAX_FILE_SIZE` if you want to override it in code).
+- Files are written with mode 0o644; existing timestamps/permissions are not
+  preserved.
+- Symlinks are not followed on the remote side — they show up as `symlink`
+  entries in directory listings and are skipped during recursive download.
+- `..` segments in remote paths are rejected to prevent traversal.
 
 ## Tests
 
