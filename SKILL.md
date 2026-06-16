@@ -1,13 +1,13 @@
 ---
 name: aimux
-description: |
-    Use aimux when you need a long-lived shell session — a REPL, a build/server you
-    want to interact with across multiple commands, or anything running on a remote
-    SSH host. Use bash directly for one-shot commands. aimux gives you session
-    primitives, file-transfer helpers, and remote-host helpers; this skill
-    explains how to combine them.
+description: Use aimux when you need a long-lived shell session — a REPL, a build/server you want to interact with across multiple commands, or anything running on a remote SSH host. Use bash directly for one-shot commands. aimux gives you session primitives, file-transfer helpers, and remote-host helpers; this skill explains how to combine them.
 ---
 
+# Install
+
+```bash
+pip install aimux # or `uv pip install aimux` if using uv venv
+```
 
 # Usage
 

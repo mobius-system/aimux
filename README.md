@@ -1,40 +1,84 @@
 # aimux
 
-AI-agent-friendly tmux wrapper. See `design.md` for the full specification.
+`aimux` is an AI-agent-friendly tmux wrapper. 
+
+Use aimux when you need a long-lived shell session — a REPL, a build/server you
+want to interact with across multiple commands, or anything running on a remote
+SSH host. Use bash directly for one-shot commands. aimux gives you session
+primitives, file-transfer helpers, and remote-host helpers; this skill
+explains how to combine them.
 
 ## Install
 
 ```bash
-pip install -e .
+pip install aimux # or `uv pip install aimux` if using uv venv
 ```
 
-## Quick start
+
+
+# Usage
+
+`aimux` is tool that enables tmux-like capability cross ssh.
 
 ```bash
-# create a local session
-aimux new --name=dev
+(.venv) /home/.../...$ aimux -h
 
-# send a command, wait, then read the last 200 lines
-aimux send-keys local/dev -- "make test" Enter
-aimux wait-last-command-complete local/dev --timeout=5m --print-lines=200
+Usage: aimux [OPTIONS] COMMAND [ARGS]...
 
-# list everything
-aimux ls
+aimux — AI-agent-friendly tmux wrapper.
 
-# upload files or directories to an SSH host via sftp
-aimux send_files worker /tmp/upload ./dist ./README.md --gitignore
-aimux get_files worker ./downloads /tmp/upload/README.md /tmp/upload/dist
+─ Options
+--help  -h        Show this message and exit.
 
-# done
-aimux kill local/dev
+─ Commands 
+ls                          List all aimux sessions.
+new                         Create a new session.
+attach                      Attach to a session. ⚠️  Human use only — agents should use send-keys + capture.
+send-keys                   Send keys to a session. Behaves exactly like 'tmux send-keys': supports -F/-H/-K/-l/-M/-R/-X/-N <count>. Pass 'Enter' as a key to submit a line.     
+send_files                  Upload multiple local files or directories to an SSH host using sftp.
+get_files                   Download multiple remote files or directories from an SSH host using sftp.
+capture                     Capture pane output (last N lines).
+kill                        Destroy a single session. Does not accept wildcards or batch.
+wait-last-command-complete  Block until the pane's foreground process is back at a shell. Local sessions only.
+remote                      Remote-host management (reads/appends ~/.ssh/config).
 ```
 
-Remote sessions are local tmux sessions whose first pane runs `ssh <host>`:
+## Example
+
+1. adding and naming a remote host in `aimux`.
+
+First, usually you will get a ssh address, for example, 
+
+```text
+HostName localhost
+Port 8824
+User root
+```
+
+To begin, you will need to check whether this address is already inside `aimux`'s storage:
+```bash
+$ aimux remote ls
+HOST              USER  HOSTNAME    PORT  STATUS         RTT   
+github.com        git   github.com  22    auth-required  2261ms
+local-8824        root  localhost   8824  reachable      709ms
+```
+
+If not in storage, you will have to add that server using:
 
 ```bash
-aimux remote add --host=10.0.1.5 --port=22 --user=deploy --name=worker
-aimux new --remote=worker --name=task-1
+aimux remote add --host localhost --port 8824 --user root --name local-8824 --timeout 2s
+aimux remote test local-8824 --timeout 2s
 ```
+
+2. Creating a session and run command in it.
+
+```bash
+aimux new --remote local-8824 --name testsession
+aimux send-keys "local-8824/testsession" -- 'ls -la' Enter
+aimux capture "local-8824/testsession" --lines 200
+```
+
+3. Creating a bridge session.
 
 Bridge remotes are reverse-connected clients. Start a broker on the server,
 connect a client back to it, then create sessions through the same `--remote`
@@ -58,15 +102,23 @@ Windows bridge profiles include `cmd`, `powershell`, `pwsh`, and `mingw64`
 when available. macOS exposes `mac-pty` and `mac-terminal`; Linux exposes
 `posix-pty`.
 
-## Tests
+4. Upload and download files.
 
 ```bash
-python3 -m pytest
+# aimux send_files REMOTE REMOTE_DIR LOCAL_PATH... [--gitignore]
+# aimux get_files REMOTE LOCAL_DIR REMOTE_PATH...
+aimux send_files local-8824 /tmp/upload /home/testdir/tests
+aimux get_files local-8824 /home/testdir/tests /tmp/upload
 ```
 
-For the issue server `root@localhost:8824`, see the human-readable manual test
-in `tests/manual_localhost_8824_remote.md`. To verify a remote session by
-listing files on the target host, see `tests/remote_test.md`.
+Use `--gitignore` on upload when ignored files should be skipped:
 
-Command surface: session commands, file transfer commands, and remote host commands. See
-`design.md`.
+```bash
+aimux send_files local-8824 /tmp/upload /home/testdir/tests --gitignore
+```
+
+5. Clean up.
+
+```bash
+aimux kill "local-8824/testsession"
+```
