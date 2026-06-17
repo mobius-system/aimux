@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import platform
@@ -21,7 +22,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .bridge import BridgeError, validate_identifier
-from .transfer import validate_bridge_path
+from .transfer import (
+    DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE,
+    apply_sync_archive_b64,
+    build_sync_archive_b64,
+    validate_bridge_path,
+)
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -469,6 +475,10 @@ class ReverseClientRuntime:
             return self._file_mkdir(payload)
         if message_type == "file.list":
             return self._file_list(payload)
+        if message_type == "file.archive":
+            return self._file_archive(payload)
+        if message_type == "file.apply_archive":
+            return self._file_apply_archive(payload)
         raise BridgeError(f"unsupported bridge message type {message_type!r}")
 
     def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -587,7 +597,12 @@ class ReverseClientRuntime:
         if not path.exists():
             raise BridgeError(f"path does not exist: {path}", kind="not_found")
         if path.is_file():
-            entries = [{"path": str(path), "type": "file", "size": path.stat().st_size}]
+            entries = [{
+                "path": str(path),
+                "type": "file",
+                "size": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }]
             return {"entries": entries}
         if not path.is_dir():
             raise BridgeError(f"not a directory: {path}", kind="bad_request")
@@ -602,10 +617,49 @@ class ReverseClientRuntime:
                 entries.append({"path": str(child), "type": "symlink", "size": 0})
                 continue
             if child.is_file():
-                entries.append({"path": str(child), "type": "file", "size": child.stat().st_size})
+                entries.append({
+                    "path": str(child),
+                    "type": "file",
+                    "size": child.stat().st_size,
+                    "sha256": _sha256_file(child),
+                })
             elif child.is_dir():
                 entries.append({"path": str(child), "type": "dir", "size": 0})
         return {"entries": entries}
+
+    def _file_archive(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        if not path.is_dir():
+            raise BridgeError(f"not a directory: {path}", kind="bad_request")
+        rel_paths = payload.get("rel_paths") if isinstance(payload.get("rel_paths"), list) else []
+        dirs = payload.get("dirs") if isinstance(payload.get("dirs"), list) else []
+        max_size = int(payload.get("max_size") or DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE)
+        try:
+            archive_b64 = build_sync_archive_b64(
+                path,
+                [str(p) for p in rel_paths],
+                [str(d) for d in dirs],
+                max_archive_size=max_size,
+            )
+        except Exception as e:
+            raise BridgeError(str(e), kind="bad_request")
+        return {"archive_b64": archive_b64, "size": len(base64.b64decode(archive_b64 or ""))}
+
+    def _file_apply_archive(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        archive_b64 = str(payload.get("archive_b64") or "")
+        delete_paths = payload.get("delete_paths") if isinstance(payload.get("delete_paths"), list) else []
+        max_size = int(payload.get("max_size") or DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE)
+        try:
+            result = apply_sync_archive_b64(
+                path,
+                archive_b64,
+                delete_paths=[str(p) for p in delete_paths],
+                max_archive_size=max_size,
+            )
+        except Exception as e:
+            raise BridgeError(str(e), kind="bad_request")
+        return result
 
 
 def _post_json(url: str, token: str, payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:
@@ -616,6 +670,14 @@ def _post_json(url: str, token: str, payload: dict[str, Any], *, timeout: float 
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
     return json.loads(raw) if raw.strip() else {}
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _open_events(url: str, token: str, identifier: str):
