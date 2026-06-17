@@ -432,6 +432,40 @@ def cmd_get_files(
 
 # ---------- sync_dir ----------
 
+def _sync_dir_progress(phase: str, payload: dict[str, object]) -> None:
+    if phase == "scan_source":
+        print(f"sync_dir: scanning {payload.get('location')} source {payload.get('path')}")
+        return
+    if phase == "scan_destination":
+        print(f"sync_dir: scanning {payload.get('location')} destination {payload.get('path')}")
+        return
+    if phase == "plan":
+        print(
+            "sync_dir: plan "
+            f"{payload.get('changed_files')} changed file(s), "
+            f"{payload.get('deleted_paths')} delete(s), "
+            f"{payload.get('dirs')} new dir(s)"
+        )
+        return
+    if phase == "archive":
+        print(
+            f"sync_dir: building archive with {payload.get('files')} file(s) "
+            f"and {payload.get('dirs')} dir(s)"
+        )
+        return
+    if phase == "transfer":
+        print(f"sync_dir: transferring archive ({payload.get('archive_size')} byte(s))")
+        return
+    if phase == "apply":
+        print(f"sync_dir: applying changes on {payload.get('location')}")
+        return
+    if phase == "noop":
+        print("sync_dir: no changes")
+        return
+    if phase == "done":
+        print("sync_dir: done")
+
+
 @app.command("sync_dir", help="Differentially synchronize a local directory with a bridge remote directory.")
 def cmd_sync_dir(
     remote: Annotated[str, typer.Argument(help="Bridge remote name.")],
@@ -445,6 +479,13 @@ def cmd_sync_dir(
         bool,
         typer.Option("--from-remote", help="Sync REMOTE:REMOTE_PATH to LOCAL_PATH."),
     ] = False,
+    exclude: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--exclude",
+            help="Exclude a file or directory pattern from sync; may be used multiple times.",
+        ),
+    ] = None,
 ):
     if to_remote == from_remote:
         err("error: exactly one of --to-remote or --from-remote is required")
@@ -466,6 +507,8 @@ def cmd_sync_dir(
             local_path,
             to_remote=to_remote,
             from_remote=from_remote,
+            progress=_sync_dir_progress,
+            exclude=exclude or (),
         )
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
