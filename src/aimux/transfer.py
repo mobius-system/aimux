@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import fnmatch
 import hashlib
 import io
 import os
@@ -12,7 +13,7 @@ import subprocess
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
     from . import bridge as bridge_mod
@@ -434,6 +435,7 @@ _validate_sftp_path = validate_transfer_path
 
 DEFAULT_BRIDGE_MAX_FILE_SIZE = 16 * 1024 * 1024
 DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE = 64 * 1024 * 1024
+SyncProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 def bridge_send_files(
@@ -529,6 +531,8 @@ def bridge_sync_dir(
     to_remote: bool = False,
     from_remote: bool = False,
     max_archive_size: int = DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE,
+    progress: SyncProgressCallback | None = None,
+    exclude: Iterable[str] = (),
 ) -> SyncDirResult:
     """Synchronize one directory through a bridge remote using Python-built tar archives."""
     if to_remote == from_remote:
@@ -539,17 +543,47 @@ def bridge_sync_dir(
 
     local_root = Path(local_path).expanduser()
     validate_transfer_path(str(local_root))
+    exclude_patterns = _normalize_sync_excludes(exclude)
 
     if to_remote:
-        source = _local_dir_snapshot(local_root, must_exist=True)
-        destination = _bridge_dir_snapshot(client, remote, remote_path, must_exist=False)
+        _emit_sync_progress(progress, "scan_source", location="local", path=str(local_root))
+        source = _local_dir_snapshot(local_root, must_exist=True, exclude=exclude_patterns)
+        _emit_sync_progress(
+            progress,
+            "scan_destination",
+            location="remote",
+            remote=remote,
+            path=remote_path,
+        )
+        destination = _bridge_dir_snapshot(
+            client,
+            remote,
+            remote_path,
+            must_exist=False,
+            exclude=exclude_patterns,
+        )
         plan = _build_sync_dir_plan(source, destination)
+        _emit_sync_plan(progress, plan)
         if plan.has_work:
-            archive_b64 = build_sync_archive_b64(
+            _emit_sync_progress(
+                progress,
+                "archive",
+                direction="to-remote",
+                files=len(plan.changed_files),
+                dirs=len(plan.dirs),
+            )
+            archive = build_sync_archive_bytes(
                 local_root.resolve(),
                 plan.changed_files,
                 plan.dirs,
                 max_archive_size=max_archive_size,
+            )
+            archive_b64 = base64.b64encode(archive).decode("ascii")
+            _emit_sync_progress(
+                progress,
+                "transfer",
+                direction="to-remote",
+                archive_size=len(archive),
             )
             client.file_apply_archive(
                 remote=remote,
@@ -558,6 +592,10 @@ def bridge_sync_dir(
                 delete_paths=list(plan.deleted_paths),
                 max_size=max_archive_size,
             )
+            _emit_sync_progress(progress, "apply", location="remote", remote=remote, path=remote_path)
+        else:
+            _emit_sync_progress(progress, "noop")
+        _emit_sync_progress(progress, "done", direction="to-remote")
         return SyncDirResult(
             direction="to-remote",
             remote=remote,
@@ -568,10 +606,32 @@ def bridge_sync_dir(
             created_dirs=len([d for d in plan.dirs if d != "."]),
         )
 
-    source = _bridge_dir_snapshot(client, remote, remote_path, must_exist=True)
-    destination = _local_dir_snapshot(local_root, must_exist=False)
+    _emit_sync_progress(
+        progress,
+        "scan_source",
+        location="remote",
+        remote=remote,
+        path=remote_path,
+    )
+    source = _bridge_dir_snapshot(
+        client,
+        remote,
+        remote_path,
+        must_exist=True,
+        exclude=exclude_patterns,
+    )
+    _emit_sync_progress(progress, "scan_destination", location="local", path=str(local_root))
+    destination = _local_dir_snapshot(local_root, must_exist=False, exclude=exclude_patterns)
     plan = _build_sync_dir_plan(source, destination)
+    _emit_sync_plan(progress, plan)
     if plan.has_work:
+        _emit_sync_progress(
+            progress,
+            "archive",
+            direction="from-remote",
+            files=len(plan.changed_files),
+            dirs=len(plan.dirs),
+        )
         response = client.file_archive(
             remote=remote,
             path=remote_path,
@@ -580,12 +640,23 @@ def bridge_sync_dir(
             max_size=max_archive_size,
         )
         archive_b64 = str(response.get("archive_b64") or "")
+        archive_size = int(response.get("size") or 0)
+        _emit_sync_progress(
+            progress,
+            "transfer",
+            direction="from-remote",
+            archive_size=archive_size,
+        )
         apply_sync_archive_b64(
             local_root,
             archive_b64,
             delete_paths=plan.deleted_paths,
             max_archive_size=max_archive_size,
         )
+        _emit_sync_progress(progress, "apply", location="local", path=str(local_root))
+    else:
+        _emit_sync_progress(progress, "noop")
+    _emit_sync_progress(progress, "done", direction="from-remote")
     return SyncDirResult(
         direction="from-remote",
         remote=remote,
@@ -682,6 +753,16 @@ def apply_sync_archive_bytes(
     root_path = _resolve_sync_root(Path(root), must_exist=False)
     root_path.mkdir(parents=True, exist_ok=True)
 
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        members = tar.getmembers()
+        for member in members:
+            rel = member.name
+            if rel == ".":
+                continue
+            _validate_sync_rel(rel)
+            if not member.isdir() and not member.isfile():
+                raise TransferError(f"sync archive contains unsupported entry: {rel}")
+
     deleted = 0
     for rel in sorted(dict.fromkeys(delete_paths), key=lambda p: (p.count("/"), p), reverse=True):
         if rel == ".":
@@ -725,7 +806,28 @@ def apply_sync_archive_bytes(
     return {"files": files, "dirs": dirs, "deleted": deleted}
 
 
-def _local_dir_snapshot(root: Path, *, must_exist: bool) -> SyncSnapshot:
+def _emit_sync_plan(progress: SyncProgressCallback | None, plan: SyncDirPlan) -> None:
+    _emit_sync_progress(
+        progress,
+        "plan",
+        changed_files=len(plan.changed_files),
+        deleted_paths=len(plan.deleted_paths),
+        dirs=len(plan.dirs),
+    )
+
+
+def _emit_sync_progress(progress: SyncProgressCallback | None, phase: str, **fields: Any) -> None:
+    if progress is None:
+        return
+    progress(phase, fields)
+
+
+def _local_dir_snapshot(
+    root: Path,
+    *,
+    must_exist: bool,
+    exclude: Iterable[str] = (),
+) -> SyncSnapshot:
     root = _resolve_sync_root(root, must_exist=must_exist)
     if not root.exists():
         return SyncSnapshot(files={}, dirs={"."}, root_exists=False)
@@ -734,10 +836,13 @@ def _local_dir_snapshot(root: Path, *, must_exist: bool) -> SyncSnapshot:
 
     files: dict[str, SyncFile] = {}
     dirs: set[str] = {"."}
+    exclude_patterns = _normalize_sync_excludes(exclude)
     for child in sorted(root.rglob("*")):
         rel = child.relative_to(root).as_posix()
         _validate_sync_rel(rel)
         if child.is_symlink():
+            continue
+        if _sync_path_excluded(rel, child.is_dir(), exclude_patterns):
             continue
         if child.is_dir():
             dirs.add(rel)
@@ -753,6 +858,7 @@ def _bridge_dir_snapshot(
     remote_path: str,
     *,
     must_exist: bool,
+    exclude: Iterable[str] = (),
 ) -> SyncSnapshot:
     validate_bridge_path(remote_path)
     stat = client.file_stat(remote=remote, path=remote_path)
@@ -771,6 +877,7 @@ def _bridge_dir_snapshot(
 
     files: dict[str, SyncFile] = {}
     dirs: set[str] = {"."}
+    exclude_patterns = _normalize_sync_excludes(exclude)
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -782,6 +889,8 @@ def _bridge_dir_snapshot(
         if not rel:
             continue
         _validate_sync_rel(rel)
+        if _sync_path_excluded(rel, item_type == "dir", exclude_patterns):
+            continue
         if item_type == "dir":
             dirs.add(rel)
             continue
@@ -822,6 +931,63 @@ def _build_sync_dir_plan(source: SyncSnapshot, destination: SyncSnapshot) -> Syn
 
 def _sort_sync_dirs(dirs: set[str]) -> tuple[str, ...]:
     return tuple(sorted(dirs, key=lambda d: (d.count("/"), d)))
+
+
+def _normalize_sync_excludes(exclude: Iterable[str]) -> tuple[str, ...]:
+    patterns: list[str] = []
+    for raw in exclude:
+        pattern = str(raw).replace("\\", "/").strip()
+        validate_transfer_path(pattern)
+        while pattern.startswith("./"):
+            pattern = pattern[2:]
+        if pattern:
+            patterns.append(pattern)
+    return tuple(patterns)
+
+
+def _sync_path_excluded(rel: str, is_dir: bool, patterns: Iterable[str]) -> bool:
+    normalized = rel.replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    for pattern in patterns:
+        dir_only = pattern.endswith("/")
+        candidate = pattern.rstrip("/")
+        anchored = candidate.startswith("/")
+        candidate = candidate.lstrip("/") if anchored else candidate
+        if not candidate:
+            continue
+        if dir_only:
+            if any(
+                _sync_exclude_pattern_matches(dir_path, candidate, anchored)
+                for dir_path in _sync_ancestor_dirs(normalized, is_dir)
+            ):
+                return True
+            continue
+        if _sync_exclude_pattern_matches(normalized, candidate, anchored):
+            return True
+    return False
+
+
+def _sync_ancestor_dirs(rel: str, is_dir: bool) -> list[str]:
+    parts = rel.split("/")
+    if not is_dir:
+        parts = parts[:-1]
+    out: list[str] = []
+    current: list[str] = []
+    for part in parts:
+        current.append(part)
+        out.append("/".join(current))
+    return out
+
+
+def _sync_exclude_pattern_matches(rel: str, pattern: str, anchored: bool) -> bool:
+    if anchored:
+        return fnmatch.fnmatchcase(rel, pattern)
+    if "/" in pattern:
+        return fnmatch.fnmatchcase(rel, pattern) or fnmatch.fnmatchcase(rel, f"*/{pattern}")
+    if fnmatch.fnmatchcase(posixpath.basename(rel), pattern):
+        return True
+    return any(fnmatch.fnmatchcase(part, pattern) for part in rel.split("/"))
 
 
 def _resolve_sync_root(root: Path, *, must_exist: bool) -> Path:

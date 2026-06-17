@@ -582,6 +582,133 @@ def test_bridge_sync_dir_from_remote_downloads_archive_and_deletes_stale(tmp_pat
     assert (local / "empty").is_dir()
 
 
+def test_bridge_sync_dir_to_remote_excludes_and_protects_paths(tmp_path):
+    local = tmp_path / "local"
+    (local / "cache").mkdir(parents=True)
+    (local / "keep.txt").write_text("keep", encoding="utf-8")
+    (local / "secret.env").write_text("local secret", encoding="utf-8")
+    (local / "cache" / "out.bin").write_text("local cache", encoding="utf-8")
+
+    fake = FakeBridgeControlClient()
+    fake.remote_dirs.update({"/remote/proj", "/remote/proj/cache"})
+    fake.remote_files["/remote/proj/secret.env"] = b"remote secret"
+    fake.remote_files["/remote/proj/cache/out.bin"] = b"remote cache"
+    fake.remote_files["/remote/proj/stale.txt"] = b"stale"
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    result = transfer.bridge_sync_dir(
+        fake,
+        "remote-1",
+        "/remote/proj",
+        local,
+        to_remote=True,
+        exclude=["*.env", "cache/"],
+        progress=lambda phase, payload: events.append((phase, payload)),
+    )
+
+    assert result.synced_files == 1
+    assert result.deleted_paths == 1
+    assert fake.remote_files["/remote/proj/keep.txt"] == b"keep"
+    assert fake.remote_files["/remote/proj/secret.env"] == b"remote secret"
+    assert fake.remote_files["/remote/proj/cache/out.bin"] == b"remote cache"
+    assert "/remote/proj/stale.txt" not in fake.remote_files
+    phases = [phase for phase, _ in events]
+    assert phases == [
+        "scan_source",
+        "scan_destination",
+        "plan",
+        "archive",
+        "transfer",
+        "apply",
+        "done",
+    ]
+    assert events[2][1] == {"changed_files": 1, "deleted_paths": 1, "dirs": 0}
+
+
+def test_bridge_sync_dir_from_remote_excludes_and_protects_paths(tmp_path):
+    local = tmp_path / "local"
+    (local / "cache").mkdir(parents=True)
+    (local / "secret.env").write_text("local secret", encoding="utf-8")
+    (local / "cache" / "out.bin").write_text("local cache", encoding="utf-8")
+    (local / "stale.txt").write_text("stale", encoding="utf-8")
+
+    fake = FakeBridgeControlClient()
+    fake.remote_dirs.update({"/remote/proj", "/remote/proj/cache"})
+    fake.remote_files["/remote/proj/keep.txt"] = b"keep"
+    fake.remote_files["/remote/proj/secret.env"] = b"remote secret"
+    fake.remote_files["/remote/proj/cache/out.bin"] = b"remote cache"
+
+    result = transfer.bridge_sync_dir(
+        fake,
+        "remote-1",
+        "/remote/proj",
+        local,
+        from_remote=True,
+        exclude=["*.env", "cache/"],
+    )
+
+    assert result.synced_files == 1
+    assert result.deleted_paths == 1
+    assert (local / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert (local / "secret.env").read_text(encoding="utf-8") == "local secret"
+    assert (local / "cache" / "out.bin").read_text(encoding="utf-8") == "local cache"
+    assert not (local / "stale.txt").exists()
+
+
+def test_bridge_sync_dir_noop_emits_progress_without_applying(tmp_path):
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "same.txt").write_text("same", encoding="utf-8")
+
+    fake = FakeBridgeControlClient()
+    fake.remote_dirs.add("/remote/proj")
+    fake.remote_files["/remote/proj/same.txt"] = b"same"
+
+    def fail_apply_archive(**kwargs):
+        pytest.fail("file_apply_archive should not run when sync_dir has no work")
+
+    fake.file_apply_archive = fail_apply_archive  # type: ignore[method-assign]
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    result = transfer.bridge_sync_dir(
+        fake,
+        "remote-1",
+        "/remote/proj",
+        local,
+        to_remote=True,
+        progress=lambda phase, payload: events.append((phase, payload)),
+    )
+
+    assert result.synced_files == 0
+    assert result.deleted_paths == 0
+    assert [phase for phase, _ in events] == [
+        "scan_source",
+        "scan_destination",
+        "plan",
+        "noop",
+        "done",
+    ]
+
+
+def test_apply_sync_archive_validates_archive_before_deleting(tmp_path):
+    root = tmp_path / "target"
+    root.mkdir()
+    stale = root / "stale.txt"
+    stale.write_text("keep until archive is valid", encoding="utf-8")
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo("bad-link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "elsewhere"
+        tar.addfile(info)
+
+    with pytest.raises(transfer.TransferError, match="unsupported entry"):
+        transfer.apply_sync_archive_bytes(root, buf.getvalue(), delete_paths=["stale.txt"])
+
+    assert stale.read_text(encoding="utf-8") == "keep until archive is valid"
+
+
 # ---------------------------------------------------------------------------
 # CLI dispatch (send_files / get_files route to bridge remote when applicable)
 # ---------------------------------------------------------------------------
@@ -648,15 +775,28 @@ def test_cli_sync_dir_dispatches_to_bridge(monkeypatch, tmp_path):
     local = tmp_path / "project"
     local.mkdir()
     (local / "a.txt").write_text("hello", encoding="utf-8")
+    (local / "ignored.txt").write_text("ignored", encoding="utf-8")
 
     result = CliRunner().invoke(
         app,
-        ["sync_dir", "--to-remote", "remote-1", "/remote/project", str(local)],
+        [
+            "sync_dir",
+            "--to-remote",
+            "--exclude",
+            "ignored.txt",
+            "remote-1",
+            "/remote/project",
+            str(local),
+        ],
     )
 
     assert result.exit_code == EXIT_OK, result.output
+    assert "sync_dir: scanning local source" in result.output
+    assert "sync_dir: plan 1 changed file(s), 0 delete(s), 1 new dir(s)" in result.output
+    assert "sync_dir: transferring archive" in result.output
     assert "synced 1 file(s) to bridge remote remote-1:/remote/project" in result.output
     assert fake.remote_files["/remote/project/a.txt"] == b"hello"
+    assert "/remote/project/ignored.txt" not in fake.remote_files
 
 
 def test_cli_send_files_falls_through_to_ssh_error_when_no_bridge(monkeypatch, tmp_path):
