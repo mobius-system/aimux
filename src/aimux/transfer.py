@@ -469,7 +469,7 @@ def bridge_get_files(
         if rtype == "dir":
             _bridge_download_dir(client, remote, remote_path, destination, max_file_size, entries)
         elif rtype == "file":
-            local_file = destination / _remote_basename(remote_path)
+            local_file = destination / _bridge_remote_basename(remote_path)
             _bridge_download_one(client, remote, remote_path, local_file, int(stat.get("size") or 0), max_file_size)
             entries.append(DownloadEntry(remote=remote_path, local=local_file))
         else:
@@ -487,7 +487,7 @@ def _bridge_download_dir(
     max_file_size: int,
     entries: list[DownloadEntry],
 ) -> None:
-    base_name = _remote_basename(remote_root)
+    base_name = _bridge_remote_basename(remote_root)
     listing = client.file_list(remote=remote, path=remote_root, recursive=True)
     items = listing.get("entries") if isinstance(listing, dict) else None
     if not isinstance(items, list):
@@ -499,7 +499,9 @@ def _bridge_download_dir(
         item_path = str(item.get("path") or "")
         if item_type != "file" or not item_path:
             continue
-        rel = _remote_relpath(remote_root, item_path)
+        rel = _bridge_remote_relpath(remote_root, item_path)
+        if not rel:
+            continue
         local_file = destination / base_name / rel
         local_file.parent.mkdir(parents=True, exist_ok=True)
         size = int(item.get("size") or 0)
@@ -542,3 +544,24 @@ def _remote_relpath(base: str, target: str) -> str:
     if target_norm.startswith(base_norm + "/"):
         return target_norm[len(base_norm) + 1:]
     return posixpath.basename(target_norm)
+
+
+def _bridge_remote_basename(remote_path: str) -> str:
+    """Return the final component of a bridge path using either POSIX or Windows separators."""
+    cleaned = remote_path.rstrip("/\\")
+    index = max(cleaned.rfind("/"), cleaned.rfind("\\"))
+    name = cleaned[index + 1:] if index >= 0 else cleaned
+    if not name or name in (".", ".."):
+        raise TransferError(f"remote path must include a file or directory name: {remote_path}")
+    return name
+
+
+def _bridge_remote_relpath(base: str, target: str) -> str:
+    """Return a bridge target path relative to base, accepting '/' or '\\' from the client."""
+    base_norm = base.replace("\\", "/").rstrip("/")
+    target_norm = target.replace("\\", "/").rstrip("/")
+    if target_norm == base_norm:
+        return ""
+    if target_norm.startswith(base_norm + "/"):
+        return target_norm[len(base_norm) + 1:]
+    return _bridge_remote_basename(target_norm)
