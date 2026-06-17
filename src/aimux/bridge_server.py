@@ -225,7 +225,7 @@ class BridgeBrokerState:
         return result or {"ok": True}
 
     def file_op(self, remote: str, action: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-        if action not in {"stat", "read", "write", "mkdir", "list"}:
+        if action not in {"stat", "read", "write", "mkdir", "list", "archive", "apply_archive"}:
             raise BridgeError(f"unknown file action {action!r}", kind="bad_request")
         return self.submit(remote, f"file.{action}", payload, timeout)
 

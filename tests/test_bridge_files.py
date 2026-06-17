@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import os
+import tarfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -101,6 +104,36 @@ def test_file_list_non_recursive_returns_only_immediate_children(tmp_path):
     paths = {e["path"] for e in result["entries"]}
     assert types == {"file", "dir"}
     assert str(tmp_path / "x" / "sub" / "deep.txt") not in paths
+
+
+def test_file_archive_and_apply_archive_round_trip(tmp_path):
+    runtime = _runtime()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "keep.txt").write_text("new", encoding="utf-8")
+    (source / "empty").mkdir()
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    (destination / "stale.txt").write_text("old", encoding="utf-8")
+
+    archive = runtime.handle(
+        "file.archive",
+        {"path": str(source), "rel_paths": ["keep.txt"], "dirs": ["empty"]},
+    )
+    result = runtime.handle(
+        "file.apply_archive",
+        {
+            "path": str(destination),
+            "archive_b64": archive["archive_b64"],
+            "delete_paths": ["stale.txt"],
+        },
+    )
+
+    assert result["files"] == 1
+    assert result["deleted"] == 1
+    assert (destination / "keep.txt").read_text(encoding="utf-8") == "new"
+    assert (destination / "empty").is_dir()
+    assert not (destination / "stale.txt").exists()
 
 
 def test_file_handlers_reject_paths_with_control_chars():
@@ -277,15 +310,95 @@ class FakeBridgeControlClient:
         prefix = _remote_key(path).rstrip("/") + "/"
         for key, value in self.remote_files.items():
             if _remote_key(key).startswith(prefix):
-                entries.append({"path": key, "type": "file", "size": len(value)})
+                entries.append({
+                    "path": key,
+                    "type": "file",
+                    "size": len(value),
+                    "sha256": hashlib.sha256(value).hexdigest(),
+                })
         for d in self.remote_dirs:
             if _remote_key(d).startswith(prefix):
                 entries.append({"path": d, "type": "dir", "size": 0})
         return {"entries": entries}
 
+    def file_archive(
+        self,
+        *,
+        remote: str,
+        path: str,
+        rel_paths: list[str],
+        dirs: list[str],
+        max_size=None,
+        timeout: float = 180.0,
+    ):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for rel in sorted(d for d in dirs if d != "."):
+                info = tarfile.TarInfo(rel)
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                tar.addfile(info)
+            for rel in sorted(rel_paths):
+                key = _remote_join(path, rel)
+                data = self.remote_files[key]
+                info = tarfile.TarInfo(rel)
+                info.size = len(data)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+        data = buf.getvalue()
+        return {"archive_b64": base64.b64encode(data).decode("ascii"), "size": len(data)}
+
+    def file_apply_archive(
+        self,
+        *,
+        remote: str,
+        path: str,
+        archive_b64: str,
+        delete_paths: list[str],
+        max_size=None,
+        timeout: float = 180.0,
+    ):
+        deleted = 0
+        for rel in sorted(delete_paths, key=lambda p: (p.count("/"), p), reverse=True):
+            key = _remote_join(path, rel)
+            if key in self.remote_files:
+                del self.remote_files[key]
+                deleted += 1
+            if key in self.remote_dirs:
+                self.remote_dirs.remove(key)
+                deleted += 1
+            prefix = _remote_key(key).rstrip("/") + "/"
+            for file_key in list(self.remote_files):
+                if _remote_key(file_key).startswith(prefix):
+                    del self.remote_files[file_key]
+            for dir_key in list(self.remote_dirs):
+                if _remote_key(dir_key).startswith(prefix):
+                    self.remote_dirs.remove(dir_key)
+
+        self.remote_dirs.add(path)
+        files = 0
+        dirs = 0
+        data = base64.b64decode(archive_b64)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                key = _remote_join(path, member.name)
+                if member.isdir():
+                    self.remote_dirs.add(key)
+                    dirs += 1
+                elif member.isfile():
+                    extracted = tar.extractfile(member)
+                    assert extracted is not None
+                    self.remote_files[key] = extracted.read()
+                    files += 1
+        return {"files": files, "dirs": dirs, "deleted": deleted}
+
 
 def _remote_key(path: str) -> str:
     return path.replace("\\", "/")
+
+
+def _remote_join(root: str, rel: str) -> str:
+    return _remote_key(root).rstrip("/") + "/" + rel
 
 
 def test_bridge_send_files_uploads_single_file(tmp_path):
@@ -411,6 +524,64 @@ def test_bridge_get_files_enforces_size_limit(tmp_path):
         transfer.bridge_get_files(fake, "remote-1", ["/remote/huge.bin"], dest, max_file_size=100)
 
 
+def test_bridge_sync_dir_to_remote_sends_changed_files_and_deletes_stale(tmp_path):
+    local = tmp_path / "local"
+    (local / "sub").mkdir(parents=True)
+    (local / "same.txt").write_text("same", encoding="utf-8")
+    (local / "changed.txt").write_text("new", encoding="utf-8")
+    (local / "sub" / "child.txt").write_text("child", encoding="utf-8")
+
+    fake = FakeBridgeControlClient()
+    fake.remote_dirs.update({"/remote/proj", "/remote/proj/sub", "/remote/proj/old"})
+    fake.remote_files["/remote/proj/same.txt"] = b"same"
+    fake.remote_files["/remote/proj/changed.txt"] = b"old"
+    fake.remote_files["/remote/proj/stale.txt"] = b"stale"
+
+    result = transfer.bridge_sync_dir(
+        fake,
+        "remote-1",
+        "/remote/proj",
+        local,
+        to_remote=True,
+    )
+
+    assert result.synced_files == 2
+    assert result.deleted_paths == 2
+    assert fake.remote_files["/remote/proj/same.txt"] == b"same"
+    assert fake.remote_files["/remote/proj/changed.txt"] == b"new"
+    assert fake.remote_files["/remote/proj/sub/child.txt"] == b"child"
+    assert "/remote/proj/stale.txt" not in fake.remote_files
+    assert "/remote/proj/old" not in fake.remote_dirs
+
+
+def test_bridge_sync_dir_from_remote_downloads_archive_and_deletes_stale(tmp_path):
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "same.txt").write_text("same", encoding="utf-8")
+    (local / "changed.txt").write_text("old", encoding="utf-8")
+    (local / "stale.txt").write_text("stale", encoding="utf-8")
+
+    fake = FakeBridgeControlClient()
+    fake.remote_dirs.update({"/remote/proj", "/remote/proj/empty"})
+    fake.remote_files["/remote/proj/same.txt"] = b"same"
+    fake.remote_files["/remote/proj/changed.txt"] = b"new"
+
+    result = transfer.bridge_sync_dir(
+        fake,
+        "remote-1",
+        "/remote/proj",
+        local,
+        from_remote=True,
+    )
+
+    assert result.synced_files == 1
+    assert result.deleted_paths == 1
+    assert (local / "same.txt").read_text(encoding="utf-8") == "same"
+    assert (local / "changed.txt").read_text(encoding="utf-8") == "new"
+    assert not (local / "stale.txt").exists()
+    assert (local / "empty").is_dir()
+
+
 # ---------------------------------------------------------------------------
 # CLI dispatch (send_files / get_files route to bridge remote when applicable)
 # ---------------------------------------------------------------------------
@@ -466,6 +637,26 @@ def test_cli_get_files_dispatches_to_bridge(monkeypatch, tmp_path):
     assert result.exit_code == EXIT_OK, result.output
     assert "downloaded 1 path(s) from bridge remote remote-1" in result.output
     assert (dest / "data.txt").read_bytes() == b"payload"
+
+
+def test_cli_sync_dir_dispatches_to_bridge(monkeypatch, tmp_path):
+    CliRunner, app, EXIT_OK, _ = _load_cli()
+    fake = CapturingFakeBridgeClient()
+    _patch_bridge_remote(monkeypatch, fake)
+    monkeypatch.setattr("aimux.cli.ssh_mod.host_exists", lambda name: False)
+
+    local = tmp_path / "project"
+    local.mkdir()
+    (local / "a.txt").write_text("hello", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        ["sync_dir", "--to-remote", "remote-1", "/remote/project", str(local)],
+    )
+
+    assert result.exit_code == EXIT_OK, result.output
+    assert "synced 1 file(s) to bridge remote remote-1:/remote/project" in result.output
+    assert fake.remote_files["/remote/project/a.txt"] == b"hello"
 
 
 def test_cli_send_files_falls_through_to_ssh_error_when_no_bridge(monkeypatch, tmp_path):

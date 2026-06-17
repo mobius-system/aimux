@@ -430,6 +430,61 @@ def cmd_get_files(
     print(f"downloaded {result.downloaded_paths} path(s) from {remote} to {result.plan.local_dir}")
 
 
+# ---------- sync_dir ----------
+
+@app.command("sync_dir", help="Differentially synchronize a local directory with a bridge remote directory.")
+def cmd_sync_dir(
+    remote: Annotated[str, typer.Argument(help="Bridge remote name.")],
+    remote_path: Annotated[str, typer.Argument(help="Remote directory path.")],
+    local_path: Annotated[str, typer.Argument(help="Local directory path.")],
+    to_remote: Annotated[
+        bool,
+        typer.Option("--to-remote", help="Sync LOCAL_PATH to REMOTE:REMOTE_PATH."),
+    ] = False,
+    from_remote: Annotated[
+        bool,
+        typer.Option("--from-remote", help="Sync REMOTE:REMOTE_PATH to LOCAL_PATH."),
+    ] = False,
+):
+    if to_remote == from_remote:
+        err("error: exactly one of --to-remote or --from-remote is required")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    bridge_client_ctl, bridge_info = _bridge_remote(remote)
+    if bridge_client_ctl is None or bridge_info is None:
+        err(f"error: bridge remote {remote!r} not found")
+        raise typer.Exit(EXIT_USER_ERROR)
+    if bridge_info.get("status") != "connected":
+        err(f"error: bridge remote {remote!r} is disconnected")
+        raise typer.Exit(EXIT_SSH_UNREACHABLE)
+
+    try:
+        result = transfer.bridge_sync_dir(
+            bridge_client_ctl,
+            remote,
+            remote_path,
+            local_path,
+            to_remote=to_remote,
+            from_remote=from_remote,
+        )
+    except bridge.BridgeError as e:
+        _exit_bridge_error(e)
+    except transfer.TransferError as e:
+        err(f"error: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    if result.direction == "to-remote":
+        print(
+            f"synced {result.synced_files} file(s) to bridge remote {remote}:{remote_path}; "
+            f"deleted {result.deleted_paths} path(s)"
+        )
+    else:
+        print(
+            f"synced {result.synced_files} file(s) from bridge remote {remote}:{remote_path} "
+            f"to {result.local_path}; deleted {result.deleted_paths} path(s)"
+        )
+
+
 # ---------- capture ----------
 
 @app.command("capture", help="Capture pane output (last N lines).")

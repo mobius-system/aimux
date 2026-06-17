@@ -359,6 +359,52 @@ class BridgeControlClient:
             timeout=timeout,
         )
 
+    def file_archive(
+        self,
+        *,
+        remote: str,
+        path: str,
+        rel_paths: list[str],
+        dirs: list[str],
+        max_size: int | None = None,
+        timeout: float = 180.0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"path": path, "rel_paths": rel_paths, "dirs": dirs}
+        if max_size is not None:
+            payload["max_size"] = int(max_size)
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/archive",
+            self.runtime.token,
+            payload,
+            timeout=timeout,
+        )
+
+    def file_apply_archive(
+        self,
+        *,
+        remote: str,
+        path: str,
+        archive_b64: str,
+        delete_paths: list[str],
+        max_size: int | None = None,
+        timeout: float = 180.0,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "path": path,
+            "archive_b64": archive_b64,
+            "delete_paths": delete_paths,
+        }
+        if max_size is not None:
+            payload["max_size"] = int(max_size)
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/apply_archive",
+            self.runtime.token,
+            payload,
+            timeout=timeout,
+        )
+
 
 def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
