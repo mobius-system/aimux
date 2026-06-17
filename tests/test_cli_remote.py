@@ -69,6 +69,7 @@ def test_remote_test_json_rejects_missing_host(tmp_path, monkeypatch):
 def test_new_remote_missing_host_fails_before_tmux_create(tmp_path, monkeypatch):
     config = _write_ssh_config(tmp_path)
     monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
+    monkeypatch.setattr("aimux.cli._bridge_remote", lambda name: (None, None))
     monkeypatch.setattr(tmux, "has_session", lambda name: False)
     monkeypatch.setattr(
         tmux,
