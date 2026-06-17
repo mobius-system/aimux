@@ -1,6 +1,7 @@
 """Reverse bridge client and terminal profile adapters."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import platform
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .bridge import BridgeError, validate_identifier
+from .transfer import validate_bridge_path
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -457,6 +459,16 @@ class ReverseClientRuntime:
             return self._kill(payload)
         if message_type == "session.list":
             return {"sessions": [session.to_dict() for session in self.sessions.values()]}
+        if message_type == "file.stat":
+            return self._file_stat(payload)
+        if message_type == "file.read":
+            return self._file_read(payload)
+        if message_type == "file.write":
+            return self._file_write(payload)
+        if message_type == "file.mkdir":
+            return self._file_mkdir(payload)
+        if message_type == "file.list":
+            return self._file_list(payload)
         raise BridgeError(f"unsupported bridge message type {message_type!r}")
 
     def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -513,6 +525,88 @@ class ReverseClientRuntime:
         self.sessions.pop(name, None)
         return {"ok": True}
 
+    def _file_path(self, payload: dict[str, Any]) -> Path:
+        raw = str(payload.get("path") or "")
+        if not raw:
+            raise BridgeError("file path is required", kind="bad_request")
+        try:
+            validate_bridge_path(raw)
+        except Exception as e:
+            raise BridgeError(str(e), kind="bad_request")
+        return Path(raw).expanduser()
+
+    def _file_stat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        if path.is_symlink() or not path.exists():
+            return {"exists": False, "type": "none", "size": 0}
+        if path.is_file():
+            return {"exists": True, "type": "file", "size": path.stat().st_size}
+        if path.is_dir():
+            return {"exists": True, "type": "dir", "size": 0}
+        return {"exists": True, "type": "other", "size": path.stat().st_size}
+
+    def _file_read(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        if not path.is_file():
+            raise BridgeError(f"not a regular file: {path}", kind="not_found")
+        data = path.read_bytes()
+        return {
+            "content_b64": base64.b64encode(data).decode("ascii"),
+            "size": len(data),
+        }
+
+    def _file_write(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        content_b64 = str(payload.get("content_b64") or "")
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except (ValueError, base64.binascii.Error) as e:
+            raise BridgeError(f"invalid base64 payload: {e}", kind="bad_request")
+        max_size = int(payload.get("max_size") or 0) or 0
+        if max_size and len(data) > max_size:
+            raise BridgeError(
+                f"file size {len(data)} exceeds bridge limit {max_size}", kind="too_large"
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        mode_value = payload.get("mode")
+        if isinstance(mode_value, int) and 0 <= mode_value <= 0o777:
+            try:
+                os.chmod(path, mode_value)
+            except OSError:
+                pass
+        return {"size": len(data)}
+
+    def _file_mkdir(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        path.mkdir(parents=True, exist_ok=True)
+        return {"ok": True}
+
+    def _file_list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        if not path.exists():
+            raise BridgeError(f"path does not exist: {path}", kind="not_found")
+        if path.is_file():
+            entries = [{"path": str(path), "type": "file", "size": path.stat().st_size}]
+            return {"entries": entries}
+        if not path.is_dir():
+            raise BridgeError(f"not a directory: {path}", kind="bad_request")
+        recursive = bool(payload.get("recursive", True))
+        entries: list[dict[str, Any]] = []
+        if recursive:
+            children = sorted(path.rglob("*"))
+        else:
+            children = sorted(path.iterdir())
+        for child in children:
+            if child.is_symlink():
+                entries.append({"path": str(child), "type": "symlink", "size": 0})
+                continue
+            if child.is_file():
+                entries.append({"path": str(child), "type": "file", "size": child.stat().st_size})
+            elif child.is_dir():
+                entries.append({"path": str(child), "type": "dir", "size": 0})
+        return {"entries": entries}
+
 
 def _post_json(url: str, token: str, payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -546,6 +640,9 @@ def _iter_sse(response) -> Any:
             data_lines.append(line[5:].lstrip())
 
 
+RECONNECT_INTERVALS: tuple[float, ...] = (5.0, 10.0, 20.0)
+
+
 def connect(
     url: str,
     *,
@@ -554,6 +651,8 @@ def connect(
     default_profile: str | None = None,
     replace: bool = False,
     reconnect: bool = True,
+    reconnect_intervals: tuple[float, ...] | None = None,
+    sleep=time.sleep,
 ) -> None:
     validate_identifier(identifier)
     runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
@@ -566,7 +665,10 @@ def connect(
         flush=True,
     )
 
+    intervals = reconnect_intervals if reconnect_intervals is not None else RECONNECT_INTERVALS
+    attempt = 0
     while True:
+        disconnect_error: Exception | None
         try:
             with _open_events(base, token, identifier) as response:
                 for event in _iter_sse(response):
@@ -589,7 +691,27 @@ def connect(
                             "error": {"kind": "client_error", "message": str(e), "code": 1},
                         }
                     _post_json(f"{base}/client/result", token, response_payload)
+            disconnect_error = OSError("bridge server closed the event stream")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            if not reconnect:
-                raise BridgeError(f"bridge connection lost: {e}", kind="remote_disconnected", exit_code=2)
-            time.sleep(2)
+            disconnect_error = e
+
+        if not reconnect:
+            raise BridgeError(
+                f"bridge connection lost: {disconnect_error}",
+                kind="remote_disconnected",
+                exit_code=2,
+            )
+        if attempt >= len(intervals):
+            raise BridgeError(
+                f"bridge connection lost after {len(intervals)} retries: {disconnect_error}",
+                kind="remote_disconnected",
+                exit_code=2,
+            )
+        delay = intervals[attempt]
+        print(
+            f"bridge connection lost ({disconnect_error}); "
+            f"retry {attempt + 1}/{len(intervals)} in {delay:g}s",
+            flush=True,
+        )
+        sleep(delay)
+        attempt += 1

@@ -224,6 +224,11 @@ class BridgeBrokerState:
             self.sessions.pop((remote, name), None)
         return result or {"ok": True}
 
+    def file_op(self, remote: str, action: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if action not in {"stat", "read", "write", "mkdir", "list"}:
+            raise BridgeError(f"unknown file action {action!r}", kind="bad_request")
+        return self.submit(remote, f"file.{action}", payload, timeout)
+
 
 def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -287,6 +292,12 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     if action == "kill":
                         self._json(HTTPStatus.OK, state.kill_session(remote, name, timeout))
                         return
+                if len(parts) == 5 and parts[:2] == ["api", "remotes"] and parts[3] == "files":
+                    self._require_auth()
+                    remote, action = parts[2], parts[4]
+                    timeout = float(payload.pop("timeout", 60) or 60)
+                    self._json(HTTPStatus.OK, state.file_op(remote, action, payload, timeout))
+                    return
                 self._json(HTTPStatus.NOT_FOUND, {"error": {"kind": "not_found", "message": "not found"}})
             except BridgeError as e:
                 self._bridge_error(e)
