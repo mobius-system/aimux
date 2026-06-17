@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from aimux import bridge
 from aimux import transfer
 from aimux.bridge_client import ReverseClientRuntime
 from aimux.bridge_server import BridgeBrokerState
@@ -181,6 +183,50 @@ def test_broker_file_op_rejects_unknown_action():
         state.file_op("remote-a", "delete", {"path": "/tmp/x"}, timeout=10)
 
 
+def test_broker_file_round_trip_through_reverse_client_runtime(tmp_path):
+    state = BridgeBrokerState("tok")
+    runtime = ReverseClientRuntime("remote-1")
+    state.register_client(runtime.registration_payload(replace=False))
+    q = state.connect_events("remote-1")
+
+    def worker():
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            try:
+                result = runtime.handle(str(item["type"]), item.get("payload") or {})
+                response = {"id": item["id"], "ok": True, "payload": result}
+            except bridge.BridgeError as e:
+                response = {
+                    "id": item["id"],
+                    "ok": False,
+                    "error": {"kind": e.kind, "message": e.message, "code": e.exit_code},
+                }
+            state.complete(response)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        target = tmp_path / "remote" / "payload.bin"
+        payload = bytes(range(64))
+        state.file_op("remote-1", "mkdir", {"path": str(target.parent)}, timeout=1)
+        state.file_op(
+            "remote-1",
+            "write",
+            {"path": str(target), "content_b64": base64.b64encode(payload).decode("ascii")},
+            timeout=1,
+        )
+        read = state.file_op("remote-1", "read", {"path": str(target)}, timeout=1)
+    finally:
+        q.put(None)
+        thread.join(timeout=1)
+        state.disconnect_events("remote-1", q)
+
+    assert base64.b64decode(read["content_b64"]) == payload
+    assert target.read_bytes() == payload
+
+
 # ---------------------------------------------------------------------------
 # bridge_send_files / bridge_get_files (transfer module)
 # ---------------------------------------------------------------------------
@@ -228,14 +274,18 @@ class FakeBridgeControlClient:
     def file_list(self, *, remote: str, path: str, recursive: bool = True, timeout: float = 60.0):
         self.list_called.append(path)
         entries: list[dict[str, Any]] = []
-        prefix = path.rstrip("/") + "/"
+        prefix = _remote_key(path).rstrip("/") + "/"
         for key, value in self.remote_files.items():
-            if key.startswith(prefix):
+            if _remote_key(key).startswith(prefix):
                 entries.append({"path": key, "type": "file", "size": len(value)})
         for d in self.remote_dirs:
-            if d.startswith(prefix):
+            if _remote_key(d).startswith(prefix):
                 entries.append({"path": d, "type": "dir", "size": 0})
         return {"entries": entries}
+
+
+def _remote_key(path: str) -> str:
+    return path.replace("\\", "/")
 
 
 def test_bridge_send_files_uploads_single_file(tmp_path):
@@ -302,6 +352,18 @@ def test_bridge_get_files_downloads_single_file(tmp_path):
     assert (dest / "log.txt").read_bytes() == b"log line\n"
 
 
+def test_bridge_get_files_downloads_windows_style_file_basename(tmp_path):
+    fake = FakeBridgeControlClient()
+    remote_path = r"C:\Users\dev\proj\logs\app.log"
+    fake.remote_files[remote_path] = b"log line\n"
+
+    dest = tmp_path / "downloads"
+    result = transfer.bridge_get_files(fake, "remote-1", [remote_path], dest)
+
+    assert result.downloaded_paths == 1
+    assert (dest / "app.log").read_bytes() == b"log line\n"
+
+
 def test_bridge_get_files_downloads_directory_recursively(tmp_path):
     fake = FakeBridgeControlClient()
     fake.remote_dirs.add("/remote/logs")
@@ -310,6 +372,21 @@ def test_bridge_get_files_downloads_directory_recursively(tmp_path):
 
     dest = tmp_path / "downloads"
     result = transfer.bridge_get_files(fake, "remote-1", ["/remote/logs"], dest)
+
+    assert result.downloaded_paths == 2
+    assert (dest / "logs" / "a.txt").read_bytes() == b"aaa"
+    assert (dest / "logs" / "sub" / "b.txt").read_bytes() == b"bbb"
+
+
+def test_bridge_get_files_downloads_windows_style_directory_recursively(tmp_path):
+    fake = FakeBridgeControlClient()
+    remote_dir = r"C:\Users\dev\proj\logs"
+    fake.remote_dirs.add(remote_dir)
+    fake.remote_files[r"C:\Users\dev\proj\logs\a.txt"] = b"aaa"
+    fake.remote_files[r"C:\Users\dev\proj\logs\sub\b.txt"] = b"bbb"
+
+    dest = tmp_path / "downloads"
+    result = transfer.bridge_get_files(fake, "remote-1", [remote_dir], dest)
 
     assert result.downloaded_paths == 2
     assert (dest / "logs" / "a.txt").read_bytes() == b"aaa"
@@ -338,17 +415,20 @@ def test_bridge_get_files_enforces_size_limit(tmp_path):
 # CLI dispatch (send_files / get_files route to bridge remote when applicable)
 # ---------------------------------------------------------------------------
 
-pytest.importorskip("typer")
-from typer.testing import CliRunner  # noqa: E402
-
-from aimux.cli import app  # noqa: E402
-from aimux.constants import EXIT_OK, EXIT_USER_ERROR  # noqa: E402
-
-
 class CapturingFakeBridgeClient(FakeBridgeControlClient):
     """Fake client that also satisfies the minimal interface the CLI uses."""
 
     pass
+
+
+def _load_cli():
+    pytest.importorskip("typer")
+    from typer.testing import CliRunner
+
+    from aimux.cli import app
+    from aimux.constants import EXIT_OK, EXIT_USER_ERROR
+
+    return CliRunner, app, EXIT_OK, EXIT_USER_ERROR
 
 
 def _patch_bridge_remote(monkeypatch, fake):
@@ -358,6 +438,7 @@ def _patch_bridge_remote(monkeypatch, fake):
 
 
 def test_cli_send_files_dispatches_to_bridge(monkeypatch, tmp_path):
+    CliRunner, app, EXIT_OK, _ = _load_cli()
     fake = CapturingFakeBridgeClient()
     _patch_bridge_remote(monkeypatch, fake)
     monkeypatch.setattr("aimux.cli.ssh_mod.host_exists", lambda name: False)
@@ -373,6 +454,7 @@ def test_cli_send_files_dispatches_to_bridge(monkeypatch, tmp_path):
 
 
 def test_cli_get_files_dispatches_to_bridge(monkeypatch, tmp_path):
+    CliRunner, app, EXIT_OK, _ = _load_cli()
     fake = CapturingFakeBridgeClient()
     fake.remote_files["/remote/data.txt"] = b"payload"
     _patch_bridge_remote(monkeypatch, fake)
@@ -387,6 +469,7 @@ def test_cli_get_files_dispatches_to_bridge(monkeypatch, tmp_path):
 
 
 def test_cli_send_files_falls_through_to_ssh_error_when_no_bridge(monkeypatch, tmp_path):
+    CliRunner, app, _, EXIT_USER_ERROR = _load_cli()
     monkeypatch.setattr("aimux.cli._bridge_remote", lambda name: (None, None))
     monkeypatch.setattr("aimux.cli.ssh_mod.host_exists", lambda name: False)
 
