@@ -640,6 +640,9 @@ def _iter_sse(response) -> Any:
             data_lines.append(line[5:].lstrip())
 
 
+RECONNECT_INTERVALS: tuple[float, ...] = (5.0, 10.0, 20.0)
+
+
 def connect(
     url: str,
     *,
@@ -648,6 +651,8 @@ def connect(
     default_profile: str | None = None,
     replace: bool = False,
     reconnect: bool = True,
+    reconnect_intervals: tuple[float, ...] | None = None,
+    sleep=time.sleep,
 ) -> None:
     validate_identifier(identifier)
     runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
@@ -660,7 +665,10 @@ def connect(
         flush=True,
     )
 
+    intervals = reconnect_intervals if reconnect_intervals is not None else RECONNECT_INTERVALS
+    attempt = 0
     while True:
+        disconnect_error: Exception | None
         try:
             with _open_events(base, token, identifier) as response:
                 for event in _iter_sse(response):
@@ -683,7 +691,27 @@ def connect(
                             "error": {"kind": "client_error", "message": str(e), "code": 1},
                         }
                     _post_json(f"{base}/client/result", token, response_payload)
+            disconnect_error = OSError("bridge server closed the event stream")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            if not reconnect:
-                raise BridgeError(f"bridge connection lost: {e}", kind="remote_disconnected", exit_code=2)
-            time.sleep(2)
+            disconnect_error = e
+
+        if not reconnect:
+            raise BridgeError(
+                f"bridge connection lost: {disconnect_error}",
+                kind="remote_disconnected",
+                exit_code=2,
+            )
+        if attempt >= len(intervals):
+            raise BridgeError(
+                f"bridge connection lost after {len(intervals)} retries: {disconnect_error}",
+                kind="remote_disconnected",
+                exit_code=2,
+            )
+        delay = intervals[attempt]
+        print(
+            f"bridge connection lost ({disconnect_error}); "
+            f"retry {attempt + 1}/{len(intervals)} in {delay:g}s",
+            flush=True,
+        )
+        sleep(delay)
+        attempt += 1
