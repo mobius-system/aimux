@@ -4,7 +4,9 @@ import json
 
 import pytest
 
+from aimux import __version__
 from aimux import bridge
+from aimux import bridge_server
 from aimux.bridge_client import _keys_to_text
 from aimux.bridge_server import BridgeBrokerState
 
@@ -73,3 +75,32 @@ def test_broker_state_registers_bridge_remote(monkeypatch):
     ]
     assert state.client_supports_profile("winbox", "cmd") is True
     assert state.client_supports_profile("winbox", "powershell") is False
+
+
+def test_bridge_server_prints_version_on_startup(monkeypatch, capsys):
+    calls: dict[str, object] = {}
+
+    class FakeHTTPServer:
+        def __init__(self, address, handler):
+            calls["address"] = address
+            calls["handler"] = handler
+            self.server_address = address
+
+        def serve_forever(self):
+            calls["served"] = True
+
+        def server_close(self):
+            calls["closed"] = True
+
+    monkeypatch.setattr(bridge_server, "ThreadingHTTPServer", FakeHTTPServer)
+    monkeypatch.setattr(bridge_server, "write_runtime", lambda runtime: calls.setdefault("runtime", runtime))
+    monkeypatch.setattr(bridge_server, "clear_runtime", lambda: calls.setdefault("cleared", True))
+
+    bridge_server.serve("127.0.0.1", 8765, token="secret")
+
+    out = capsys.readouterr().out
+    assert f"aimux bridge server version {__version__}" in out
+    assert "bridge listening on 127.0.0.1:8765" in out
+    assert calls["served"] is True
+    assert calls["closed"] is True
+    assert calls["cleared"] is True

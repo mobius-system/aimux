@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from . import __version__
 from .bridge import BridgeError, validate_identifier
 from .transfer import (
     DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE,
@@ -793,6 +794,7 @@ def connect(
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
     _post_json(f"{base}/client/register", token, payload)
+    print(f"aimux bridge client version {__version__}", flush=True)
     print(
         f"connected bridge remote {identifier!r}; "
         f"profiles={','.join(runtime.adapters)}; default={runtime.default_profile}",

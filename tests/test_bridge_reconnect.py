@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from aimux import __version__
 from aimux import bridge
 from aimux.bridge_client import connect
 
@@ -79,7 +80,7 @@ def test_connect_retries_three_times_with_expected_intervals_then_gives_up(monke
     assert sleeps == [5.0, 10.0, 20.0]
 
 
-def test_connect_does_not_retry_when_reconnect_disabled(monkeypatch):
+def test_connect_does_not_retry_when_reconnect_disabled(monkeypatch, capsys):
     sleeps: list[float] = []
 
     _patch_client(monkeypatch, events_side_effects=[urllib.error.URLError("nope")])
@@ -96,6 +97,7 @@ def test_connect_does_not_retry_when_reconnect_disabled(monkeypatch):
 
     assert exc.value.kind == "remote_disconnected"
     assert sleeps == []
+    assert f"aimux bridge client version {__version__}" in capsys.readouterr().out
 
 
 def test_connect_processes_event_and_posts_result(monkeypatch):

@@ -13,6 +13,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from . import __version__
 from . import ssh as ssh_mod
 from .bridge import (
     BridgeError,
@@ -391,6 +392,7 @@ def serve(host: str, port: int, *, token: str | None = None) -> None:
     )
     write_runtime(runtime)
     connect_host = external_host_hint(host)
+    print(f"aimux bridge server version {__version__}", flush=True)
     print(f"bridge listening on {host}:{actual_port}", flush=True)
     print(
         "connect client with:\n"
