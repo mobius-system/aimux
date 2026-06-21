@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
@@ -31,6 +32,7 @@ from .transfer import (
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_STREAM_EOF = object()
 
 
 @dataclass
@@ -702,6 +704,74 @@ def _iter_sse(response) -> Any:
             data_lines.append(line[5:].lstrip())
 
 
+class _EventStreamReader:
+    def __init__(self, response) -> None:
+        self._response = response
+        self._queue: queue.Queue[dict[str, Any] | BaseException | object] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def get(self, timeout: float) -> dict[str, Any] | BaseException | object:
+        return self._queue.get(timeout=timeout)
+
+    def _run(self) -> None:
+        try:
+            for event in _iter_sse(self._response):
+                self._queue.put(event)
+            self._queue.put(_STREAM_EOF)
+        except Exception as e:
+            self._queue.put(e)
+
+
+def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: dict[str, Any]) -> None:
+    request_id = str(event.get("id") or "")
+    message_type = str(event.get("type") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    try:
+        result = runtime.handle(message_type, payload)
+        response_payload = {"id": request_id, "ok": True, "payload": result}
+    except BridgeError as e:
+        response_payload = {
+            "id": request_id,
+            "ok": False,
+            "error": {"kind": e.kind, "message": e.message, "code": e.exit_code},
+        }
+    except Exception as e:  # pragma: no cover - defensive path for remote clients
+        response_payload = {
+            "id": request_id,
+            "ok": False,
+            "error": {"kind": "client_error", "message": str(e), "code": 1},
+        }
+    _post_json(f"{base}/client/result", token, response_payload)
+
+
+def _serve_event_stream(
+    response,
+    *,
+    runtime: ReverseClientRuntime,
+    base: str,
+    token: str,
+    stop_event: threading.Event | None,
+    poll_interval: float,
+) -> None:
+    reader = _EventStreamReader(response)
+    reader.start()
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise KeyboardInterrupt
+        try:
+            item = reader.get(timeout=poll_interval)
+        except queue.Empty:
+            continue
+        if item is _STREAM_EOF:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        _handle_event(runtime, base, token, item)
+
+
 RECONNECT_INTERVALS: tuple[float, ...] = (5.0, 10.0, 20.0)
 
 
@@ -715,6 +785,8 @@ def connect(
     reconnect: bool = True,
     reconnect_intervals: tuple[float, ...] | None = None,
     sleep=time.sleep,
+    stop_event: threading.Event | None = None,
+    stream_poll_interval: float = 0.2,
 ) -> None:
     validate_identifier(identifier)
     runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
@@ -733,26 +805,14 @@ def connect(
         disconnect_error: Exception | None
         try:
             with _open_events(base, token, identifier) as response:
-                for event in _iter_sse(response):
-                    request_id = str(event.get("id") or "")
-                    message_type = str(event.get("type") or "")
-                    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                    try:
-                        result = runtime.handle(message_type, payload)
-                        response_payload = {"id": request_id, "ok": True, "payload": result}
-                    except BridgeError as e:
-                        response_payload = {
-                            "id": request_id,
-                            "ok": False,
-                            "error": {"kind": e.kind, "message": e.message, "code": e.exit_code},
-                        }
-                    except Exception as e:  # pragma: no cover - defensive path for remote clients
-                        response_payload = {
-                            "id": request_id,
-                            "ok": False,
-                            "error": {"kind": "client_error", "message": str(e), "code": 1},
-                        }
-                    _post_json(f"{base}/client/result", token, response_payload)
+                _serve_event_stream(
+                    response,
+                    runtime=runtime,
+                    base=base,
+                    token=token,
+                    stop_event=stop_event,
+                    poll_interval=stream_poll_interval,
+                )
             disconnect_error = OSError("bridge server closed the event stream")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             disconnect_error = e
