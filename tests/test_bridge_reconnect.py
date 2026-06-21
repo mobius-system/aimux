@@ -1,6 +1,7 @@
 """Tests for the bridge reverse-client auto-reconnection logic."""
 from __future__ import annotations
 
+import threading
 import urllib.error
 from typing import Any
 
@@ -97,6 +98,23 @@ def test_connect_does_not_retry_when_reconnect_disabled(monkeypatch):
     assert sleeps == []
 
 
+def test_connect_processes_event_and_posts_result(monkeypatch):
+    event = '{"id":"req-1","type":"session.list","payload":{}}'
+    post_calls, _ = _patch_client(monkeypatch, events_side_effects=[[f"data: {event}", ""]])
+
+    with pytest.raises(bridge.BridgeError) as exc:
+        connect("http://broker.example", identifier="winbox_1", token="secret", reconnect=False)
+
+    assert exc.value.kind == "remote_disconnected"
+    assert post_calls[0]["url"] == "http://broker.example/client/register"
+    assert post_calls[1]["url"] == "http://broker.example/client/result"
+    assert post_calls[1]["payload"] == {
+        "id": "req-1",
+        "ok": True,
+        "payload": {"sessions": []},
+    }
+
+
 def test_connect_recovers_within_retry_budget(monkeypatch):
     """A flaky link that succeeds on the second attempt should not raise."""
     sleeps: list[float] = []
@@ -120,3 +138,54 @@ def test_connect_recovers_within_retry_budget(monkeypatch):
             sleep=sleeps.append,
         )
     assert sleeps == [5.0, 10.0, 20.0]
+
+
+def test_connect_can_stop_while_event_stream_reader_is_blocked(monkeypatch):
+    posted: list[dict[str, Any]] = []
+    reader_started = threading.Event()
+    response_closed = threading.Event()
+    stop_event = threading.Event()
+
+    def fake_post_json(url, token, payload, *, timeout=10.0):
+        posted.append({"url": url, "token": token, "payload": payload})
+        return {}
+
+    class BlockingResponse:
+        def __iter__(self):
+            reader_started.set()
+            response_closed.wait(timeout=2.0)
+            if False:
+                yield b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            response_closed.set()
+            return False
+
+    def fake_open_events(url, token, identifier):
+        return BlockingResponse()
+
+    def trigger_stop():
+        reader_started.wait(timeout=1.0)
+        stop_event.set()
+
+    monkeypatch.setattr("aimux.bridge_client._post_json", fake_post_json)
+    monkeypatch.setattr("aimux.bridge_client._open_events", fake_open_events)
+    stopper = threading.Thread(target=trigger_stop)
+    stopper.start()
+
+    with pytest.raises(KeyboardInterrupt):
+        connect(
+            "http://broker.example",
+            identifier="winbox_1",
+            token="secret",
+            stop_event=stop_event,
+            stream_poll_interval=0.01,
+        )
+
+    stopper.join(timeout=1.0)
+    assert reader_started.is_set()
+    assert response_closed.is_set()
+    assert posted[0]["url"] == "http://broker.example/client/register"
