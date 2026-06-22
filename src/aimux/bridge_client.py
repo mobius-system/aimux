@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from loguru import logger
+
 from . import __version__
 from .bridge import BridgeError, validate_identifier
 from .transfer import (
@@ -34,6 +36,66 @@ from .transfer import (
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _STREAM_EOF = object()
+BRIDGE_CLIENT_HEARTBEAT_INTERVAL = 180.0
+
+
+def _payload_count(payload: dict[str, Any], key: str) -> int:
+    value = payload.get(key)
+    return len(value) if isinstance(value, list) else 0
+
+
+def _bridge_command_summary(message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if message_type == "session.create":
+        return {
+            "session": payload.get("name"),
+            "profile": payload.get("profile"),
+            "cmd": payload.get("cmd"),
+            "cwd": payload.get("cwd"),
+        }
+    if message_type == "session.send_keys":
+        keys = payload.get("keys") if isinstance(payload.get("keys"), list) else []
+        flags = payload.get("flags") if isinstance(payload.get("flags"), list) else []
+        return {"session": payload.get("session"), "keys": keys, "flags": flags}
+    if message_type == "session.capture":
+        return {"session": payload.get("session"), "lines": payload.get("lines"), "ansi": bool(payload.get("ansi"))}
+    if message_type == "session.kill":
+        return {"session": payload.get("session")}
+    if message_type == "session.list":
+        return {}
+    if message_type == "file.write":
+        content_b64 = str(payload.get("content_b64") or "")
+        return {
+            "path": payload.get("path"),
+            "content_b64_len": len(content_b64),
+            "max_size": payload.get("max_size"),
+            "mode": payload.get("mode"),
+        }
+    if message_type == "file.archive":
+        return {
+            "path": payload.get("path"),
+            "rel_paths": _payload_count(payload, "rel_paths"),
+            "dirs": _payload_count(payload, "dirs"),
+            "max_size": payload.get("max_size"),
+        }
+    if message_type == "file.apply_archive":
+        archive_b64 = str(payload.get("archive_b64") or "")
+        return {
+            "path": payload.get("path"),
+            "archive_b64_len": len(archive_b64),
+            "delete_paths": _payload_count(payload, "delete_paths"),
+            "max_size": payload.get("max_size"),
+        }
+    if message_type.startswith("file."):
+        return {
+            "path": payload.get("path"),
+            "recursive": payload.get("recursive"),
+            "max_size": payload.get("max_size"),
+        }
+    return {"payload_keys": sorted(payload)}
+
+
+def _is_logged_bridge_command(message_type: str) -> bool:
+    return message_type.startswith("file.") or message_type.startswith("session.")
 
 
 @dataclass
@@ -730,21 +792,52 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
     request_id = str(event.get("id") or "")
     message_type = str(event.get("type") or "")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    if _is_logged_bridge_command(message_type):
+        logger.info(
+            "bridge client received command identifier={} request_id={} type={} details={}",
+            runtime.identifier,
+            request_id,
+            message_type,
+            _bridge_command_summary(message_type, payload),
+        )
     try:
         result = runtime.handle(message_type, payload)
         response_payload = {"id": request_id, "ok": True, "payload": result}
+        if _is_logged_bridge_command(message_type):
+            logger.info(
+                "bridge client completed command identifier={} request_id={} type={} result_keys={}",
+                runtime.identifier,
+                request_id,
+                message_type,
+                sorted(result) if isinstance(result, dict) else [],
+            )
     except BridgeError as e:
         response_payload = {
             "id": request_id,
             "ok": False,
             "error": {"kind": e.kind, "message": e.message, "code": e.exit_code},
         }
+        logger.warning(
+            "bridge client command failed identifier={} request_id={} type={} kind={} code={} message={}",
+            runtime.identifier,
+            request_id,
+            message_type,
+            e.kind,
+            e.exit_code,
+            e.message,
+        )
     except Exception as e:  # pragma: no cover - defensive path for remote clients
         response_payload = {
             "id": request_id,
             "ok": False,
             "error": {"kind": "client_error", "message": str(e), "code": 1},
         }
+        logger.exception(
+            "bridge client command crashed identifier={} request_id={} type={}",
+            runtime.identifier,
+            request_id,
+            message_type,
+        )
     _post_json(f"{base}/client/result", token, response_payload)
 
 
@@ -756,12 +849,23 @@ def _serve_event_stream(
     token: str,
     stop_event: threading.Event | None,
     poll_interval: float,
+    heartbeat_interval: float = BRIDGE_CLIENT_HEARTBEAT_INTERVAL,
 ) -> None:
     reader = _EventStreamReader(response)
     reader.start()
+    last_heartbeat = time.monotonic()
     while True:
         if stop_event is not None and stop_event.is_set():
             raise KeyboardInterrupt
+        now = time.monotonic()
+        if heartbeat_interval > 0 and now - last_heartbeat >= heartbeat_interval:
+            logger.info(
+                "bridge client heartbeat identifier={} sessions={} profiles={}",
+                runtime.identifier,
+                len(runtime.sessions),
+                ",".join(runtime.adapters),
+            )
+            last_heartbeat = now
         try:
             item = reader.get(timeout=poll_interval)
         except queue.Empty:
@@ -788,17 +892,19 @@ def connect(
     sleep=time.sleep,
     stop_event: threading.Event | None = None,
     stream_poll_interval: float = 0.2,
+    heartbeat_interval: float = BRIDGE_CLIENT_HEARTBEAT_INTERVAL,
 ) -> None:
     validate_identifier(identifier)
     runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
     _post_json(f"{base}/client/register", token, payload)
-    print(f"aimux bridge client version {__version__}", flush=True)
-    print(
-        f"connected bridge remote {identifier!r}; "
-        f"profiles={','.join(runtime.adapters)}; default={runtime.default_profile}",
-        flush=True,
+    logger.info("aimux bridge client version {}", __version__)
+    logger.info(
+        "connected bridge remote {!r}; profiles={}; default={}",
+        identifier,
+        ",".join(runtime.adapters),
+        runtime.default_profile,
     )
 
     intervals = reconnect_intervals if reconnect_intervals is not None else RECONNECT_INTERVALS
@@ -814,6 +920,7 @@ def connect(
                     token=token,
                     stop_event=stop_event,
                     poll_interval=stream_poll_interval,
+                    heartbeat_interval=heartbeat_interval,
                 )
             disconnect_error = OSError("bridge server closed the event stream")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -832,10 +939,12 @@ def connect(
                 exit_code=2,
             )
         delay = intervals[attempt]
-        print(
-            f"bridge connection lost ({disconnect_error}); "
-            f"retry {attempt + 1}/{len(intervals)} in {delay:g}s",
-            flush=True,
+        logger.warning(
+            "bridge connection lost ({}); retry {}/{} in {:g}s",
+            disconnect_error,
+            attempt + 1,
+            len(intervals),
+            delay,
         )
         sleep(delay)
         attempt += 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from loguru import logger
 
 from aimux import __version__
 from aimux import bridge
@@ -77,8 +78,10 @@ def test_broker_state_registers_bridge_remote(monkeypatch):
     assert state.client_supports_profile("winbox", "powershell") is False
 
 
-def test_bridge_server_prints_version_on_startup(monkeypatch, capsys):
+def test_bridge_server_prints_version_on_startup(monkeypatch):
     calls: dict[str, object] = {}
+    logs: list[str] = []
+    sink_id = logger.add(lambda message: logs.append(str(message)), format="{message}")
 
     class FakeHTTPServer:
         def __init__(self, address, handler):
@@ -96,11 +99,13 @@ def test_bridge_server_prints_version_on_startup(monkeypatch, capsys):
     monkeypatch.setattr(bridge_server, "write_runtime", lambda runtime: calls.setdefault("runtime", runtime))
     monkeypatch.setattr(bridge_server, "clear_runtime", lambda: calls.setdefault("cleared", True))
 
-    bridge_server.serve("127.0.0.1", 8765, token="secret")
+    try:
+        bridge_server.serve("127.0.0.1", 8765, token="secret")
+    finally:
+        logger.remove(sink_id)
 
-    out = capsys.readouterr().out
-    assert f"aimux bridge server version {__version__}" in out
-    assert "bridge listening on 127.0.0.1:8765" in out
+    assert any(f"aimux bridge server version {__version__}" in line for line in logs)
+    assert any("bridge listening on 127.0.0.1:8765" in line for line in logs)
     assert calls["served"] is True
     assert calls["closed"] is True
     assert calls["cleared"] is True

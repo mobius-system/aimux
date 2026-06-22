@@ -6,12 +6,15 @@ import os
 import queue
 import secrets
 import threading
+import time
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+from loguru import logger
 
 from . import __version__
 from . import ssh as ssh_mod
@@ -25,6 +28,9 @@ from .bridge import (
     validate_identifier,
     write_runtime,
 )
+
+
+BRIDGE_SERVER_HEARTBEAT_LOG_INTERVAL = 180.0
 
 
 @dataclass
@@ -78,6 +84,14 @@ class BridgeBrokerState:
                 connected=False,
                 last_seen=utc_now(),
             )
+        logger.info(
+            "bridge client registered name={!r} platform={} default_profile={} profiles={} replace={}",
+            name,
+            platform,
+            default_profile,
+            [p.get("name") for p in profiles if isinstance(p, dict)],
+            replace,
+        )
         return {"ok": True}
 
     def connect_events(self, name: str) -> queue.Queue[dict[str, Any] | None]:
@@ -90,6 +104,7 @@ class BridgeBrokerState:
             client.queue = q
             client.connected = True
             client.last_seen = utc_now()
+            logger.info("bridge client event stream connected name={!r}", name)
             return q
 
     def disconnect_events(self, name: str, q: queue.Queue[dict[str, Any] | None]) -> None:
@@ -99,6 +114,7 @@ class BridgeBrokerState:
                 client.connected = False
                 client.queue = None
                 client.last_seen = utc_now()
+                logger.info("bridge client event stream disconnected name={!r}", name)
 
     def list_remotes(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -142,10 +158,18 @@ class BridgeBrokerState:
             pending = PendingRequest()
             self.pending[request_id] = pending
             client.queue.put({"id": request_id, "type": message_type, "payload": payload})
+            logger.info("bridge broker queued request remote={!r} request_id={} type={}", remote, request_id, message_type)
 
         if not pending.event.wait(timeout):
             with self.lock:
                 self.pending.pop(request_id, None)
+            logger.warning(
+                "bridge broker request timed out remote={!r} request_id={} type={} timeout={}",
+                remote,
+                request_id,
+                message_type,
+                timeout,
+            )
             raise BridgeError(f"bridge request to {remote!r} timed out", kind="timeout", exit_code=124)
 
         result = pending.result or {}
@@ -154,7 +178,17 @@ class BridgeBrokerState:
             message = str(error.get("message") or "bridge client request failed")
             kind = str(error.get("kind") or "client_error")
             exit_code = int(error.get("code") or 1)
+            logger.warning(
+                "bridge broker request failed remote={!r} request_id={} type={} kind={} code={} message={}",
+                remote,
+                request_id,
+                message_type,
+                kind,
+                exit_code,
+                message,
+            )
             raise BridgeError(message, kind=kind, exit_code=exit_code)
+        logger.info("bridge broker request completed remote={!r} request_id={} type={}", remote, request_id, message_type)
         return result.get("payload") if isinstance(result.get("payload"), dict) else {}
 
     def complete(self, payload: dict[str, Any]) -> None:
@@ -164,6 +198,9 @@ class BridgeBrokerState:
         if pending is not None:
             pending.result = payload
             pending.event.set()
+            logger.info("bridge broker received result request_id={} ok={}", request_id, bool(payload.get("ok")))
+        else:
+            logger.warning("bridge broker received result for unknown request_id={}", request_id)
 
     def create_session(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         remote = str(payload.get("remote") or "")
@@ -198,6 +235,7 @@ class BridgeBrokerState:
         }
         with self.lock:
             self.sessions[(remote, name)] = record
+        logger.info("bridge broker recorded session remote={!r} name={!r} profile={!r}", remote, name, profile)
         return {"session": record}
 
     def send_keys(self, remote: str, name: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -341,12 +379,17 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
             try:
                 self.wfile.write(b": connected\n\n")
                 self.wfile.flush()
+                last_heartbeat_log = time.monotonic()
                 while True:
                     try:
                         item = q.get(timeout=15)
                     except queue.Empty:
                         self.wfile.write(b": heartbeat\n\n")
                         self.wfile.flush()
+                        now = time.monotonic()
+                        if now - last_heartbeat_log >= BRIDGE_SERVER_HEARTBEAT_LOG_INTERVAL:
+                            logger.info("bridge server heartbeat identifier={!r}", identifier)
+                            last_heartbeat_log = now
                         continue
                     if item is None:
                         break
@@ -392,15 +435,17 @@ def serve(host: str, port: int, *, token: str | None = None) -> None:
     )
     write_runtime(runtime)
     connect_host = external_host_hint(host)
-    print(f"aimux bridge server version {__version__}", flush=True)
-    print(f"bridge listening on {host}:{actual_port}", flush=True)
-    print(
-        "connect client with:\n"
-        f"  aimux reverse connect http://{connect_host}:{actual_port} --identifier <name> --token {token}",
-        flush=True,
+    logger.info("aimux bridge server version {}", __version__)
+    logger.info("bridge listening on {}:{}", host, actual_port)
+    logger.info(
+        "connect client with: aimux reverse connect http://{}:{} --identifier <name> --token {}",
+        connect_host,
+        actual_port,
+        token,
     )
     try:
         httpd.serve_forever()
     finally:
+        logger.info("bridge server shutting down pid={}", os.getpid())
         clear_runtime()
         httpd.server_close()

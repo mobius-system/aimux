@@ -6,9 +6,11 @@ import urllib.error
 from typing import Any
 
 import pytest
+from loguru import logger
 
 from aimux import __version__
 from aimux import bridge
+from aimux import bridge_client
 from aimux.bridge_client import connect
 
 
@@ -80,24 +82,29 @@ def test_connect_retries_three_times_with_expected_intervals_then_gives_up(monke
     assert sleeps == [5.0, 10.0, 20.0]
 
 
-def test_connect_does_not_retry_when_reconnect_disabled(monkeypatch, capsys):
+def test_connect_does_not_retry_when_reconnect_disabled(monkeypatch):
     sleeps: list[float] = []
+    logs: list[str] = []
+    sink_id = logger.add(lambda message: logs.append(str(message)), format="{message}")
 
     _patch_client(monkeypatch, events_side_effects=[urllib.error.URLError("nope")])
 
-    with pytest.raises(bridge.BridgeError) as exc:
-        connect(
-            "http://broker.example",
-            identifier="winbox_1",
-            token="secret",
-            reconnect=False,
-            reconnect_intervals=(5.0, 10.0, 20.0),
-            sleep=sleeps.append,
-        )
+    try:
+        with pytest.raises(bridge.BridgeError) as exc:
+            connect(
+                "http://broker.example",
+                identifier="winbox_1",
+                token="secret",
+                reconnect=False,
+                reconnect_intervals=(5.0, 10.0, 20.0),
+                sleep=sleeps.append,
+            )
+    finally:
+        logger.remove(sink_id)
 
     assert exc.value.kind == "remote_disconnected"
     assert sleeps == []
-    assert f"aimux bridge client version {__version__}" in capsys.readouterr().out
+    assert any(f"aimux bridge client version {__version__}" in line for line in logs)
 
 
 def test_connect_processes_event_and_posts_result(monkeypatch):
@@ -191,3 +198,90 @@ def test_connect_can_stop_while_event_stream_reader_is_blocked(monkeypatch):
     assert reader_started.is_set()
     assert response_closed.is_set()
     assert posted[0]["url"] == "http://broker.example/client/register"
+
+
+def test_handle_event_logs_bridge_command_details(monkeypatch):
+    posted: list[dict[str, Any]] = []
+    logs: list[str] = []
+    sink_id = logger.add(lambda message: logs.append(str(message)), format="{message}")
+
+    class FakeRuntime:
+        identifier = "winbox_1"
+
+        def handle(self, message_type, payload):
+            assert message_type == "file.write"
+            assert payload["path"] == r"C:\tmp\out.txt"
+            return {"size": 5}
+
+    def fake_post_json(url, token, payload, *, timeout=10.0):
+        posted.append({"url": url, "token": token, "payload": payload})
+        return {}
+
+    monkeypatch.setattr("aimux.bridge_client._post_json", fake_post_json)
+
+    try:
+        bridge_client._handle_event(
+            FakeRuntime(),
+            "http://broker.example",
+            "secret",
+            {
+                "id": "req-1",
+                "type": "file.write",
+                "payload": {"path": r"C:\tmp\out.txt", "content_b64": "aGVsbG8=", "max_size": 100},
+            },
+        )
+    finally:
+        logger.remove(sink_id)
+
+    joined = "\n".join(logs)
+    assert "bridge client received command" in joined
+    assert "type=file.write" in joined
+    assert "C:\\\\tmp\\\\out.txt" in joined
+    assert "content_b64_len" in joined
+    assert "bridge client completed command" in joined
+    assert posted[0]["payload"] == {"id": "req-1", "ok": True, "payload": {"size": 5}}
+
+
+def test_serve_event_stream_logs_heartbeat(monkeypatch):
+    logs: list[str] = []
+    sink_id = logger.add(lambda message: logs.append(str(message)), format="{message}")
+
+    class FakeRuntime:
+        identifier = "winbox_1"
+        sessions = {}
+        adapters = {"cmd": object()}
+
+    class FakeReader:
+        calls = 0
+
+        def __init__(self, response):
+            pass
+
+        def start(self):
+            pass
+
+        def get(self, timeout):
+            self.calls += 1
+            if self.calls == 1:
+                raise bridge_client.queue.Empty
+            return KeyboardInterrupt()
+
+    times = iter([0.0, 181.0, 182.0])
+    monkeypatch.setattr(bridge_client, "_EventStreamReader", FakeReader)
+    monkeypatch.setattr(bridge_client.time, "monotonic", lambda: next(times))
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            bridge_client._serve_event_stream(
+                object(),
+                runtime=FakeRuntime(),
+                base="http://broker.example",
+                token="secret",
+                stop_event=None,
+                poll_interval=0.01,
+                heartbeat_interval=180.0,
+            )
+    finally:
+        logger.remove(sink_id)
+
+    assert any("bridge client heartbeat identifier=winbox_1" in line for line in logs)
