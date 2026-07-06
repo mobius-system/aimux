@@ -433,8 +433,14 @@ _validate_sftp_path = validate_transfer_path
 # Bridge remote transfer (HTTP/SSE broker instead of sftp)
 # ---------------------------------------------------------------------------
 
-DEFAULT_BRIDGE_MAX_FILE_SIZE = 16 * 1024 * 1024
-DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE = 64 * 1024 * 1024
+# Bridge transfers are base64-encoded payloads relayed through the HTTP/SSE
+# broker (control client -> broker -> remote client -> broker -> control client),
+# so the whole payload is materialized in memory several times per request.
+# 1 GiB is an upper guardrail: it unblocks large single files (e.g. git bundles,
+# build artifacts) while keeping each hop bounded. Real transfers should stay
+# well below this; anything larger should use sync_dir/chunking instead.
+DEFAULT_BRIDGE_MAX_FILE_SIZE = 1024 * 1024 * 1024
+DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE = 1024 * 1024 * 1024
 SyncProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
