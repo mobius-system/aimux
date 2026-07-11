@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -512,6 +513,7 @@ def build_adapters() -> tuple[dict[str, TerminalAdapter], str]:
 class ReverseClientRuntime:
     def __init__(self, identifier: str, default_profile: str | None = None):
         self.identifier = identifier
+        self.client_id = str(uuid.uuid4())
         self.adapters, detected_default = build_adapters()
         self.default_profile = default_profile or detected_default
         self.sessions: dict[str, ClientSession] = {}
@@ -524,6 +526,7 @@ class ReverseClientRuntime:
             "default_profile": self.default_profile,
             "profiles": [adapter.profile_info() for adapter in self.adapters.values()],
             "version": __version__,
+            "client_id": self.client_id,
         }
 
     def handle(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -601,8 +604,14 @@ class ReverseClientRuntime:
 
     def _kill(self, payload: dict[str, Any]) -> dict[str, Any]:
         name = str(payload.get("session") or "")
-        session = self._get(name)
-        if session.adapter is not None:
+        # Do NOT route through _get(): it raises session_gone for an already-exited
+        # session, which would prevent cleanup. kill must succeed — clearing the
+        # record and freeing adapter resources (pty fd, etc.) — whether the
+        # underlying process is still running or already exited.
+        session = self.sessions.get(name)
+        if session is None:
+            raise BridgeError(f"session {name!r} not found", kind="not_found")
+        if session.adapter is not None and session.is_running():
             session.adapter.kill(session)
         self.sessions.pop(name, None)
         return {"ok": True}
@@ -970,36 +979,41 @@ def connect(
     runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
-    register_response = _register_with_retry(
-        base,
-        token,
-        payload,
-        identifier=identifier,
-        reconnect=reconnect,
-        retry_intervals=register_retry_intervals,
-        sleep=sleep,
-    )
-    logger.info("aimux bridge client version {}", __version__)
-    server_version = (
-        str(register_response.get("server_version") or "")
-        if isinstance(register_response, dict)
-        else ""
-    )
-    client_mismatch = version_mismatch_message(__version__, server_version)
-    if client_mismatch:
-        logger.warning("bridge client {} — {}", identifier, client_mismatch)
-    logger.info(
-        "connected bridge remote {!r}; profiles={}; default={}",
-        identifier,
-        ",".join(runtime.adapters),
-        runtime.default_profile,
-    )
+    logged_registration = False
 
     intervals = reconnect_intervals if reconnect_intervals is not None else RECONNECT_INTERVALS
     attempt = 0
     while True:
         disconnect_error: Exception | None
         try:
+            register_response = _register_with_retry(
+                base,
+                token,
+                payload,
+                identifier=identifier,
+                reconnect=reconnect,
+                retry_intervals=register_retry_intervals,
+                sleep=sleep,
+            )
+            if not logged_registration:
+                logger.info("aimux bridge client version {}", __version__)
+                server_version = (
+                    str(register_response.get("server_version") or "")
+                    if isinstance(register_response, dict)
+                    else ""
+                )
+                client_mismatch = version_mismatch_message(__version__, server_version)
+                if client_mismatch:
+                    logger.warning("bridge client {} — {}", identifier, client_mismatch)
+                logger.info(
+                    "connected bridge remote {!r}; profiles={}; default={}",
+                    identifier,
+                    ",".join(runtime.adapters),
+                    runtime.default_profile,
+                )
+                logged_registration = True
+            else:
+                logger.info("bridge remote {!r} re-registered before reconnecting event stream", identifier)
             with _open_events(base, token, identifier) as response:
                 _serve_event_stream(
                     response,

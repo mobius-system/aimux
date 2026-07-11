@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 from loguru import logger
@@ -122,6 +123,7 @@ def test_register_payload_advertises_client_version():
     runtime = bridge_client.ReverseClientRuntime("winbox_1")
     payload = runtime.registration_payload(replace=False)
     assert payload["version"] == __version__
+    assert payload["client_id"] == runtime.client_id
 
 
 def test_register_client_flags_version_mismatch(monkeypatch):
@@ -202,3 +204,103 @@ def test_register_client_emits_warning_log_on_mismatch(monkeypatch):
     assert "version mismatch" in joined
     assert "0.0.1-ancient" in joined
     assert __version__ in joined
+
+
+def test_register_client_preserves_sessions_for_same_client_id(monkeypatch):
+    monkeypatch.setattr("aimux.bridge_server.ssh_mod.host_exists", lambda name: False)
+    state = BridgeBrokerState("secret")
+    state.register_client(
+        {
+            "identifier": "winbox_1",
+            "platform": "linux",
+            "profiles": [{"name": "posix-pty", "available": True}],
+            "client_id": "client-a",
+        }
+    )
+    state.sessions[("winbox_1", "shell")] = {
+        "id": "winbox_1/shell",
+        "location": "winbox_1",
+        "name": "shell",
+        "backend": "bridge",
+    }
+
+    state.register_client(
+        {
+            "identifier": "winbox_1",
+            "platform": "linux",
+            "profiles": [{"name": "posix-pty", "available": True}],
+            "client_id": "client-a",
+        }
+    )
+
+    assert ("winbox_1", "shell") in state.sessions
+
+
+def test_register_client_clears_sessions_for_new_client_id(monkeypatch):
+    monkeypatch.setattr("aimux.bridge_server.ssh_mod.host_exists", lambda name: False)
+    state = BridgeBrokerState("secret")
+    state.register_client(
+        {
+            "identifier": "winbox_1",
+            "platform": "linux",
+            "profiles": [{"name": "posix-pty", "available": True}],
+            "client_id": "client-a",
+        }
+    )
+    state.sessions[("winbox_1", "shell")] = {
+        "id": "winbox_1/shell",
+        "location": "winbox_1",
+        "name": "shell",
+        "backend": "bridge",
+    }
+
+    state.register_client(
+        {
+            "identifier": "winbox_1",
+            "platform": "linux",
+            "profiles": [{"name": "posix-pty", "available": True}],
+            "client_id": "client-b",
+        }
+    )
+
+    assert ("winbox_1", "shell") not in state.sessions
+
+
+def test_disconnect_events_fails_pending_requests_without_waiting_for_timeout(monkeypatch):
+    monkeypatch.setattr("aimux.bridge_server.ssh_mod.host_exists", lambda name: False)
+    state = BridgeBrokerState("secret")
+    state.register_client(
+        {
+            "identifier": "winbox_1",
+            "platform": "linux",
+            "profiles": [{"name": "posix-pty", "available": True}],
+            "client_id": "client-a",
+        }
+    )
+    q = state.connect_events("winbox_1")
+    queued = threading.Event()
+    result: dict[str, object] = {}
+
+    def submitter() -> None:
+        queued.set()
+        try:
+            state.submit("winbox_1", "session.capture", {"session": "shell"}, timeout=30.0)
+        except bridge.BridgeError as exc:
+            result["kind"] = exc.kind
+            result["exit_code"] = exc.exit_code
+            result["message"] = exc.message
+
+    thread = threading.Thread(target=submitter)
+    thread.start()
+    assert queued.wait(timeout=1.0)
+    event = q.get(timeout=1.0)
+    assert event is not None
+    assert event["type"] == "session.capture"
+
+    state.disconnect_events("winbox_1", q)
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert result["kind"] == "remote_disconnected"
+    assert result["exit_code"] == 2
+    assert "session.capture" in str(result["message"])

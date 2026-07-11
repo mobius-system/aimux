@@ -83,6 +83,27 @@ def test_connect_retries_three_times_with_expected_intervals_then_gives_up(monke
     assert sleeps == [5.0, 10.0, 20.0]
 
 
+def test_connect_re_registers_before_each_event_stream_retry(monkeypatch):
+    post_calls, open_calls = _patch_client(monkeypatch, events_side_effects=[
+        urllib.error.URLError("disconnect 1"),
+        urllib.error.URLError("disconnect 2"),
+    ])
+
+    with pytest.raises(bridge.BridgeError):
+        connect(
+            "http://broker.example",
+            identifier="winbox_1",
+            token="secret",
+            reconnect_intervals=(0.0,),
+            sleep=lambda _: None,
+        )
+
+    register_calls = [call for call in post_calls if call["url"] == "http://broker.example/client/register"]
+    assert open_calls["open"] == 2
+    assert len(register_calls) == 2
+    assert register_calls[0]["payload"]["client_id"] == register_calls[1]["payload"]["client_id"]
+
+
 def test_connect_does_not_retry_when_reconnect_disabled(monkeypatch):
     sleeps: list[float] = []
     logs: list[str] = []

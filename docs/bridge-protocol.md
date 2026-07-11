@@ -108,11 +108,12 @@
 ### 2.2 客户端反向通道
 
 #### `POST /client/register`
-- 客户端启动时调用一次，宣告自己的身份。
+- 客户端启动时调用一次，且每次 SSE 断线重连前也应重新调用，宣告自己的身份。
 - 请求：
 ```json
 {
   "identifier": "winbox",
+  "client_id": "550e8400-e29b-41d4-a716-446655440000",
   "replace": false,
   "platform": "windows",
   "default_profile": "cmd",
@@ -122,6 +123,7 @@
 }
 ```
 - 响应：`200 {"ok": true}`
+- `client_id` 是客户端进程级稳定 ID；同一进程重连时保持不变，server 用它区分“同进程网络重连”（保留 session 记录）和“客户端进程重启”（清理 stale session 记录）。旧客户端可不传，server 必须兼容。
 - 冲突语义：
   - `replace=false` 且同名已连接 → `409 {"error": {"kind": "name_conflict", ...}}`
   - `replace=true` → 踢掉旧连接（向其 SSE 队列投 `null`）
@@ -135,7 +137,7 @@
 - 流程：
   1. server 把 `identifier` 对应的客户端标记为 `connected`
   2. 写入心跳/事件直到连接断开
-  3. 断开时把客户端标记为 `disconnected`，丢弃队列
+  3. 断开时把客户端标记为 `disconnected`，丢弃队列，并把该客户端名下所有 pending 请求标记为 `remote_disconnected`
 - **事件帧**（标准 SSE）：
   ```
   id: <request-uuid>

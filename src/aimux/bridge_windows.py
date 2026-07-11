@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import threading
 from ctypes import wintypes
 
 from .bridge import BridgeError
@@ -11,14 +12,51 @@ from .bridge_client import _parse_repeat
 
 if sys.platform == "win32":
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # CreateFileW returns a fresh handle to the *currently attached* console's
+    # input/output buffer. This is what we must use after AttachConsole —
+    # GetStdHandle returns the process's startup-time standard handle, which is
+    # stale (or INVALID_HANDLE_VALUE) when the reverse client has no console of
+    # its own (e.g. spawned as an Electron child / background service). That
+    # staleness was the root cause of "failed to write console input (Win32
+    # error 6)".
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 else:  # pragma: no cover - imported only to keep non-Windows syntax checks happy.
     kernel32 = None
+
+
+# AttachConsole + FreeConsole are process-wide: a process is attached to at
+# most one console at a time. Guard the attach → operate → free sequence so that
+# concurrent calls (send_keys to one session racing capture of another) cannot
+# detach each other's console mid-operation. Today commands are dispatched from
+# a single SSE reader thread, but the Win32 console API's process-global nature
+# makes this lock a necessary safety net.
+_console_lock = threading.Lock()
 
 
 STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE = -11
 ATTACH_PARENT_PROCESS = -1
 KEY_EVENT = 0x0001
+
+GENERIC_READ = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+OPEN_EXISTING = 3
+# INVALID_HANDLE_VALUE is (HANDLE)-1; represent it as the unsigned pointer-sized
+# int that CreateFileW actually returns via a c_void_p restype.
+INVALID_HANDLE_VALUE = (1 << (8 * ctypes.sizeof(wintypes.HANDLE))) - 1
 
 VK = {
     "Enter": 0x0D,
@@ -112,22 +150,75 @@ def _raise_last(message: str) -> None:
 
 def _attach(pid: int) -> None:
     _check_windows()
+    _console_lock.acquire()
     kernel32.FreeConsole()
     if not kernel32.AttachConsole(wintypes.DWORD(pid)):
+        _console_lock.release()
         _raise_last(f"failed to attach to console for pid {pid}")
 
 
 def _free() -> None:
-    if kernel32 is not None:
-        kernel32.FreeConsole()
+    try:
+        if kernel32 is not None:
+            kernel32.FreeConsole()
+    finally:
+        _console_lock.release()
+
+
+def _is_invalid_handle(handle) -> bool:
+    return handle is None or handle == INVALID_HANDLE_VALUE
+
+
+def _open_conin():
+    """Open a writable handle to the currently attached console's input buffer.
+
+    Must be called after _attach(). Unlike GetStdHandle(STD_INPUT_HANDLE),
+    CreateFileW("CONIN$") resolves to the live console that AttachConsole just
+    bound us to, so it works even when the process has no inherited console.
+    """
+    handle = kernel32.CreateFileW(
+        "CONIN$",
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        0,
+        None,
+    )
+    if _is_invalid_handle(handle):
+        _raise_last("failed to open console input (CONIN$)")
+    return handle
+
+
+def _open_conout():
+    """Open a readable handle to the currently attached console's output buffer."""
+    handle = kernel32.CreateFileW(
+        "CONOUT$",
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        0,
+        None,
+    )
+    if _is_invalid_handle(handle):
+        _raise_last("failed to open console output (CONOUT$)")
+    return handle
+
+
+def _close(handle) -> None:
+    """Close a handle returned by _open_conin/_open_conout. Safe on None/invalid."""
+    if not _is_invalid_handle(handle):
+        kernel32.CloseHandle(handle)
 
 
 def capture(pid: int, lines: int) -> str:
     if lines <= 0:
         raise BridgeError("--lines must be a positive integer")
     _attach(pid)
+    handle = None
     try:
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        handle = _open_conout()
         info = CONSOLE_SCREEN_BUFFER_INFO()
         if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
             _raise_last("failed to read console buffer info")
@@ -154,13 +245,15 @@ def capture(pid: int, lines: int) -> str:
         content = "\n".join(rows[-lines:])
         return content + "\n" if content else ""
     finally:
+        _close(handle)
         _free()
 
 
 def configure_buffer(pid: int, *, height: int) -> None:
     _attach(pid)
+    handle = None
     try:
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        handle = _open_conout()
         info = CONSOLE_SCREEN_BUFFER_INFO()
         if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
             return
@@ -168,6 +261,7 @@ def configure_buffer(pid: int, *, height: int) -> None:
         target = COORD(width, max(int(info.dwSize.Y), height))
         kernel32.SetConsoleScreenBufferSize(handle, target)
     finally:
+        _close(handle)
         _free()
 
 
@@ -187,8 +281,9 @@ def send_keys(pid: int, keys: list[str], flags: list[str]) -> None:
     if not records:
         return
     _attach(pid)
+    handle = None
     try:
-        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        handle = _open_conin()
         arr_type = INPUT_RECORD * len(records)
         arr = arr_type(*records)
         written = wintypes.DWORD(0)
@@ -196,6 +291,7 @@ def send_keys(pid: int, keys: list[str], flags: list[str]) -> None:
         if not ok or written.value != len(records):
             _raise_last("failed to write console input")
     finally:
+        _close(handle)
         _free()
 
 
