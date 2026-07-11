@@ -72,6 +72,9 @@ def test_broker_state_registers_bridge_remote(monkeypatch):
             "default_profile": "cmd",
             "profiles": [{"name": "cmd", "available": True}],
             "last_seen": state.list_remotes()[0]["last_seen"],
+            "client_version": "",
+            "server_version": __version__,
+            "version_mismatch": False,
         }
     ]
     assert state.client_supports_profile("winbox", "cmd") is True
@@ -109,3 +112,93 @@ def test_bridge_server_prints_version_on_startup(monkeypatch):
     assert calls["served"] is True
     assert calls["closed"] is True
     assert calls["cleared"] is True
+
+
+def test_register_payload_advertises_client_version():
+    """The reverse client advertises its aimux version when registering so the
+    broker can detect client/server skew instead of failing silently."""
+    from aimux import bridge_client
+
+    runtime = bridge_client.ReverseClientRuntime("winbox_1")
+    payload = runtime.registration_payload(replace=False)
+    assert payload["version"] == __version__
+
+
+def test_register_client_flags_version_mismatch(monkeypatch):
+    monkeypatch.setattr("aimux.bridge_server.ssh_mod.host_exists", lambda name: False)
+    state = BridgeBrokerState("secret")
+
+    result = state.register_client(
+        {
+            "identifier": "winbox_1",
+            "platform": "linux",
+            "profiles": [],
+            "version": "0.0.1-ancient",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["server_version"] == __version__
+    assert result["version_mismatch"] is True
+    assert state.clients["winbox_1"].client_version == "0.0.1-ancient"
+    remote = state.list_remotes()[0]
+    assert remote["client_version"] == "0.0.1-ancient"
+    assert remote["server_version"] == __version__
+    assert remote["version_mismatch"] is True
+
+
+def test_register_client_silent_when_versions_match(monkeypatch):
+    monkeypatch.setattr("aimux.bridge_server.ssh_mod.host_exists", lambda name: False)
+    state = BridgeBrokerState("secret")
+
+    result = state.register_client(
+        {
+            "identifier": "winbox_1",
+            "platform": "linux",
+            "profiles": [],
+            "version": __version__,
+        }
+    )
+
+    assert result["version_mismatch"] is False
+    assert state.list_remotes()[0]["version_mismatch"] is False
+
+
+def test_register_client_tolerates_legacy_client_without_version(monkeypatch):
+    """An older client that sends no version must not false-alarm — only a
+    known-and-different version triggers a mismatch."""
+    monkeypatch.setattr("aimux.bridge_server.ssh_mod.host_exists", lambda name: False)
+    state = BridgeBrokerState("secret")
+
+    result = state.register_client(
+        {"identifier": "winbox_1", "platform": "linux", "profiles": []}
+    )
+
+    assert result["version_mismatch"] is False
+    assert state.clients["winbox_1"].client_version == ""
+    assert state.list_remotes()[0]["client_version"] == ""
+
+
+def test_register_client_emits_warning_log_on_mismatch(monkeypatch):
+    """User-facing requirement: a version skew must produce a WARNING log so
+    operators see it without polling the API."""
+    monkeypatch.setattr("aimux.bridge_server.ssh_mod.host_exists", lambda name: False)
+    logs: list[str] = []
+    sink_id = logger.add(lambda message: logs.append(str(message)), level="WARNING", format="{message}")
+    try:
+        state = BridgeBrokerState("secret")
+        state.register_client(
+            {
+                "identifier": "winbox_1",
+                "platform": "linux",
+                "profiles": [],
+                "version": "0.0.1-ancient",
+            }
+        )
+    finally:
+        logger.remove(sink_id)
+
+    joined = "\n".join(logs)
+    assert "version mismatch" in joined
+    assert "0.0.1-ancient" in joined
+    assert __version__ in joined

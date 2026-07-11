@@ -25,7 +25,7 @@ from typing import Any, Protocol
 from loguru import logger
 
 from . import __version__
-from .bridge import BridgeError, validate_identifier
+from .bridge import BridgeError, validate_identifier, version_mismatch_message
 from .transfer import (
     DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE,
     apply_sync_archive_b64,
@@ -523,6 +523,7 @@ class ReverseClientRuntime:
             "platform": platform.system().lower() or sys.platform,
             "default_profile": self.default_profile,
             "profiles": [adapter.profile_info() for adapter in self.adapters.values()],
+            "version": __version__,
         }
 
     def handle(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -895,7 +896,7 @@ def _register_with_retry(
     reconnect: bool,
     retry_intervals: tuple[float, ...] | None = None,
     sleep=time.sleep,
-) -> None:
+) -> dict[str, Any]:
     """POST /client/register, retrying on 409 Conflict or transient errors.
 
     A 409 means the broker still believes a previous client with this
@@ -908,10 +909,10 @@ def _register_with_retry(
     attempt = 0
     while True:
         try:
-            _post_json(f"{base}/client/register", token, payload)
+            response = _post_json(f"{base}/client/register", token, payload)
             if attempt:
                 logger.info("bridge register recovered identifier={} after {} retries", identifier, attempt)
-            return
+            return response
         except urllib.error.HTTPError as e:
             reason = f"HTTP {e.code} {e.reason}"
             if e.code in (401, 403):
@@ -969,7 +970,7 @@ def connect(
     runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
-    _register_with_retry(
+    register_response = _register_with_retry(
         base,
         token,
         payload,
@@ -979,6 +980,14 @@ def connect(
         sleep=sleep,
     )
     logger.info("aimux bridge client version {}", __version__)
+    server_version = (
+        str(register_response.get("server_version") or "")
+        if isinstance(register_response, dict)
+        else ""
+    )
+    client_mismatch = version_mismatch_message(__version__, server_version)
+    if client_mismatch:
+        logger.warning("bridge client {} — {}", identifier, client_mismatch)
     logger.info(
         "connected bridge remote {!r}; profiles={}; default={}",
         identifier,

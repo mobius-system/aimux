@@ -28,6 +28,7 @@ from .bridge import (
     external_host_hint,
     utc_now,
     validate_identifier,
+    version_mismatch_message,
     write_runtime,
 )
 
@@ -90,6 +91,7 @@ class ClientInfo:
     profiles: list[dict[str, Any]]
     connected: bool = False
     last_seen: str | None = None
+    client_version: str = ""
     queue: queue.Queue[dict[str, Any] | None] | None = None
 
 
@@ -110,6 +112,10 @@ class BridgeBrokerState:
         platform = str(payload.get("platform") or "unknown")
         default_profile = payload.get("default_profile")
         profiles = payload.get("profiles") if isinstance(payload.get("profiles"), list) else []
+        client_version = str(payload.get("version") or "")
+        mismatch = version_mismatch_message(client_version, __version__)
+        if mismatch:
+            logger.warning("bridge client {} registered with {}", name, mismatch)
         with self.lock:
             existing = self.clients.get(name)
             if existing and existing.connected and not replace:
@@ -126,16 +132,31 @@ class BridgeBrokerState:
                 profiles=[p for p in profiles if isinstance(p, dict)],
                 connected=False,
                 last_seen=utc_now(),
+                client_version=client_version,
             )
+            # A reverse client re-registering means its process restarted, so its
+            # in-memory session table is now empty. Drop our cached session records
+            # for this remote; otherwise `new` keeps reporting "already exists" for
+            # sessions the client no longer has, while `send-keys` reports "not found".
+            stale_keys = [key for key in self.sessions if key[0] == name]
+            for key in stale_keys:
+                self.sessions.pop(key, None)
         logger.info(
-            "bridge client registered name={!r} platform={} default_profile={} profiles={} replace={}",
+            "bridge client registered name={!r} platform={} default_profile={} profiles={} replace={} version={}",
             name,
             platform,
             default_profile,
             [p.get("name") for p in profiles if isinstance(p, dict)],
             replace,
+            client_version or "unknown",
         )
-        return {"ok": True}
+        if stale_keys:
+            logger.info(
+                "bridge client re-registration cleared {} stale session(s) for name={!r}",
+                len(stale_keys),
+                name,
+            )
+        return {"ok": True, "server_version": __version__, "version_mismatch": bool(mismatch)}
 
     def connect_events(self, name: str) -> queue.Queue[dict[str, Any] | None]:
         validate_identifier(name)
@@ -179,6 +200,9 @@ class BridgeBrokerState:
                         "default_profile": client.default_profile,
                         "profiles": client.profiles,
                         "last_seen": client.last_seen,
+                        "client_version": client.client_version,
+                        "server_version": __version__,
+                        "version_mismatch": bool(version_mismatch_message(client.client_version, __version__)),
                     }
                 )
             return rows
@@ -186,6 +210,20 @@ class BridgeBrokerState:
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.lock:
             return [dict(v) for _, v in sorted(self.sessions.items())]
+
+    def _drop_session(self, remote: str, name: str, *, reason: str) -> None:
+        """Remove a cached session record so broker state stays in sync with the
+        reverse client. Used when the client reports a session is gone, and when
+        the client process restarts (its in-memory session table is then empty)."""
+        with self.lock:
+            existed = self.sessions.pop((remote, name), None) is not None
+        if existed:
+            logger.info(
+                "bridge broker dropped stale session remote={!r} name={!r} reason={}",
+                remote,
+                name,
+                reason,
+            )
 
     def client_supports_profile(self, remote: str, profile: str) -> bool:
         with self.lock:
@@ -294,7 +332,12 @@ class BridgeBrokerState:
                 raise BridgeError(f"session {remote!r}/{name!r} not found", kind="not_found")
         payload = dict(payload)
         payload["session"] = name
-        return self.submit(remote, "session.send_keys", payload, timeout)
+        try:
+            return self.submit(remote, "session.send_keys", payload, timeout)
+        except BridgeError as e:
+            if e.kind == "not_found":
+                self._drop_session(remote, name, reason="client reports not_found")
+            raise
 
     def capture(self, remote: str, name: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         with self.lock:
@@ -302,15 +345,28 @@ class BridgeBrokerState:
                 raise BridgeError(f"session {remote!r}/{name!r} not found", kind="not_found")
         payload = dict(payload)
         payload["session"] = name
-        return self.submit(remote, "session.capture", payload, timeout)
+        try:
+            return self.submit(remote, "session.capture", payload, timeout)
+        except BridgeError as e:
+            if e.kind == "not_found":
+                self._drop_session(remote, name, reason="client reports not_found")
+            raise
 
     def kill_session(self, remote: str, name: str, timeout: float) -> dict[str, Any]:
         with self.lock:
             if (remote, name) not in self.sessions:
                 raise BridgeError(f"session {remote!r}/{name!r} not found", kind="not_found")
-        result = self.submit(remote, "session.kill", {"session": name}, timeout)
-        with self.lock:
-            self.sessions.pop((remote, name), None)
+        try:
+            result = self.submit(remote, "session.kill", {"session": name}, timeout)
+        except BridgeError as e:
+            # Client no longer knows this session — the kill's goal (destroy it)
+            # is already met. Drop our stale cache and treat as success so callers
+            # can recover from a half-dead record without restarting the broker.
+            if e.kind == "not_found":
+                self._drop_session(remote, name, reason="client reports not_found on kill")
+                return {"ok": True}
+            raise
+        self._drop_session(remote, name, reason="killed")
         return result or {"ok": True}
 
     def file_op(self, remote: str, action: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:

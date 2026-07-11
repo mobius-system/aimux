@@ -40,6 +40,21 @@ class BridgeTimeoutError(BridgeError):
         super().__init__(message, kind="timeout", exit_code=124)
 
 
+def version_mismatch_message(client_version: str, server_version: str) -> str | None:
+    """Return a warning string when client/server aimux versions differ, else None.
+
+    Stays silent (returns None) when either side is unknown — e.g. an older
+    client that did not report a version, or a server that did not echo one —
+    so a version-skewed deployment never false-alarms on the missing side.
+    """
+    if not client_version or not server_version or client_version == server_version:
+        return None
+    return (
+        f"aimux version mismatch: client={client_version!r} server={server_version!r}; "
+        "bridge commands may fail with unexpected errors — upgrade the older side to match"
+    )
+
+
 @dataclass(frozen=True)
 class BridgeRuntime:
     url: str
