@@ -1,6 +1,7 @@
 """Tests for the bridge reverse-client auto-reconnection logic."""
 from __future__ import annotations
 
+import io
 import threading
 import urllib.error
 from typing import Any
@@ -285,3 +286,115 @@ def test_serve_event_stream_logs_heartbeat(monkeypatch):
         logger.remove(sink_id)
 
     assert any("bridge client heartbeat identifier=winbox_1" in line for line in logs)
+
+
+def _patch_register(monkeypatch, *, post_side_effects):
+    """Stub _post_json/_open_events to drive register-side behavior.
+
+    ``post_side_effects`` is a list whose entries are either an Exception
+    instance/class (raised by _post_json) or a dict (returned on success).
+    Once exhausted, the last entry repeats. The event stream always fails
+    immediately so tests can focus on the register phase.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def fake_post_json(url, token, payload, *, timeout=10.0):
+        idx = len(calls)
+        calls.append({"url": url, "payload": payload})
+        effect = post_side_effects[idx] if idx < len(post_side_effects) else post_side_effects[-1]
+        if isinstance(effect, BaseException):
+            raise effect
+        if isinstance(effect, type) and issubclass(effect, BaseException):
+            raise effect("simulated")
+        return effect
+
+    def fake_open_events(url, token, identifier):
+        raise urllib.error.URLError("stream closed")
+
+    monkeypatch.setattr("aimux.bridge_client._post_json", fake_post_json)
+    monkeypatch.setattr("aimux.bridge_client._open_events", fake_open_events)
+    return calls
+
+
+def _http_error(code: int, msg: str) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "http://broker.example/client/register",
+        code,
+        msg,
+        {},
+        io.BytesIO(b"{}"),
+    )
+
+
+def test_register_retries_on_409_then_succeeds(monkeypatch):
+    sleeps: list[float] = []
+    calls = _patch_register(monkeypatch, post_side_effects=[
+        _http_error(409, "Conflict"),
+        {},  # second register attempt succeeds
+    ])
+    with pytest.raises(bridge.BridgeError) as exc:
+        connect(
+            "http://broker.example",
+            identifier="winbox_1",
+            token="secret",
+            reconnect=True,
+            reconnect_intervals=(),  # do not retry the SSE stage
+            register_retry_intervals=(2.0, 4.0),
+            sleep=sleeps.append,
+        )
+    # Register recovered on attempt 2; then the event stream failed and, with
+    # no SSE retries configured, connect raises remote_disconnected.
+    assert exc.value.kind == "remote_disconnected"
+    assert len(calls) == 2
+    assert sleeps == [2.0]
+
+
+def test_register_gives_up_after_retries(monkeypatch):
+    sleeps: list[float] = []
+    calls = _patch_register(monkeypatch, post_side_effects=[_http_error(409, "Conflict")])
+    with pytest.raises(bridge.BridgeError) as exc:
+        connect(
+            "http://broker.example",
+            identifier="winbox_1",
+            token="secret",
+            register_retry_intervals=(2.0, 4.0, 8.0),
+            sleep=sleeps.append,
+        )
+    assert exc.value.kind == "remote_disconnected"
+    assert exc.value.exit_code == 2
+    assert len(calls) == 4  # 1 initial + 3 retries
+    assert sleeps == [2.0, 4.0, 8.0]
+
+
+def test_register_409_does_not_retry_when_reconnect_disabled(monkeypatch):
+    sleeps: list[float] = []
+    calls = _patch_register(monkeypatch, post_side_effects=[_http_error(409, "Conflict")])
+    with pytest.raises(bridge.BridgeError) as exc:
+        connect(
+            "http://broker.example",
+            identifier="winbox_1",
+            token="secret",
+            reconnect=False,
+            register_retry_intervals=(2.0, 4.0),
+            sleep=sleeps.append,
+        )
+    assert exc.value.kind == "remote_disconnected"
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_register_auth_failure_is_not_retried(monkeypatch):
+    sleeps: list[float] = []
+    calls = _patch_register(monkeypatch, post_side_effects=[_http_error(401, "Unauthorized")])
+    with pytest.raises(bridge.BridgeError) as exc:
+        connect(
+            "http://broker.example",
+            identifier="winbox_1",
+            token="secret",
+            register_retry_intervals=(2.0, 4.0),
+            sleep=sleeps.append,
+        )
+    assert exc.value.kind == "auth_required"
+    assert exc.value.exit_code == 4
+    assert len(calls) == 1
+    assert sleeps == []

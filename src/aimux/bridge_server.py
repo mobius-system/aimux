@@ -5,6 +5,8 @@ import json
 import os
 import queue
 import secrets
+import socket
+import sys
 import threading
 import time
 import urllib.parse
@@ -31,6 +33,47 @@ from .bridge import (
 
 
 BRIDGE_SERVER_HEARTBEAT_LOG_INTERVAL = 180.0
+
+# TCP keepalive tuning so the broker detects half-open reverse clients
+# (Windows sleep / VPN switch / network drop) within tens of seconds instead
+# of waiting for the kernel retransmit timeout (~minutes). The 15s SSE
+# heartbeat write alone cannot detect this: data sits in the kernel send
+# buffer and write() returns successfully while the peer is long gone.
+BRIDGE_TCP_KEEPIDLE = 10
+BRIDGE_TCP_KEEPINTVL = 3
+BRIDGE_TCP_KEEPCNT = 3
+
+
+def _apply_tcp_keepalive(sock) -> None:
+    """Enable TCP keepalive on an accepted socket with short probe intervals.
+
+    Best-effort and platform-defensive: the broker normally runs on Linux,
+    but every option is guarded so a missing constant or a read-only socket
+    never breaks request handling.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    for opt_name, value in (
+        ("TCP_KEEPIDLE", BRIDGE_TCP_KEEPIDLE),
+        ("TCP_KEEPINTVL", BRIDGE_TCP_KEEPINTVL),
+        ("TCP_KEEPCNT", BRIDGE_TCP_KEEPCNT),
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+            except OSError:
+                pass
+    if sys.platform == "win32":
+        try:
+            sock.ioctl(
+                socket.SIO_KEEPALIVE_VALS,
+                (1, BRIDGE_TCP_KEEPIDLE * 1000, BRIDGE_TCP_KEEPINTVL * 1000),
+            )
+        except (OSError, AttributeError):
+            pass
 
 
 @dataclass
@@ -115,6 +158,13 @@ class BridgeBrokerState:
                 client.queue = None
                 client.last_seen = utc_now()
                 logger.info("bridge client event stream disconnected name={!r}", name)
+
+    def touch(self, name: str) -> None:
+        """Record a heartbeat observation so last_seen reflects live SSE traffic."""
+        with self.lock:
+            client = self.clients.get(name)
+            if client is not None:
+                client.last_seen = utc_now()
 
     def list_remotes(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -273,6 +323,10 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "aimux-bridge/0.1"
 
+        def setup(self) -> None:  # noqa: D401
+            super().setup()
+            _apply_tcp_keepalive(self.connection)
+
         def do_GET(self) -> None:  # noqa: N802
             try:
                 parsed = urllib.parse.urlparse(self.path)
@@ -386,6 +440,7 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     except queue.Empty:
                         self.wfile.write(b": heartbeat\n\n")
                         self.wfile.flush()
+                        state.touch(identifier)
                         now = time.monotonic()
                         if now - last_heartbeat_log >= BRIDGE_SERVER_HEARTBEAT_LOG_INTERVAL:
                             logger.info("bridge server heartbeat identifier={!r}", identifier)

@@ -38,6 +38,12 @@ _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _STREAM_EOF = object()
 BRIDGE_CLIENT_HEARTBEAT_INTERVAL = 180.0
 
+# Backoff schedule used when /client/register returns 409 Conflict (a stale
+# server-side record for the same identifier) or the broker is temporarily
+# unreachable. Lets the client ride out a broker restart or slow disconnect
+# detection instead of exiting and relying on an external supervisor.
+REGISTER_RETRY_INTERVALS: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 30.0)
+
 
 def _payload_count(payload: dict[str, Any], key: str) -> int:
     value = payload.get(key)
@@ -880,6 +886,70 @@ def _serve_event_stream(
 RECONNECT_INTERVALS: tuple[float, ...] = (5.0, 10.0, 20.0)
 
 
+def _register_with_retry(
+    base: str,
+    token: str,
+    payload: dict[str, Any],
+    *,
+    identifier: str,
+    reconnect: bool,
+    retry_intervals: tuple[float, ...] | None = None,
+    sleep=time.sleep,
+) -> None:
+    """POST /client/register, retrying on 409 Conflict or transient errors.
+
+    A 409 means the broker still believes a previous client with this
+    identifier is connected (its disconnect has not been observed yet, e.g.
+    a half-open TCP connection). Rather than crashing for an external
+    supervisor to restart us, back off and retry so we take over the moment
+    the stale record clears. Auth failures (401/403) are not retried.
+    """
+    intervals = retry_intervals if retry_intervals is not None else REGISTER_RETRY_INTERVALS
+    attempt = 0
+    while True:
+        try:
+            _post_json(f"{base}/client/register", token, payload)
+            if attempt:
+                logger.info("bridge register recovered identifier={} after {} retries", identifier, attempt)
+            return
+        except urllib.error.HTTPError as e:
+            reason = f"HTTP {e.code} {e.reason}"
+            if e.code in (401, 403):
+                raise BridgeError(
+                    f"bridge register rejected: {reason}",
+                    kind="auth_required",
+                    exit_code=4,
+                )
+            retryable = e.code == 409
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            reason = str(e) or e.__class__.__name__
+            retryable = True
+
+        if not reconnect or not retryable:
+            raise BridgeError(
+                f"bridge register failed: {reason}",
+                kind="remote_disconnected",
+                exit_code=2,
+            )
+        if attempt >= len(intervals):
+            raise BridgeError(
+                f"bridge register failed after {len(intervals)} retries: {reason}",
+                kind="remote_disconnected",
+                exit_code=2,
+            )
+        delay = intervals[attempt]
+        logger.warning(
+            "bridge register failed identifier={} reason={} retry {}/{} in {:g}s",
+            identifier,
+            reason,
+            attempt + 1,
+            len(intervals),
+            delay,
+        )
+        sleep(delay)
+        attempt += 1
+
+
 def connect(
     url: str,
     *,
@@ -889,6 +959,7 @@ def connect(
     replace: bool = False,
     reconnect: bool = True,
     reconnect_intervals: tuple[float, ...] | None = None,
+    register_retry_intervals: tuple[float, ...] | None = None,
     sleep=time.sleep,
     stop_event: threading.Event | None = None,
     stream_poll_interval: float = 0.2,
@@ -898,7 +969,15 @@ def connect(
     runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
-    _post_json(f"{base}/client/register", token, payload)
+    _register_with_retry(
+        base,
+        token,
+        payload,
+        identifier=identifier,
+        reconnect=reconnect,
+        retry_intervals=register_retry_intervals,
+        sleep=sleep,
+    )
     logger.info("aimux bridge client version {}", __version__)
     logger.info(
         "connected bridge remote {!r}; profiles={}; default={}",
