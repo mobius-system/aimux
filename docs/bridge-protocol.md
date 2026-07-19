@@ -179,7 +179,31 @@
 ```
 - 响应：`200 {"ok": true}`（无论 id 是否匹配）
 
-### 2.3 Session 操作（CLI → server → client → server → CLI）
+### 2.3 HTTP port forward
+
+#### `ANY /api/forward`
+
+该 endpoint 供 `aimux port forward` 的本地 HTTP 代理调用，同时承载普通
+HTTP、SSE 和 WebSocket Upgrade。请求体和响应体必须流式转发，不得封装为
+JSON/base64。
+
+内部控制头：
+
+- `X-Aimux-Target-Origin`: Bridge Server 网络视角下的目标 origin，例如
+  `http://127.0.0.1:3000`。
+- `X-Aimux-Request-Target`: 原始 origin-form path + query，例如
+  `/api/items?q=1`。必须以 `/` 开头，禁止 CR/LF 和 fragment。
+- `X-Aimux-Local-Origin`: 浏览器访问的本地 origin，用于重写 Location、
+  Cookie Domain、CORS Origin。
+- `X-Aimux-Upstream-Authorization`: 目标应用自己的 Authorization。Bridge
+  完成自身 Bearer token 鉴权后，将其恢复为上游 Authorization。
+
+Bridge 转发前必须删除所有 `X-Aimux-*`、Bridge `Authorization` 和
+hop-by-hop headers。普通 HTTP 与 SSE 返回目标 status/headers/body；SSE
+必须禁用 buffering 和总时长 timeout。带 `Upgrade: websocket` 的 GET 在同一
+endpoint 完成目标握手后进入双向流转发。
+
+### 2.4 Session 操作（CLI → server → client → server → CLI）
 
 #### `POST /api/sessions`（create）
 - 请求：
@@ -243,7 +267,7 @@
 - 请求：`{"timeout": 30}`（可选）
 - 响应：`200 {"ok": true}`
 
-### 2.4 File 操作（不绑定 session，只走 remote）
+### 2.5 File 操作（不绑定 session，只走 remote）
 
 #### `POST /api/remotes/{remote}/files/{action}`
 - `action ∈ {stat, read, write, mkdir, list}`

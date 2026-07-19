@@ -102,7 +102,22 @@ Windows bridge profiles include `cmd`, `powershell`, `pwsh`, and `mingw64`
 when available. macOS exposes `mac-pty` and `mac-terminal`; Linux exposes
 `posix-pty`.
 
-4. Upload and download files.
+4. Forward a browser-facing HTTP service through the bridge server.
+
+```bash
+aimux port forward https://SERVER/aimux_bridge \
+  --local-port=8080 \
+  --remote-host=127.0.0.1 \
+  --remote-port=3000 \
+  --token=<token>
+```
+
+Open `http://127.0.0.1:8080`. Ordinary HTTP requests, streaming SSE responses,
+and WebSocket upgrades are forwarded to `http://127.0.0.1:3000` from the
+bridge server's network namespace. Use `--remote-scheme=https` for an HTTPS
+target.
+
+5. Upload and download files.
 
 ### File transfer for bridge remotes
 

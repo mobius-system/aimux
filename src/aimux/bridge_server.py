@@ -19,6 +19,7 @@ from typing import Any
 from loguru import logger
 
 from . import __version__
+from . import port_forward
 from . import ssh as ssh_mod
 from .bridge import (
     BridgeError,
@@ -418,6 +419,7 @@ class BridgeBrokerState:
 def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "aimux-bridge/0.1"
+        protocol_version = "HTTP/1.1"
 
         def setup(self) -> None:  # noqa: D401
             super().setup()
@@ -438,6 +440,10 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     self._require_auth()
                     self._json(HTTPStatus.OK, {"sessions": state.list_sessions()})
                     return
+                if parsed.path == port_forward.FORWARD_PATH:
+                    self._require_auth()
+                    port_forward.handle_bridge_forward(self)
+                    return
                 if parsed.path == "/client/events":
                     self._require_auth()
                     query = urllib.parse.parse_qs(parsed.query)
@@ -451,6 +457,10 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             try:
                 parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == port_forward.FORWARD_PATH:
+                    self._require_auth()
+                    port_forward.handle_bridge_forward(self)
+                    return
                 payload = self._read_json()
                 if parsed.path == "/client/register":
                     self._require_auth()
@@ -488,6 +498,34 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     self._json(HTTPStatus.OK, state.file_op(remote, action, payload, timeout))
                     return
                 self._json(HTTPStatus.NOT_FOUND, {"error": {"kind": "not_found", "message": "not found"}})
+            except BridgeError as e:
+                self._bridge_error(e)
+            except ValueError as e:
+                self._json(HTTPStatus.BAD_REQUEST, {"error": {"kind": "bad_request", "message": str(e)}})
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._forward_method()
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._forward_method()
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._forward_method()
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            self._forward_method()
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self._forward_method()
+
+        def _forward_method(self) -> None:
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path != port_forward.FORWARD_PATH:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": {"kind": "not_found", "message": "not found"}})
+                    return
+                self._require_auth()
+                port_forward.handle_bridge_forward(self)
             except BridgeError as e:
                 self._bridge_error(e)
             except ValueError as e:

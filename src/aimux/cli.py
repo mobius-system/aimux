@@ -16,6 +16,7 @@ import typer
 from . import bridge
 from . import bridge_client
 from . import bridge_server
+from . import port_forward
 from . import session as session_mod
 from . import ssh as ssh_mod
 from . import tmux
@@ -63,6 +64,13 @@ reverse_app = typer.Typer(
     help="Reverse-connect this machine to an aimux bridge broker.",
 )
 app.add_typer(reverse_app, name="reverse")
+
+port_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Forward local HTTP traffic through an aimux bridge broker.",
+)
+app.add_typer(port_app, name="port")
 
 
 # ---------- helpers ----------
@@ -969,5 +977,47 @@ def cmd_reverse_connect(
         )
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
+    except KeyboardInterrupt:
+        raise typer.Exit(EXIT_OK)
+
+
+# ---------- port forward ----------
+
+@port_app.command("forward", help="Forward local HTTP, SSE, and WebSocket traffic through a bridge broker.")
+def cmd_port_forward(
+    url: Annotated[str, typer.Argument(help="Bridge broker URL, e.g. https://server/aimux_bridge.")],
+    local_port: Annotated[int, typer.Option("--local-port", help="Local browser-facing port.")],
+    remote_port: Annotated[int, typer.Option("--remote-port", help="Target port visible from the bridge server.")],
+    token: Annotated[str, typer.Option("--token", help="Bridge token or upstream proxy JWT.")],
+    local_host: Annotated[str, typer.Option("--local-host", help="Local listen address.")] = "127.0.0.1",
+    remote_host: Annotated[str, typer.Option("--remote-host", help="Target host visible from the bridge server.")] = "127.0.0.1",
+    remote_scheme: Annotated[str, typer.Option("--remote-scheme", help="Target scheme: http or https.")] = "http",
+    preserve_host: Annotated[bool, typer.Option("--preserve-host", help="Send the browser Host header to the target.")] = False,
+    rewrite_origin: Annotated[bool, typer.Option("--rewrite-origin/--no-rewrite-origin", help="Rewrite local Origin/Referer to the target origin.")] = True,
+    rewrite_secure_cookie: Annotated[bool, typer.Option("--rewrite-secure-cookie", help="Remove Secure from target cookies for a local HTTP listener.")] = False,
+):
+    if not 0 <= local_port <= 65535:
+        err("error: --local-port must be between 0 and 65535")
+        raise typer.Exit(EXIT_USER_ERROR)
+    if not 1 <= remote_port <= 65535:
+        err("error: --remote-port must be between 1 and 65535")
+        raise typer.Exit(EXIT_USER_ERROR)
+    target_origin = f"{remote_scheme}://{remote_host}:{remote_port}"
+    try:
+        port_forward.serve_local_forward(
+            url,
+            local_host=local_host,
+            local_port=local_port,
+            target_origin=target_origin,
+            token=token,
+            preserve_host=preserve_host,
+            rewrite_origin=rewrite_origin,
+            rewrite_secure_cookie=rewrite_secure_cookie,
+        )
+    except bridge.BridgeError as e:
+        _exit_bridge_error(e)
+    except OSError as e:
+        err(f"error: failed to start port forward: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
     except KeyboardInterrupt:
         raise typer.Exit(EXIT_OK)
