@@ -625,6 +625,38 @@ def test_bridge_sync_dir_to_remote_excludes_and_protects_paths(tmp_path):
     assert events[2][1] == {"changed_files": 1, "deleted_paths": 1, "dirs": 0}
 
 
+def test_bridge_sync_dir_to_remote_excludes_directory_descendants_without_trailing_slash(tmp_path):
+    local = tmp_path / "local"
+    node_modules = local / "frontend" / "node_modules"
+    esbuild_bin = node_modules / "esbuild" / "bin"
+    src = local / "frontend" / "src"
+    esbuild_bin.mkdir(parents=True)
+    src.mkdir(parents=True)
+    (src / "app.js").write_text("console.log('keep')\n", encoding="utf-8")
+    (esbuild_bin / "package.txt").write_text("exclude me", encoding="utf-8")
+    try:
+        (esbuild_bin / "esbuild").symlink_to("package.txt")
+    except OSError:
+        pass
+
+    fake = FakeBridgeControlClient()
+    fake.remote_dirs.add("/remote/proj")
+
+    result = transfer.bridge_sync_dir(
+        fake,
+        "remote-1",
+        "/remote/proj",
+        local,
+        to_remote=True,
+        exclude=["frontend/node_modules"],
+    )
+
+    assert result.synced_files == 1
+    assert fake.remote_files == {"/remote/proj/frontend/src/app.js": b"console.log('keep')\n"}
+    assert "/remote/proj/frontend/node_modules/esbuild/bin/package.txt" not in fake.remote_files
+    assert "/remote/proj/frontend/node_modules" not in fake.remote_dirs
+
+
 def test_bridge_sync_dir_from_remote_excludes_and_protects_paths(tmp_path):
     local = tmp_path / "local"
     (local / "cache").mkdir(parents=True)
@@ -653,6 +685,34 @@ def test_bridge_sync_dir_from_remote_excludes_and_protects_paths(tmp_path):
     assert (local / "secret.env").read_text(encoding="utf-8") == "local secret"
     assert (local / "cache" / "out.bin").read_text(encoding="utf-8") == "local cache"
     assert not (local / "stale.txt").exists()
+
+
+def test_bridge_sync_dir_from_remote_excludes_directory_descendants_without_trailing_slash(tmp_path):
+    local = tmp_path / "local"
+    fake = FakeBridgeControlClient()
+    fake.remote_dirs.update({
+        "/remote/proj",
+        "/remote/proj/frontend",
+        "/remote/proj/frontend/node_modules",
+        "/remote/proj/frontend/node_modules/esbuild",
+        "/remote/proj/frontend/node_modules/esbuild/bin",
+        "/remote/proj/frontend/src",
+    })
+    fake.remote_files["/remote/proj/frontend/src/app.js"] = b"console.log('keep')\n"
+    fake.remote_files["/remote/proj/frontend/node_modules/esbuild/bin/esbuild"] = b"exclude me"
+
+    result = transfer.bridge_sync_dir(
+        fake,
+        "remote-1",
+        "/remote/proj",
+        local,
+        from_remote=True,
+        exclude=["frontend/node_modules"],
+    )
+
+    assert result.synced_files == 1
+    assert (local / "frontend" / "src" / "app.js").read_bytes() == b"console.log('keep')\n"
+    assert not (local / "frontend" / "node_modules").exists()
 
 
 def test_bridge_sync_dir_noop_emits_progress_without_applying(tmp_path):

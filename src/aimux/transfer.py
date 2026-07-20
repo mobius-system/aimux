@@ -843,18 +843,36 @@ def _local_dir_snapshot(
     files: dict[str, SyncFile] = {}
     dirs: set[str] = {"."}
     exclude_patterns = _normalize_sync_excludes(exclude)
-    for child in sorted(root.rglob("*")):
-        rel = child.relative_to(root).as_posix()
-        _validate_sync_rel(rel)
-        if child.is_symlink():
-            continue
-        if _sync_path_excluded(rel, child.is_dir(), exclude_patterns):
-            continue
-        if child.is_dir():
+    for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        current_path = Path(current)
+        current_rel = current_path.relative_to(root).as_posix()
+        if current_rel == ".":
+            current_rel = ""
+
+        kept_dirs: list[str] = []
+        for dirname in sorted(dirnames):
+            child = current_path / dirname
+            rel = f"{current_rel}/{dirname}" if current_rel else dirname
+            _validate_sync_rel(rel)
+            if child.is_symlink():
+                continue
+            if _sync_path_excluded(rel, True, exclude_patterns):
+                continue
             dirs.add(rel)
-        elif child.is_file():
-            stat = child.stat()
-            files[rel] = SyncFile(rel=rel, size=stat.st_size, sha256=_sha256_file(child))
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+
+        for filename in sorted(filenames):
+            child = current_path / filename
+            rel = f"{current_rel}/{filename}" if current_rel else filename
+            _validate_sync_rel(rel)
+            if child.is_symlink():
+                continue
+            if _sync_path_excluded(rel, False, exclude_patterns):
+                continue
+            if child.is_file():
+                stat = child.stat()
+                files[rel] = SyncFile(rel=rel, size=stat.st_size, sha256=_sha256_file(child))
     return SyncSnapshot(files=files, dirs=dirs, root_exists=True)
 
 
@@ -884,6 +902,7 @@ def _bridge_dir_snapshot(
     files: dict[str, SyncFile] = {}
     dirs: set[str] = {"."}
     exclude_patterns = _normalize_sync_excludes(exclude)
+    excluded_dirs: set[str] = set()
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -895,7 +914,11 @@ def _bridge_dir_snapshot(
         if not rel:
             continue
         _validate_sync_rel(rel)
+        if _sync_has_excluded_ancestor(rel, excluded_dirs):
+            continue
         if _sync_path_excluded(rel, item_type == "dir", exclude_patterns):
+            if item_type == "dir":
+                excluded_dirs.add(rel)
             continue
         if item_type == "dir":
             dirs.add(rel)
@@ -915,6 +938,16 @@ def _bridge_dir_snapshot(
             sha256 = hashlib.sha256(data).hexdigest()
         files[rel] = SyncFile(rel=rel, size=size, sha256=sha256)
     return SyncSnapshot(files=files, dirs=dirs, root_exists=True)
+
+
+def _sync_has_excluded_ancestor(rel: str, excluded_dirs: set[str]) -> bool:
+    parts = rel.replace("\\", "/").split("/")[:-1]
+    current: list[str] = []
+    for part in parts:
+        current.append(part)
+        if "/".join(current) in excluded_dirs:
+            return True
+    return False
 
 
 def _build_sync_dir_plan(source: SyncSnapshot, destination: SyncSnapshot) -> SyncDirPlan:
@@ -970,6 +1003,11 @@ def _sync_path_excluded(rel: str, is_dir: bool, patterns: Iterable[str]) -> bool
                 return True
             continue
         if _sync_exclude_pattern_matches(normalized, candidate, anchored):
+            return True
+        if any(
+            _sync_exclude_pattern_matches(dir_path, candidate, anchored)
+            for dir_path in _sync_ancestor_dirs(normalized, is_dir)
+        ):
             return True
     return False
 
