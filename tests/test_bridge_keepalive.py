@@ -1,9 +1,28 @@
 """Tests for broker TCP keepalive applied to accepted SSE sockets."""
 from __future__ import annotations
 
+import http.client
+import json
 import socket
+import threading
+from contextlib import contextmanager
+from http import HTTPStatus
+from http.server import ThreadingHTTPServer
 
 from aimux import bridge_server
+
+
+@contextmanager
+def _running_server(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
 
 
 def test_apply_tcp_keepalive_enables_so_keepalive_and_tunes_probes():
@@ -53,3 +72,48 @@ def test_broker_state_touch_updates_last_seen():
     # Touching an unknown client is a no-op.
     state.touch("ghost")
     assert "ghost" not in state.clients
+
+
+def test_broker_connection_status_tracks_the_active_event_stream():
+    state = bridge_server.BridgeBrokerState("secret")
+    state.register_client({"identifier": "winbox_1", "platform": "linux", "profiles": []})
+
+    assert state.connection_status("winbox_1") == {
+        "identifier": "winbox_1",
+        "registered": True,
+        "event_stream_connected": False,
+        "last_seen": state.clients["winbox_1"].last_seen,
+    }
+
+    queue = state.connect_events("winbox_1")
+    assert state.connection_status("winbox_1")["event_stream_connected"] is True
+
+    state.disconnect_events("winbox_1", queue)
+    assert state.connection_status("winbox_1")["event_stream_connected"] is False
+    assert state.connection_status("unknown_client")["registered"] is False
+
+
+def test_connection_status_endpoint_reports_event_stream_state():
+    state = bridge_server.BridgeBrokerState("secret")
+    state.register_client({"identifier": "desktop_1", "platform": "win32", "profiles": []})
+
+    with _running_server(bridge_server.make_handler(state)) as broker:
+        connection = http.client.HTTPConnection("127.0.0.1", broker.server_address[1], timeout=2)
+        connection.request("GET", "/api/remotes/desktop_1/connection", headers={"Authorization": "Bearer secret"})
+        response = connection.getresponse()
+        assert response.status == HTTPStatus.OK
+        assert json.loads(response.read()) == {
+            "identifier": "desktop_1",
+            "registered": True,
+            "event_stream_connected": False,
+            "last_seen": state.clients["desktop_1"].last_seen,
+        }
+
+        queue = state.connect_events("desktop_1")
+        connection.request("GET", "/api/remotes/desktop_1/connection", headers={"Authorization": "Bearer secret"})
+        response = connection.getresponse()
+        assert response.status == HTTPStatus.OK
+        assert json.loads(response.read())["event_stream_connected"] is True
+
+        state.disconnect_events("desktop_1", queue)
+        connection.close()

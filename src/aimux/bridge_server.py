@@ -229,6 +229,18 @@ class BridgeBrokerState:
                 )
             return rows
 
+    def connection_status(self, name: str) -> dict[str, Any]:
+        validate_identifier(name)
+        with self.lock:
+            client = self.clients.get(name)
+            connected = bool(client and client.connected and client.queue is not None)
+            return {
+                "identifier": name,
+                "registered": client is not None,
+                "event_stream_connected": connected,
+                "last_seen": client.last_seen if client else None,
+            }
+
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.lock:
             return [dict(v) for _, v in sorted(self.sessions.items())]
@@ -435,6 +447,11 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/remotes":
                     self._require_auth()
                     self._json(HTTPStatus.OK, {"remotes": state.list_remotes()})
+                    return
+                parts = parsed.path.strip("/").split("/")
+                if len(parts) == 4 and parts[:2] == ["api", "remotes"] and parts[3] == "connection":
+                    self._require_auth()
+                    self._json(HTTPStatus.OK, state.connection_status(urllib.parse.unquote(parts[2])))
                     return
                 if parsed.path == "/api/sessions":
                     self._require_auth()
