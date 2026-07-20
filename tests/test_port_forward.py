@@ -153,8 +153,62 @@ def test_sse_forward_streams_event_response():
     assert body == b"data: one\n\ndata: two\n\n"
 
 
+def test_sse_forward_flushes_event_before_upstream_closes():
+    first_event = b"data: ready\n\n"
+    event_sent = threading.Event()
+    release_target = threading.Event()
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):  # noqa: N802
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(first_event)
+            self.wfile.flush()
+            event_sent.set()
+            release_target.wait(timeout=5)
+            self.close_connection = True
+
+        def log_message(self, fmt, *args):
+            return
+
+    with _running_server(TargetHandler) as target:
+        with _running_server(make_handler(BridgeBrokerState("secret"))) as broker:
+            config = port_forward.LocalForwardConfig(
+                bridge_origin=port_forward.Origin("http", "127.0.0.1", broker.server_address[1]),
+                bridge_path=port_forward.FORWARD_PATH,
+                target_origin=port_forward.Origin("http", "127.0.0.1", target.server_address[1]),
+                token="secret",
+                local_origin="http://127.0.0.1:18080",
+            )
+            with _running_server(port_forward._make_local_handler(config)) as local:
+                connection = http.client.HTTPConnection("127.0.0.1", local.server_address[1], timeout=5)
+                connection.request("GET", "/events")
+                response = connection.getresponse()
+                assert event_sent.wait(timeout=1)
+                received: dict[str, bytes] = {}
+                read_done = threading.Event()
+
+                def read_first_event() -> None:
+                    received["body"] = response.read(len(first_event))
+                    read_done.set()
+
+                reader = threading.Thread(target=read_first_event, daemon=True)
+                reader.start()
+                streamed_before_close = read_done.wait(timeout=0.5)
+                release_target.set()
+                reader.join(timeout=2)
+                connection.close()
+
+    assert streamed_before_close
+    assert received["body"] == first_event
+
+
 def test_websocket_upgrade_uses_same_forward_endpoint():
-    observed: dict[str, str] = {}
+    observed: dict[str, str | bytes] = {}
 
     class TargetHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -167,8 +221,11 @@ def test_websocket_upgrade_uses_same_forward_endpoint():
             self.send_header("Upgrade", "websocket")
             self.send_header("Sec-WebSocket-Accept", "test-accept")
             self.end_headers()
-            self.wfile.write(b"\x81\x02ok")
-            self.wfile.flush()
+            frame = self.connection.recv(1024)
+            mask = frame[2:6]
+            payload = bytes(value ^ mask[index % 4] for index, value in enumerate(frame[6:]))
+            observed["payload"] = payload
+            self.connection.sendall(b"\x82" + bytes([len(payload)]) + payload)
             self.close_connection = True
 
         def log_message(self, fmt, *args):
@@ -194,7 +251,16 @@ def test_websocket_upgrade_uses_same_forward_endpoint():
                     b"Sec-WebSocket-Key: dGVzdA==\r\n\r\n"
                 )
                 response = bytearray()
-                while b"\x81\x02ok" not in response:
+                while b"\r\n\r\n" not in response:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+                mask = b"\x01\x02\x03\x04"
+                payload = b"ping"
+                masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+                client.sendall(b"\x82\x84" + mask + masked)
+                while b"\x82\x04ping" not in response:
                     chunk = client.recv(4096)
                     if not chunk:
                         break
@@ -202,8 +268,8 @@ def test_websocket_upgrade_uses_same_forward_endpoint():
                 client.close()
 
     assert response.startswith(b"HTTP/1.1 101")
-    assert response.endswith(b"\x81\x02ok")
-    assert observed == {"path": "/socket?q=1", "upgrade": "websocket"}
+    assert response.endswith(b"\x82\x04ping")
+    assert observed == {"path": "/socket?q=1", "upgrade": "websocket", "payload": b"ping"}
 
 
 def test_port_forward_cli_builds_target_origin(monkeypatch):

@@ -304,8 +304,9 @@ def _copy_response(
     handler.end_headers()
     if not _response_has_body(handler.command, response.status):
         return
+    read_chunk = response.read1 if "text/event-stream" in content_type else response.read
     while True:
-        chunk = response.read(COPY_CHUNK_SIZE)
+        chunk = read_chunk(COPY_CHUNK_SIZE)
         if not chunk:
             return
         handler.wfile.write(chunk)
