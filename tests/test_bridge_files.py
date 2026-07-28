@@ -150,6 +150,64 @@ def test_file_handlers_reject_paths_with_control_chars():
         assert "control" in str(exc.value).lower() or "bad_request" in str(exc.value).lower()
 
 
+def test_file_delete_removes_file_and_is_idempotent(tmp_path):
+    runtime = _runtime()
+    target = tmp_path / "victim.txt"
+    target.write_text("x")
+
+    assert runtime.handle("file.delete", {"path": str(target)}) == {"ok": True, "existed": True}
+    assert not target.exists()
+    # second delete: path gone -> idempotent success, existed False
+    assert runtime.handle("file.delete", {"path": str(target)}) == {"ok": True, "existed": False}
+
+
+def test_file_delete_directory_requires_recursive(tmp_path):
+    runtime = _runtime()
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "a.txt").write_text("a")
+
+    with pytest.raises(Exception):
+        runtime.handle("file.delete", {"path": str(sub)})
+    assert sub.exists()  # not removed without recursive
+
+    assert runtime.handle("file.delete", {"path": str(sub), "recursive": True}) == {
+        "ok": True,
+        "existed": True,
+    }
+    assert not sub.exists()
+
+
+def test_file_delete_removes_symlink_not_its_target(tmp_path):
+    runtime = _runtime()
+    real = tmp_path / "real.txt"
+    real.write_text("keep")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    runtime.handle("file.delete", {"path": str(link)})
+    assert not link.exists()
+    assert real.exists()  # symlink target untouched
+
+
+def test_file_rename_moves_file_and_creates_parent(tmp_path):
+    runtime = _runtime()
+    src = tmp_path / "a.txt"
+    src.write_text("data")
+    dst = tmp_path / "nested" / "b.txt"
+
+    result = runtime.handle("file.rename", {"src": str(src), "dst": str(dst)})
+    assert result == {"ok": True, "src": str(src), "dst": str(dst)}
+    assert not src.exists()
+    assert dst.read_text() == "data"
+
+
+def test_file_rename_missing_source_raises(tmp_path):
+    runtime = _runtime()
+    with pytest.raises(Exception):
+        runtime.handle("file.rename", {"src": str(tmp_path / "nope"), "dst": str(tmp_path / "x")})
+
+
 def test_file_write_enforces_max_size(tmp_path):
     runtime = _runtime()
     payload = b"x" * 100
@@ -188,6 +246,10 @@ class _CollectingBrokerState(BridgeBrokerState):
             return {"size": len(base64.b64decode(payload.get("content_b64", "")))}
         if message_type == "file.mkdir":
             return {"ok": True}
+        if message_type == "file.delete":
+            return {"ok": True, "existed": True}
+        if message_type == "file.rename":
+            return {"ok": True, "src": payload.get("src"), "dst": payload.get("dst")}
         if message_type == "file.list":
             return {"entries": []}
         raise AssertionError(f"unexpected message type {message_type!r}")
@@ -199,6 +261,8 @@ def test_broker_file_op_dispatches_to_submit_with_correct_message_type():
     state.file_op("remote-a", "read", {"path": "/tmp/x"}, timeout=10)
     state.file_op("remote-a", "write", {"path": "/tmp/x", "content_b64": "aGVsbG8="}, timeout=10)
     state.file_op("remote-a", "mkdir", {"path": "/tmp/x"}, timeout=10)
+    state.file_op("remote-a", "delete", {"path": "/tmp/x"}, timeout=10)
+    state.file_op("remote-a", "rename", {"src": "/tmp/x", "dst": "/tmp/y"}, timeout=10)
     state.file_op("remote-a", "list", {"path": "/tmp/x"}, timeout=10)
 
     assert [(r, m) for r, m, _ in state.submitted] == [
@@ -206,14 +270,17 @@ def test_broker_file_op_dispatches_to_submit_with_correct_message_type():
         ("remote-a", "file.read"),
         ("remote-a", "file.write"),
         ("remote-a", "file.mkdir"),
+        ("remote-a", "file.delete"),
+        ("remote-a", "file.rename"),
         ("remote-a", "file.list"),
     ]
 
 
 def test_broker_file_op_rejects_unknown_action():
     state = _CollectingBrokerState()
+    # delete/rename are now whitelisted; use a genuinely unknown action.
     with pytest.raises(Exception):
-        state.file_op("remote-a", "delete", {"path": "/tmp/x"}, timeout=10)
+        state.file_op("remote-a", "chmod", {"path": "/tmp/x"}, timeout=10)
 
 
 def test_broker_file_round_trip_through_reverse_client_runtime(tmp_path):

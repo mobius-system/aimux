@@ -1,6 +1,7 @@
 """aimux CLI — typer-based entrypoint."""
 from __future__ import annotations
 
+import base64
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +72,16 @@ port_app = typer.Typer(
     help="Forward local HTTP traffic through an aimux bridge broker.",
 )
 app.add_typer(port_app, name="port")
+
+file_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help=(
+        "Fine-grained file operations (list/stat/read/write/mkdir/delete/rename) "
+        "on an SSH or bridge remote. Auto-dispatches by remote name."
+    ),
+)
+app.add_typer(file_app, name="file")
 
 
 # ---------- helpers ----------
@@ -1021,3 +1032,228 @@ def cmd_port_forward(
         raise typer.Exit(EXIT_USER_ERROR)
     except KeyboardInterrupt:
         raise typer.Exit(EXIT_OK)
+
+
+# ---------- file operations (list / stat / read / write / mkdir / delete / rename) ----------
+#
+# Each command auto-dispatches by remote name via _bridge_remote: a registered
+# bridge remote is served by BridgeControlClient.file_*; anything else must be
+# an ~/.ssh/config host and is served by transfer.ssh_file_*. Mirrors the
+# send_files/get_files dispatch shape.
+
+
+def _parse_file_mode(mode: str) -> int:
+    s = (mode or "").strip().lower()
+    if s.startswith("0o"):
+        s = s[2:]
+    try:
+        return int(s, 8)
+    except ValueError:
+        err(f"error: invalid file mode {mode!r}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+
+def _file_require_ssh(remote: str) -> None:
+    if not ssh_mod.host_exists(remote):
+        err(f"error: host {remote!r} not found in ~/.ssh/config or bridge registry")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+
+@file_app.command("list", help="List a remote directory.")
+def cmd_file_list(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    path: Annotated[str, typer.Option("--path", help="Directory path.")] = ".",
+    recursive: Annotated[bool, typer.Option("--recursive", help="Recurse into subdirectories.")] = False,
+    json_out: Annotated[bool, typer.Option("--json", help="Output as JSON.")] = False,
+):
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            payload = client.file_list(remote=remote, path=path, recursive=recursive)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e, json_mode=json_out)
+    else:
+        _file_require_ssh(remote)
+        try:
+            payload = transfer.ssh_file_list(remote, path, recursive=recursive)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    if json_out:
+        print_json(payload)
+        return
+    entries = payload.get("entries") or []
+    if not entries:
+        return
+    rows = []
+    for e in entries:
+        kind = str(e.get("type") or "?")[:1]
+        size = e.get("size")
+        rows.append([kind, str(size) if size else "-", str(e.get("name") or "")])
+    emit_table(["T", "SIZE", "NAME"], rows)
+
+
+@file_app.command("stat", help="Stat a remote path (type/size).")
+def cmd_file_stat(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    path: Annotated[str, typer.Option("--path", help="Path.")],
+    json_out: Annotated[bool, typer.Option("--json")] = False,
+):
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            payload = client.file_stat(remote=remote, path=path)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e, json_mode=json_out)
+    else:
+        _file_require_ssh(remote)
+        try:
+            payload = transfer.ssh_file_stat(remote, path)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    if json_out:
+        print_json(payload)
+        return
+    if not payload.get("exists", True):
+        print(f"missing\t{path}")
+        return
+    print(f"{payload.get('type')}\t{payload.get('size')}\t{path}")
+
+
+@file_app.command("read", help="Read a remote file to stdout (binary-safe).")
+def cmd_file_read(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    path: Annotated[str, typer.Option("--path", help="File path.")],
+    b64: Annotated[bool, typer.Option("--b64", help="Output base64 instead of raw bytes.")] = False,
+):
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            resp = client.file_read(remote=remote, path=path)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+        data = base64.b64decode(resp.get("content_b64") or "")
+    else:
+        _file_require_ssh(remote)
+        try:
+            data = transfer.ssh_file_read(remote, path)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    if b64:
+        sys.stdout.write(base64.b64encode(data).decode("ascii") + "\n")
+    else:
+        sys.stdout.buffer.write(data)
+
+
+@file_app.command("write", help="Write content to a remote file (binary-safe).")
+def cmd_file_write(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    path: Annotated[str, typer.Option("--path", help="File path.")],
+    content: Annotated[Optional[str], typer.Option("--content", help="Text content (utf-8).")] = None,
+    stdin: Annotated[bool, typer.Option("--stdin", help="Read bytes from stdin.")] = False,
+    b64: Annotated[Optional[str], typer.Option("--b64", help="Base64-encoded content.")] = None,
+    mode: Annotated[str, typer.Option("--mode", help="File mode, e.g. 644 or 0o755.")] = "644",
+):
+    provided = sum(1 for x in (content, b64) if x is not None) + (1 if stdin else 0)
+    if provided != 1:
+        err("error: exactly one of --content / --stdin / --b64 is required")
+        raise typer.Exit(EXIT_USER_ERROR)
+    if stdin:
+        data = sys.stdin.buffer.read()
+    elif b64 is not None:
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except Exception as e:
+            err(f"error: invalid base64 payload: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    else:
+        data = (content or "").encode("utf-8")
+    mode_int = _parse_file_mode(mode)
+
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            client.file_write(
+                remote=remote,
+                path=path,
+                content_b64=base64.b64encode(data).decode("ascii"),
+                mode=mode_int,
+                max_size=transfer.DEFAULT_BRIDGE_MAX_FILE_SIZE,
+            )
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+    else:
+        _file_require_ssh(remote)
+        try:
+            transfer.ssh_file_write(remote, path, data, mode=mode_int)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    print(f"wrote {len(data)} byte(s) to {remote}:{path}")
+
+
+@file_app.command("mkdir", help="Create a remote directory (with parents).")
+def cmd_file_mkdir(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    path: Annotated[str, typer.Option("--path", help="Directory path.")],
+):
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            client.file_mkdir(remote=remote, path=path)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+    else:
+        _file_require_ssh(remote)
+        try:
+            transfer.ssh_file_mkdir(remote, path)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    print(f"created directory {remote}:{path}")
+
+
+@file_app.command("delete", help="Delete a remote file or directory.")
+def cmd_file_delete(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    path: Annotated[str, typer.Option("--path", help="Path to delete.")],
+    recursive: Annotated[bool, typer.Option("--recursive", help="Required to delete a directory.")] = False,
+):
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            client.file_delete(remote=remote, path=path, recursive=recursive)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+    else:
+        _file_require_ssh(remote)
+        try:
+            transfer.ssh_file_delete(remote, path, recursive=recursive)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    print(f"deleted {remote}:{path}")
+
+
+@file_app.command("rename", help="Rename or move a remote path.")
+def cmd_file_rename(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    src: Annotated[str, typer.Option("--src", help="Source path.")],
+    dst: Annotated[str, typer.Option("--dst", help="Destination path.")],
+):
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            client.file_rename(remote=remote, src=src, dst=dst)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+    else:
+        _file_require_ssh(remote)
+        try:
+            transfer.ssh_file_rename(remote, src, dst)
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    print(f"renamed {remote}:{src} -> {remote}:{dst}")
