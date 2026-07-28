@@ -68,8 +68,8 @@ def _remote_execute(remote: str, profile: str, args: dict) -> dict:
         cwd=None, created_at=bridge.utc_now(), created_by="aimux-mcp",
     )
     try:
-        c.send_keys(remote=remote, name=name, keys=[command], flags=["Enter"], timeout=15.0)
-        c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?"], flags=["Enter"], timeout=15.0)
+        c.send_keys(remote=remote, name=name, keys=[command, "Enter"], flags=[], timeout=15.0)
+        c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?", "Enter"], flags=[], timeout=15.0)
 
         deadline = time.time() + max(timeout, 1.0)
         out = ""
