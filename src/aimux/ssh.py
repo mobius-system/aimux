@@ -252,6 +252,45 @@ def hardware_info(name: str, timeout: int = 10) -> HardwareInfo:
     )
 
 
+class SshScriptError(Exception):
+    """Raised when a remote shell script (run via `ssh <host> sh -s`) times out.
+
+    Non-zero exit codes are NOT raised here — callers inspect the returned
+    CompletedProcess so they can read structured stdout (e.g. ERR rows) and
+    specific exit codes emitted by the script itself.
+    """
+
+
+def run_script(name: str, script: str, *, timeout: int = 10) -> subprocess.CompletedProcess:
+    """Run a POSIX shell script on a remote host via `ssh <name> sh -s`.
+
+    Feeds ``script`` on stdin (BatchMode=yes, StrictHostKeyChecking=accept-new)
+    and returns the CompletedProcess with decoded stdout/stderr. Only a
+    wall-clock timeout raises SshScriptError; a non-zero exit is returned to
+    the caller for inspection. Used by the single-file SSH operations
+    (list/stat/mkdir/delete) where structured stdout is required — sftp batch
+    only signals success via return code.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={timeout}",
+                "-o", "StrictHostKeyChecking=accept-new",
+                name,
+                "sh", "-s",
+            ],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 10,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise SshScriptError("ssh wall-clock timeout") from e
+    return result
+
+
 def probe_raw(host: str, port: int, user: str, identity: str | None, timeout: int = 5) -> ProbeResult:
     """Probe a host that is NOT yet in ssh config. Used by `remote add`."""
     import time

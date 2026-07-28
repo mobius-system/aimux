@@ -358,6 +358,38 @@ class BridgeControlClient:
             timeout=timeout,
         )
 
+    def file_delete(
+        self,
+        *,
+        remote: str,
+        path: str,
+        recursive: bool = False,
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/delete",
+            self.runtime.token,
+            {"path": path, "recursive": bool(recursive)},
+            timeout=timeout,
+        )
+
+    def file_rename(
+        self,
+        *,
+        remote: str,
+        src: str,
+        dst: str,
+        timeout: float = 60.0,
+    ) -> dict[str, Any]:
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/rename",
+            self.runtime.token,
+            {"src": src, "dst": dst},
+            timeout=timeout,
+        )
+
     def file_list(
         self,
         *,

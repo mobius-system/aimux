@@ -548,6 +548,10 @@ class ReverseClientRuntime:
             return self._file_write(payload)
         if message_type == "file.mkdir":
             return self._file_mkdir(payload)
+        if message_type == "file.delete":
+            return self._file_delete(payload)
+        if message_type == "file.rename":
+            return self._file_rename(payload)
         if message_type == "file.list":
             return self._file_list(payload)
         if message_type == "file.archive":
@@ -741,6 +745,34 @@ class ReverseClientRuntime:
         except Exception as e:
             raise BridgeError(str(e), kind="bad_request")
         return result
+
+    def _file_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        path = self._file_path(payload)
+        recursive = bool(payload.get("recursive", False))
+        if not path.exists():
+            # Idempotent: a missing target is already "deleted" (mirrors `rm -f`).
+            return {"ok": True, "existed": False}
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            if not recursive:
+                raise BridgeError(
+                    f"path is a directory; pass recursive to remove it: {path}",
+                    kind="bad_request",
+                )
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        return {"ok": True, "existed": True}
+
+    def _file_rename(self, payload: dict[str, Any]) -> dict[str, Any]:
+        src = self._file_path({"path": payload.get("src", "")})
+        dst = self._file_path({"path": payload.get("dst", "")})
+        if not src.exists():
+            raise BridgeError(f"source path does not exist: {src}", kind="not_found")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(src, dst)
+        return {"ok": True, "src": str(src), "dst": str(dst)}
 
 
 def _post_json(url: str, token: str, payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:

@@ -11,9 +11,12 @@ import posixpath
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
+
+from . import ssh as ssh_mod
 
 if TYPE_CHECKING:
     from . import bridge as bridge_mod
@@ -152,6 +155,283 @@ def get_paths(host: str, remote_paths: Iterable[str], local_dir: str | Path) -> 
     if plan.has_work:
         _run_sftp_batch(host, build_get_files_batch(plan), SftpDownloadError)
     return GetFilesResult(plan=plan, downloaded_paths=len(plan.entries))
+
+
+# ---------------------------------------------------------------------------
+# Single-file SSH operations (list / stat / read / write / mkdir / delete / rename)
+#
+# These complement send_paths/get_paths (bulk sftp) with the fine-grained file
+# operations a remote file browser needs. Two mechanisms are used:
+#   * list / stat / mkdir / delete: `ssh <host> sh -s` + a POSIX shell script
+#     that prints structured TSV. sftp batch cannot parse ls/lstat output
+#     reliably, and mkdir/rmdir need conditional logic (recursive creation,
+#     "is it a dir" guards) that a script handles cleanly.
+#   * read / write / rename: sftp batch (get / put / rename) — binary-safe and
+#     fire-and-forget, reusing _run_sftp_batch + _sftp_quote.
+# Path validation uses validate_transfer_path (rejects control chars). Unlike
+# the bridge path, '..' is ALLOWED here because the remote sshd mediates path
+# resolution (same contract as send_files/get_files).
+# ---------------------------------------------------------------------------
+
+
+def _sh_single_quote(value: str) -> str:
+    """POSIX single-quote a literal for safe embedding in a remote sh script."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def _to_int(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+# Scripts are raw strings so that `\t` / `\n` stay literal for printf/sh.
+# @@TARGET@@ / @@RECURSIVE@@ are unique placeholders replaced via str.replace
+# (not str.format — the scripts contain ${...} and $(...) which clash with %).
+_STAT_SCRIPT = r'''TARGET=@@TARGET@@
+if [ -L "$TARGET" ]; then
+  printf 'symlink\t0\t0\n'
+elif [ -d "$TARGET" ]; then
+  MT=$(stat -c %Y "$TARGET" 2>/dev/null || echo 0)
+  printf 'dir\t0\t%s\n' "$MT"
+elif [ -f "$TARGET" ]; then
+  SZ=$(stat -c %s "$TARGET" 2>/dev/null || wc -c < "$TARGET" 2>/dev/null || echo 0)
+  MT=$(stat -c %Y "$TARGET" 2>/dev/null || echo 0)
+  printf 'file\t%s\t%s\n' "$SZ" "$MT"
+elif [ -e "$TARGET" ]; then
+  printf 'other\t0\t0\n'
+else
+  printf 'none\t0\t0\n'
+fi
+'''
+
+_LIST_SCRIPT = r'''TARGET=@@TARGET@@
+RECURSIVE=@@RECURSIVE@@
+if [ -L "$TARGET" ] || [ ! -d "$TARGET" ]; then
+  printf 'ERR\tnot_directory\t%s\n' "$TARGET"
+  exit 3
+fi
+REAL=$(cd "$TARGET" 2>/dev/null && pwd -P)
+if [ -z "$REAL" ]; then
+  printf 'ERR\taccess_denied\t%s\n' "$TARGET"
+  exit 3
+fi
+printf 'PATH\t%s\n' "$REAL"
+emit() {
+  p=$1
+  name=${p##*/}
+  if [ -L "$p" ]; then T=symlink; SZ=0; MT=0
+  elif [ -d "$p" ]; then T=dir; SZ=0; MT=$(stat -c %Y "$p" 2>/dev/null || echo 0)
+  elif [ -f "$p" ]; then T=file; SZ=$(stat -c %s "$p" 2>/dev/null || echo 0); MT=$(stat -c %Y "$p" 2>/dev/null || echo 0)
+  else T=other; SZ=0; MT=0
+  fi
+  printf 'ENTRY\t%s\t%s\t%s\t%s\n' "$T" "$SZ" "$MT" "$name"
+}
+if [ "$RECURSIVE" = "1" ]; then
+  find "$REAL" -mindepth 1 2>/dev/null | while IFS= read -r p; do
+    [ -e "$p" ] || [ -L "$p" ] || continue
+    emit "$p"
+  done
+else
+  for p in "$REAL"/* "$REAL"/.[!.]* "$REAL"/..?*; do
+    [ -e "$p" ] || [ -L "$p" ] || continue
+    emit "$p"
+  done
+fi
+'''
+
+_DELETE_SCRIPT = r'''TARGET=@@TARGET@@
+RECURSIVE=@@RECURSIVE@@
+if [ ! -e "$TARGET" ] && [ ! -L "$TARGET" ]; then
+  exit 0
+fi
+if [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && [ "$RECURSIVE" != "1" ]; then
+  printf 'ERR\tis_dir\t%s\n' "$TARGET"
+  exit 4
+fi
+rm -rf -- "$TARGET"
+'''
+
+
+def _parse_stat_output(stdout: str) -> dict[str, Any]:
+    lines = (stdout or "").splitlines()
+    if not lines:
+        return {"exists": False, "type": "none", "size": 0, "mtime": 0}
+    parts = lines[-1].split("\t")
+    ftype = parts[0] if parts else "none"
+    if ftype == "none":
+        return {"exists": False, "type": "none", "size": 0, "mtime": 0}
+    return {
+        "exists": True,
+        "type": ftype,
+        "size": _to_int(parts[1]) if len(parts) > 1 else 0,
+        "mtime": _to_int(parts[2]) if len(parts) > 2 else 0,
+    }
+
+
+def _parse_list_output(stdout: str) -> dict[str, Any]:
+    out: dict[str, Any] = {"path": "", "entries": []}
+    for line in (stdout or "").splitlines():
+        parts = line.split("\t")
+        kind = parts[0] if parts else ""
+        if kind == "PATH" and len(parts) > 1:
+            out["path"] = parts[1]
+        elif kind == "ENTRY" and len(parts) >= 5:
+            out["entries"].append({
+                "name": parts[4],
+                "type": parts[1],
+                "size": _to_int(parts[2]),
+                "mtime": _to_int(parts[3]),
+            })
+        elif kind == "ERR":
+            detail = parts[2] if len(parts) > 2 else (parts[1] if len(parts) > 1 else "error")
+            raise TransferError(f"remote list error: {detail}")
+    return out
+
+
+def ssh_file_stat(host: str, path: str, *, timeout: int = 10) -> dict[str, Any]:
+    """Stat a remote path over SSH.
+
+    Returns ``{exists, type, size, mtime}``; a missing path yields
+    ``{exists: False, type: "none", size: 0, mtime: 0}``.
+    """
+    validate_transfer_path(path)
+    script = _STAT_SCRIPT.replace("@@TARGET@@", _sh_single_quote(path))
+    result = ssh_mod.run_script(host, script, timeout=timeout)
+    return _parse_stat_output(result.stdout)
+
+
+def ssh_file_list(
+    host: str,
+    path: str,
+    *,
+    recursive: bool = False,
+    timeout: int = 15,
+) -> dict[str, Any]:
+    """List a remote directory over SSH.
+
+    Returns ``{path, entries: [{name, type, size, mtime}]}``. Raises
+    TransferError if the target is not a directory or is inaccessible.
+    """
+    validate_transfer_path(path)
+    script = (
+        _LIST_SCRIPT
+        .replace("@@TARGET@@", _sh_single_quote(path))
+        .replace("@@RECURSIVE@@", "1" if recursive else "0")
+    )
+    result = ssh_mod.run_script(host, script, timeout=timeout)
+    parsed = _parse_list_output(result.stdout)
+    if result.returncode != 0 and not parsed["path"] and not parsed["entries"]:
+        raise TransferError(
+            f"failed to list {path!r}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    return parsed
+
+
+def ssh_file_read(host: str, path: str, *, timeout: int = 60) -> bytes:
+    """Read a single remote file's bytes via sftp ``get`` into a temp file."""
+    validate_transfer_path(path)
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="aimux-read-")
+    os.close(tmp_fd)
+    try:
+        batch = "get " + _sftp_quote(path) + " " + _sftp_quote(tmp_path) + "\n"
+        try:
+            _run_sftp_batch(host, batch, SftpDownloadError)
+        except SftpDownloadError as e:
+            raise TransferError(f"failed to read {path!r}: {e}") from e
+        return Path(tmp_path).read_bytes()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def ssh_file_write(
+    host: str,
+    path: str,
+    data: bytes,
+    *,
+    mode: int = 0o644,
+    timeout: int = 60,
+) -> int:
+    """Write bytes to a remote file via sftp ``put`` from a temp file (binary-safe)."""
+    validate_transfer_path(path)
+    if not isinstance(data, (bytes, bytearray)):
+        raise TransferError("ssh_file_write data must be bytes")
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="aimux-write-")
+    try:
+        with os.fdopen(tmp_fd, "wb") as handle:
+            handle.write(data)
+        try:
+            os.chmod(tmp_path, int(mode))
+        except OSError:
+            pass
+        batch = "put " + _sftp_quote(tmp_path) + " " + _sftp_quote(path) + "\n"
+        try:
+            _run_sftp_batch(host, batch, SftpUploadError)
+        except SftpUploadError as e:
+            raise TransferError(f"failed to write {path!r}: {e}") from e
+        return len(data)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def ssh_file_mkdir(host: str, path: str, *, timeout: int = 15) -> None:
+    """Create a remote directory (with parents) via ``ssh mkdir -p``."""
+    validate_transfer_path(path)
+    script = "mkdir -p " + _sh_single_quote(path) + "\n"
+    result = ssh_mod.run_script(host, script, timeout=timeout)
+    if result.returncode != 0:
+        raise TransferError(
+            f"failed to mkdir {path!r}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
+def ssh_file_delete(
+    host: str,
+    path: str,
+    *,
+    recursive: bool = False,
+    timeout: int = 30,
+) -> None:
+    """Delete a remote file or directory.
+
+    A directory requires ``recursive=True``; a missing path is a silent success
+    (idempotent, mirrors ``rm -f``).
+    """
+    validate_transfer_path(path)
+    script = (
+        _DELETE_SCRIPT
+        .replace("@@TARGET@@", _sh_single_quote(path))
+        .replace("@@RECURSIVE@@", "1" if recursive else "0")
+    )
+    result = ssh_mod.run_script(host, script, timeout=timeout)
+    if result.returncode == 0:
+        return
+    if result.returncode == 4:
+        raise TransferError(f"path is a directory; pass recursive to remove it: {path!r}")
+    stdout = result.stdout.strip()
+    if stdout.startswith("ERR\t"):
+        raise TransferError(f"failed to delete {path!r}: {stdout}")
+    raise TransferError(
+        f"failed to delete {path!r}: {result.stderr.strip() or stdout or 'ssh error'}"
+    )
+
+
+def ssh_file_rename(host: str, src: str, dst: str, *, timeout: int = 30) -> None:
+    """Rename or move a remote path via sftp ``rename`` (same-filesystem, atomic)."""
+    validate_transfer_path(src)
+    validate_transfer_path(dst)
+    batch = "rename " + _sftp_quote(src) + " " + _sftp_quote(dst) + "\n"
+    try:
+        _run_sftp_batch(host, batch, SftpUploadError)
+    except SftpUploadError as e:
+        raise TransferError(f"failed to rename {src!r} -> {dst!r}: {e}") from e
 
 
 def build_send_files_plan(
@@ -526,6 +806,34 @@ def bridge_get_files(
 
     plan = GetFilesPlan(remotes, destination, tuple(entries))
     return GetFilesResult(plan=plan, downloaded_paths=len(entries))
+
+
+def bridge_delete_file(
+    client: "bridge_mod.BridgeControlClient",
+    remote: str,
+    path: str,
+    *,
+    recursive: bool = False,
+) -> dict[str, Any]:
+    """Delete a file or directory on a bridge remote via the file.delete message.
+
+    Directories require ``recursive=True``; a missing path is treated as success
+    (idempotent, mirrors ``rm -f``).
+    """
+    validate_bridge_path(path)
+    return client.file_delete(remote=remote, path=path, recursive=recursive)
+
+
+def bridge_rename(
+    client: "bridge_mod.BridgeControlClient",
+    remote: str,
+    src: str,
+    dst: str,
+) -> dict[str, Any]:
+    """Rename or move a path on a bridge remote via the file.rename message."""
+    validate_bridge_path(src)
+    validate_bridge_path(dst)
+    return client.file_rename(remote=remote, src=src, dst=dst)
 
 
 def bridge_sync_dir(
