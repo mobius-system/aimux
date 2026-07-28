@@ -83,6 +83,13 @@ file_app = typer.Typer(
 )
 app.add_typer(file_app, name="file")
 
+mcp_app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Run a stdio MCP server exposing a bridge remote to external agents.",
+)
+app.add_typer(mcp_app, name="mcp")
+
 
 # ---------- helpers ----------
 
@@ -1257,3 +1264,22 @@ def cmd_file_rename(
             err(f"error: {e}")
             raise typer.Exit(EXIT_USER_ERROR)
     print(f"renamed {remote}:{src} -> {remote}:{dst}")
+
+
+# ---------- mcp serve ----------
+
+@mcp_app.command("serve", help="Run a stdio MCP server for a bridge remote (codex-facing tools).")
+def cmd_mcp_serve(
+    remote: Annotated[str, typer.Option("--remote", help="Bridge remote name (aimux_id) to expose.")],
+    profile: Annotated[
+        Optional[str],
+        typer.Option("--profile", help="Override the bridge session profile."),
+    ] = None,
+):
+    from . import mcp_server  # lazy import: keep `mcp` off the common command path
+    try:
+        mcp_server.run_stdio(remote=remote, profile=profile)
+    except bridge.BridgeError as e:
+        _exit_bridge_error(e)
+    except KeyboardInterrupt:
+        raise typer.Exit(EXIT_OK)
