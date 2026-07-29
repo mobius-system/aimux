@@ -1,17 +1,16 @@
 """aimux MCP server — expose one bridge remote as MCP tools over stdio.
 
-Codex-facing tools (5):
-  remote_execute       Run a shell command, return output + exit_code.
-  remote_read_file     Read a file (with pagination).
-  remote_write_file    Write/create a file.
+Codex-facing tools (5, aligned with codex native tool specs):
+  remote_exec_command  Run a command in a PTY; return output or session_id.
+  remote_write_stdin   Write chars to an existing exec session, return output.
+  remote_apply_patch   Apply a codex-style patch (FREEFORM input).
+  remote_view_image    Return a remote image file as a data URL.
   remote_ping          Health check.
-  remote_apply_patch   Apply a codex-style patch (FREEFORM: input = raw patch text).
 
 Transport: newline-delimited JSON-RPC 2.0 over stdin/stdout (MCP stdio).
-Zero external dependencies — Python standard library only.
-
-The server binds to a single bridge remote (``--remote <name>``); tools do not
-expose the remote parameter. Logs go to stderr only (stdout is the protocol).
+Zero external dependencies — Python standard library only. The server binds
+to a single bridge remote (``--remote <name>``); tools do not expose the
+remote parameter. Logs go to stderr only (stdout is the protocol).
 """
 from __future__ import annotations
 
@@ -48,119 +47,190 @@ def _file_bytes(res: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# remote_execute
+# unified exec session registry (session_id -> bridge session name)
 # ---------------------------------------------------------------------------
+
+_session_counter = 0
+_sessions: dict[int, dict] = {}
 
 _EXEC_SHELL = os.environ.get("AIMUX_MCP_SHELL") or os.environ.get("SHELL") or "/bin/bash"
 
 
-def _remote_execute(remote: str, profile: str, args: dict) -> dict:
-    command = args.get("command")
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError("command is required")
-    timeout = float(args.get("timeout") or 30.0)
+def _create_exec_session(remote: str, profile: str, cmd: str, cwd: str | None) -> int:
+    global _session_counter
+    name = f"mcp-exec-{uuid.uuid4().hex[:10]}"
+    _client().create_session(
+        remote=remote, name=name, profile=profile, cmd=cmd, cwd=cwd,
+        created_at=bridge.utc_now(), created_by="aimux-mcp",
+    )
+    _session_counter += 1
+    sid = _session_counter
+    _sessions[sid] = {"remote": remote, "name": name, "profile": profile}
+    return sid
+
+
+def _close_exec_session(sid: int, c) -> None:
+    sess = _sessions.pop(sid, None)
+    if not sess:
+        return
+    try:
+        c.kill_session(remote=sess["remote"], name=sess["name"])
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# token estimate & truncation (per spec: ceil(UTF-8 bytes / 4))
+# ---------------------------------------------------------------------------
+
+
+def _est_tokens(text: str) -> int:
+    return -(-len(text.encode("utf-8")) // 4)
+
+
+def _truncate_output(text: str, max_tokens: int) -> tuple[str, int]:
+    original = _est_tokens(text)
+    if max_tokens <= 0 or original <= max_tokens:
+        return text, original
+    max_bytes = max_tokens * 4
+    truncated = text.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+    return truncated + "\n...[truncated]...", original
+
+
+# ---------------------------------------------------------------------------
+# shared drain: poll capture until marker (command finished) or yield elapsed
+# ---------------------------------------------------------------------------
+
+
+def _drain(c, remote: str, name: str, marker: str, yield_ms: int, expect_marker: bool):
+    """Poll capture until ``marker`` appears (command finished) or yield_ms elapses.
+
+    Returns (output, exit_code, finished, wall_seconds).
+    """
+    started = time.time()
+    deadline = started + max(yield_ms, 0) / 1000.0
+    out = ""
+    exit_code = None
+    finished = False
+    while True:
+        if time.time() >= deadline:
+            break
+        time.sleep(0.3)
+        try:
+            cap = c.capture(remote=remote, name=name, lines=4000, ansi=False, timeout=10.0)
+        except Exception:
+            cap = {}
+        out = str((cap or {}).get("content") or "")
+        if expect_marker and marker and marker in out:
+            tail = out.rsplit(marker, 1)[1]
+            tok = tail.lstrip(": \t\r\n").split()[0] if tail.strip() else ""
+            try:
+                exit_code = int(tok)
+            except Exception:
+                exit_code = None
+            out = out.rsplit(marker, 1)[0]
+            finished = True
+            break
+    return out, exit_code, finished, time.time() - started
+
+
+def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, finished: bool, wall: float) -> dict:
+    res = {
+        "output": output,
+        "original_token_count": original_tokens,
+        "wall_time_seconds": round(wall, 3),
+    }
+    if finished:
+        if exit_code is not None:
+            res["exit_code"] = exit_code
+        _close_exec_session(sid, c)
+    else:
+        # still running: hand back session_id for remote_write_stdin
+        res["session_id"] = sid
+    return res
+
+
+# ---------------------------------------------------------------------------
+# remote_exec_command
+# ---------------------------------------------------------------------------
+
+
+def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
+    cmd = args.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        raise ValueError("cmd is required")
     workdir = args.get("workdir") or None
-    max_tokens = int(args.get("max_output_tokens") or 0)  # 0 = unlimited
     shell_bin = args.get("shell") or _EXEC_SHELL
     login = args.get("login")
     if login is None:
         login = True
-    # login=True  → normal interactive shell (loads rc → full env, but may print rc noise
-    #              like nvm "Now using node" prompts);
-    # login=False → --norc --noprofile (clean output, no rc noise, leaner env).
+    # login=True  → normal interactive shell (loads rc → full env, may print rc noise);
+    # login=False → --norc --noprofile (clean output, leaner env).
     shell_cmd = shell_bin if login else f"{shell_bin} --norc --noprofile"
+    max_tokens = int(args.get("max_output_tokens") or 10000)
+    yield_ms = max(250, min(30000, int(args.get("yield_time_ms") or 10000)))
 
-    name = f"mcp-exec-{uuid.uuid4().hex[:10]}"
+    sid = _create_exec_session(remote, profile, shell_cmd, workdir)
+    name = _sessions[sid]["name"]
     marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
     c = _client()
-    c.create_session(
-        remote=remote, name=name, profile=profile, cmd=shell_cmd,
-        cwd=workdir, created_at=bridge.utc_now(), created_by="aimux-mcp",
-    )
+    c.send_keys(remote=remote, name=name, keys=[cmd, "Enter"], flags=[], timeout=15.0)
+    c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?", "Enter"], flags=[], timeout=15.0)
+    out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, True)
+    out_t, original = _truncate_output(out, max_tokens)
+    return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
+
+
+# ---------------------------------------------------------------------------
+# remote_write_stdin
+# ---------------------------------------------------------------------------
+
+
+def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
     try:
-        c.send_keys(remote=remote, name=name, keys=[command, "Enter"], flags=[], timeout=15.0)
+        sid = int(args.get("session_id"))
+    except Exception:
+        raise ValueError("session_id is required")
+    sess = _sessions.get(sid)
+    if not sess:
+        raise ValueError(f"unknown or expired session_id: {sid}")
+    chars = args.get("chars") or ""
+    has_chars = bool(chars)
+    max_tokens = int(args.get("max_output_tokens") or 10000)
+    default_yield = 250 if has_chars else 5000
+    yield_ms = max(0, min(30000, int(args.get("yield_time_ms") or default_yield)))
+
+    name = sess["name"]
+    c = _client()
+    marker = ""
+    if has_chars:
+        marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
+        c.send_keys(remote=remote, name=name, keys=[chars, "Enter"], flags=[], timeout=15.0)
         c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?", "Enter"], flags=[], timeout=15.0)
-
-        deadline = time.time() + max(timeout, 1.0)
-        out = ""
-        exit_code = None
-        while True:
-            time.sleep(0.3)
-            cap = c.capture(remote=remote, name=name, lines=4000, ansi=False, timeout=10.0)
-            out = str(cap.get("content") or "")
-            if marker in out:
-                tail = out.rsplit(marker, 1)[1]
-                code_token = tail.lstrip(": \t\r\n").split()[0] if tail.strip() else ""
-                try:
-                    exit_code = int(code_token)
-                except Exception:
-                    exit_code = None
-                out = out.rsplit(marker, 1)[0]
-                break
-            if time.time() >= deadline:
-                break
-        if max_tokens > 0:
-            out, _ = _truncate_output(out, max_tokens)
-        return {"output": out, "exit_code": exit_code}
-    finally:
-        try:
-            c.kill_session(remote=remote, name=name)
-        except Exception:
-            pass
+    out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, has_chars)
+    out_t, original = _truncate_output(out, max_tokens)
+    return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
 
 
 # ---------------------------------------------------------------------------
-# remote_read_file (with pagination)
+# remote_view_image
 # ---------------------------------------------------------------------------
 
 
-def _remote_read_file(remote: str, profile: str, args: dict) -> dict:
+def _remote_view_image(remote: str, profile: str, args: dict) -> dict:
     path = args.get("path")
     if not isinstance(path, str) or not path:
         raise ValueError("path is required")
-    offset = int(args.get("offset") or 0)
-    limit = int(args.get("limit") or 2000)
-    if offset < 0:
-        offset = 0
-    if limit <= 0:
-        limit = 2000
-
+    detail = args.get("detail") or "high"
+    if detail not in ("high", "original"):
+        detail = "high"
     res = _client().file_read(remote=remote, path=path, timeout=180.0)
-    text = _file_bytes(res).decode("utf-8", "replace")
-    # keep a trailing newline as its own empty last line for stable pagination
-    trailing_nl = text.endswith("\n")
-    lines = text.split("\n")
-    if trailing_nl and lines and lines[-1] == "":
-        lines = lines[:-1]
-    total = len(lines)
-    window = lines[offset:offset + limit]
-    return {
-        "path": path,
-        "content": "\n".join(window),
-        "total_lines": total,
-        "offset": offset,
-        "limit": limit,
-        "has_more": (offset + limit) < total,
-    }
-
-
-# ---------------------------------------------------------------------------
-# remote_write_file
-# ---------------------------------------------------------------------------
-
-
-def _remote_write_file(remote: str, profile: str, args: dict) -> dict:
-    path = args.get("path")
-    content = args.get("content")
-    if not isinstance(path, str) or not path:
-        raise ValueError("path is required")
-    if content is None:
-        raise ValueError("content is required")
-    if not isinstance(content, str):
-        content = str(content)
-    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    _client().file_write(remote=remote, path=path, content_b64=b64, timeout=180.0)
-    return {"path": path, "bytes": len(content.encode("utf-8"))}
+    raw = _file_bytes(res)
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif",
+            "webp": "webp", "bmp": "bmp"}.get(ext, ext or "octet-stream")
+    b64 = base64.b64encode(raw).decode("ascii")
+    return {"detail": detail, "image_url": f"data:image/{mime};base64,{b64}"}
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +293,8 @@ def _parse_codex_patch(text: str) -> list:
     """Parse ``*** Begin Patch ... *** End Patch`` into a list of ops.
 
     Supports ``*** Add File``, ``*** Update File``, ``*** Delete File``.
-    Update hunks: ``@@`` starts a context anchor; ``+`` add, ``-`` remove,
-    any other line is context.
+    Update hunks: ``@@`` is a hunk delimiter (not content); ``+`` add,
+    ``-`` remove, any other line is context.
     """
     ops = []
     lines = text.splitlines()
@@ -304,7 +374,7 @@ def _apply_hunks(orig: str, hunks: list) -> str:
         changed = False
         for hl in hunk["lines"]:
             if hl.startswith("@@"):
-                continue  # '@@' is a hunk delimiter, not file content
+                continue  # hunk delimiter, not file content
             elif hl.startswith("+"):
                 replace.append(hl[1:])
                 changed = True
@@ -334,77 +404,71 @@ def _apply_hunks(orig: str, hunks: list) -> str:
 
 TOOLS = [
     {
-        "name": "remote_execute",
-        "description": "Run a shell command on the remote workstation and return its output.",
+        "name": "remote_exec_command",
+        "description": "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Shell command to execute."},
-                "timeout": {"type": "number", "default": 30, "description": "Max seconds to wait."},
-                "workdir": {"type": "string", "description": "Working directory. Defaults to the remote login directory."},
-                "max_output_tokens": {"type": "number", "default": 0, "description": "Output token budget (ceil(UTF-8 bytes / 4)). 0 = unlimited."},
-                "shell": {"type": "string", "description": "Shell binary (e.g. bash, zsh). Defaults to $SHELL or /bin/bash."},
-                "login": {"type": "boolean", "default": True, "description": "True loads shell rc (full env, may print rc noise like nvm prompts); false skips rc (--norc --noprofile) for clean output."},
+                "cmd": {"type": "string", "description": "Shell command to execute."},
+                "login": {"type": "boolean", "default": True, "description": "True runs the shell with -l/-i semantics; false disables them (uses --norc --noprofile). Defaults to true."},
+                "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
+                "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
+                "workdir": {"type": "string", "description": "Working directory for the command. Defaults to the turn cwd."},
+                "yield_time_ms": {"type": "number", "default": 10000, "description": "Wait before yielding output. Defaults to 10000 ms; effective range 250-30000 ms."},
             },
-            "required": ["command"],
+            "required": ["cmd"],
         },
     },
     {
-        "name": "remote_read_file",
-        "description": "Read a file from the remote workstation (with pagination).",
+        "name": "remote_write_stdin",
+        "description": "Writes characters to an existing unified exec session and returns recent output.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "offset": {"type": "number", "default": 0, "description": "Starting line (0-based)."},
-                "limit": {"type": "number", "default": 2000, "description": "Max lines to return."},
+                "chars": {"type": "string", "description": "Bytes to write to stdin."},
+                "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget. Defaults to 10000."},
+                "session_id": {"type": "number", "description": "Identifier of the running unified exec session."},
+                "yield_time_ms": {"type": "number", "description": "Wait before yielding output. Non-empty writes default to 250 ms; empty polls wait 5000+ ms."},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "remote_apply_patch",
+        "description": "Use the remote_apply_patch tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON. The input is the raw codex-style patch text (*** Begin Patch ... *** End Patch).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "input": {"type": "string", "description": "The raw codex-style patch text. Do not wrap in a JSON object."},
+            },
+            "required": ["input"],
+        },
+    },
+    {
+        "name": "remote_view_image",
+        "description": "View a local image file from the filesystem when visual inspection is needed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "detail": {"type": "string", "enum": ["high", "original"], "default": "high", "description": "Image detail level. Defaults to high; use original to preserve exact resolution."},
+                "path": {"type": "string", "description": "Local filesystem path to an image file."},
             },
             "required": ["path"],
         },
     },
     {
-        "name": "remote_write_file",
-        "description": "Write or create a file on the remote workstation.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
         "name": "remote_ping",
-        "description": "Health check for the remote bridge connection.",
+        "description": "Health check.",
         "inputSchema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "remote_apply_patch",
-        "description": (
-            "Use the remote_apply_patch tool to edit files on the remote workstation. "
-            "This is a FREEFORM tool, so do not wrap the patch in JSON. "
-            "The input is the raw codex-style patch text (*** Begin Patch ... *** End Patch)."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "input": {
-                    "type": "string",
-                    "description": "The raw codex-style patch text. Do not wrap in a JSON object.",
-                },
-            },
-            "required": ["input"],
-        },
     },
 ]
 
 _TOOL_FUNCS = {
-    "remote_execute": _remote_execute,
-    "remote_read_file": _remote_read_file,
-    "remote_write_file": _remote_write_file,
-    "remote_ping": _remote_ping,
+    "remote_exec_command": _remote_exec_command,
+    "remote_write_stdin": _remote_write_stdin,
     "remote_apply_patch": _remote_apply_patch,
+    "remote_view_image": _remote_view_image,
+    "remote_ping": _remote_ping,
 }
 
 
