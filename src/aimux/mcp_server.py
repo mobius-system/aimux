@@ -23,6 +23,7 @@ import sys
 import time
 import uuid
 
+from . import __version__
 from . import bridge
 
 # ---------------------------------------------------------------------------
@@ -591,7 +592,7 @@ def _dispatch(remote: str, profile: str, req: dict) -> None:
     if method == "initialize":
         _result(req_id, {
             "protocolVersion": PROTOCOL_VERSION,
-            "serverInfo": {"name": "aimux-bridge", "version": "0.1.16"},
+            "serverInfo": {"name": "aimux-bridge", "version": __version__},
             "capabilities": {"tools": {}},
         })
         return
