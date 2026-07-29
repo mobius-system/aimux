@@ -354,9 +354,10 @@ class WindowsConsoleAdapter:
     capture_source = "screen-buffer"
     supports_ansi = False
 
-    def __init__(self, name: str, command: str):
+    def __init__(self, name: str, command: str, silent: bool = False):
         self.name = name
         self.command = command
+        self.silent = silent
 
     def profile_info(self) -> dict[str, Any]:
         return {
@@ -372,7 +373,16 @@ class WindowsConsoleAdapter:
             raise BridgeError(f"profile {self.name!r} is only available on Windows")
         command = cmd or self.command
         creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-        process = subprocess.Popen(command, cwd=cwd, creationflags=creationflags)
+        startupinfo = None
+        if self.silent:
+            # CREATE_NEW_CONSOLE still allocates a console buffer (attach/capture
+            # keep working), but STARTF_USESHOWWINDOW + SW_HIDE keeps its window
+            # off the desktop — shells run in the background.
+            si = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            si.wShowWindow = 0  # SW_HIDE
+            startupinfo = si
+        process = subprocess.Popen(command, cwd=cwd, creationflags=creationflags, startupinfo=startupinfo)
         session = ClientSession(
             name=name,
             profile=self.name,
@@ -491,16 +501,16 @@ def find_git_bash() -> str | None:
     return shutil.which("bash.exe")
 
 
-def build_adapters() -> tuple[dict[str, TerminalAdapter], str]:
+def build_adapters(silent_shell: bool = False) -> tuple[dict[str, TerminalAdapter], str]:
     adapters: dict[str, TerminalAdapter] = {}
     if sys.platform == "win32":
-        adapters["cmd"] = WindowsConsoleAdapter("cmd", "cmd.exe")
-        adapters["powershell"] = WindowsConsoleAdapter("powershell", "powershell.exe -NoLogo -NoExit")
+        adapters["cmd"] = WindowsConsoleAdapter("cmd", "cmd.exe", silent=silent_shell)
+        adapters["powershell"] = WindowsConsoleAdapter("powershell", "powershell.exe -NoLogo -NoExit", silent=silent_shell)
         if shutil.which("pwsh.exe") or shutil.which("pwsh"):
-            adapters["pwsh"] = WindowsConsoleAdapter("pwsh", "pwsh.exe -NoLogo")
+            adapters["pwsh"] = WindowsConsoleAdapter("pwsh", "pwsh.exe -NoLogo", silent=silent_shell)
         bash = find_git_bash()
         if bash:
-            adapters["mingw64"] = WindowsConsoleAdapter("mingw64", f'"{bash}" --login -i')
+            adapters["mingw64"] = WindowsConsoleAdapter("mingw64", f'"{bash}" --login -i', silent=silent_shell)
         return adapters, "cmd"
     if sys.platform == "darwin":
         adapters["mac-pty"] = PosixPtyAdapter("mac-pty")
@@ -511,10 +521,10 @@ def build_adapters() -> tuple[dict[str, TerminalAdapter], str]:
 
 
 class ReverseClientRuntime:
-    def __init__(self, identifier: str, default_profile: str | None = None):
+    def __init__(self, identifier: str, default_profile: str | None = None, silent_shell: bool = False):
         self.identifier = identifier
         self.client_id = str(uuid.uuid4())
-        self.adapters, detected_default = build_adapters()
+        self.adapters, detected_default = build_adapters(silent_shell=silent_shell)
         self.default_profile = default_profile or detected_default
         self.sessions: dict[str, ClientSession] = {}
 
@@ -1000,6 +1010,7 @@ def connect(
     default_profile: str | None = None,
     replace: bool = False,
     reconnect: bool = True,
+    silent_shell: bool = False,
     reconnect_intervals: tuple[float, ...] | None = None,
     register_retry_intervals: tuple[float, ...] | None = None,
     sleep=time.sleep,
@@ -1008,7 +1019,7 @@ def connect(
     heartbeat_interval: float = BRIDGE_CLIENT_HEARTBEAT_INTERVAL,
 ) -> None:
     validate_identifier(identifier)
-    runtime = ReverseClientRuntime(identifier, default_profile=default_profile)
+    runtime = ReverseClientRuntime(identifier, default_profile=default_profile, silent_shell=silent_shell)
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
     logged_registration = False

@@ -984,6 +984,7 @@ def cmd_reverse_connect(
         typer.Option("--default-profile", help="Default profile reported by this client."),
     ] = None,
     replace: Annotated[bool, typer.Option("--replace", help="Replace an existing client with the same identifier.")] = False,
+    silent_shell: Annotated[bool, typer.Option("--silent-shell", help="Windows only: hide console windows of spawned shells so they run in the background.")] = False,
 ):
     try:
         bridge_client.connect(
@@ -992,6 +993,7 @@ def cmd_reverse_connect(
             token=token,
             default_profile=default_profile,
             replace=replace,
+            silent_shell=silent_shell,
         )
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
