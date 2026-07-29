@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import re
+import signal
 import sys
 import time
 import uuid
@@ -54,6 +55,10 @@ def _file_bytes(res: dict) -> bytes:
 _session_counter = 0
 _sessions: dict[int, dict] = {}
 
+# Bridge control client, stashed at startup so the SIGTERM handler can reach it
+# without closure tricks. Set in run_stdio() after remote/profile validation.
+_reap_client = None
+
 _EXEC_SHELL = os.environ.get("AIMUX_MCP_SHELL") or os.environ.get("SHELL") or "/bin/bash"
 
 
@@ -78,6 +83,70 @@ def _close_exec_session(sid: int, c) -> None:
         c.kill_session(remote=sess["remote"], name=sess["name"])
     except Exception:
         pass
+
+
+def _reap_all_sessions(c, *, timeout: float = 5.0) -> int:
+    """Kill every tracked exec session. Best-effort, idempotent, safe to call
+    repeatedly (kill_session treats a missing session as success). Returns the
+    count reaped. Called at process exit so the bridge PTYs this MCP server
+    created do not leak on the (shared) remote client.
+
+    Iterates ONLY this process's local ``_sessions`` — never list_sessions() /
+    pattern-matches — so it cannot touch a concurrent sibling MCP process's
+    sessions (mcp-exec-<uuid> names are globally unique regardless). Short
+    timeout bounds exit latency if the client is down.
+    """
+    sids = list(_sessions.keys())
+    reaped = 0
+    for sid in sids:
+        sess = _sessions.get(sid)
+        if not sess:
+            continue
+        try:
+            c.kill_session(remote=sess["remote"], name=sess["name"], timeout=timeout)
+        except Exception as e:
+            print(f"aimux-mcp: reap kill_session failed sid={sid}: {e}", file=sys.stderr)
+        _sessions.pop(sid, None)
+        reaped += 1
+    return reaped
+
+
+def _on_sigterm(signum, frame) -> None:
+    """SIGTERM handler: reap tracked sessions then exit. The run_stdio stdin
+    read may not wake on a signal, so reap + os._exit directly here. os._exit
+    skips the run_stdio finally (which would otherwise reap a second time —
+    harmless, but avoids double work and any stdout write after a partial
+    response)."""
+    c = _reap_client
+    if c is not None:
+        try:
+            _reap_all_sessions(c, timeout=5.0)
+        except Exception:
+            pass
+    os._exit(130)  # 128 + SIGTERM
+
+
+def _request_parent_death_signal() -> None:
+    """Linux: ask the kernel to deliver SIGTERM to us when our parent dies, so
+    _on_sigterm runs and reaps. Closes the 'orphaned with stdin still open'
+    hole the EOF reap cannot reach. No-op on macOS/Windows (EOF + the SIGTERM
+    handler remain adequate there). Best-effort: a missing prctl/libc never
+    blocks startup."""
+    if sys.platform != "linux":
+        return
+    try:
+        import ctypes
+        # CDLL(None) resolves against the main program (which links libc),
+        # robust across glibc (.so.6) and musl (libc.musl-*.so.1).
+        libc = ctypes.CDLL(None, use_errno=True)
+        PR_SET_PDEATHSIG = 1
+        SIGTERM = 15
+        libc.prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0)
+        # TOCTOU guard: parent may have died between fork and prctl.
+        if os.getppid() == 1:
+            os._exit(127)
+    except Exception as e:
+        print(f"aimux-mcp: PR_SET_PDEATHSIG unavailable: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -560,16 +629,36 @@ def run_stdio(*, remote: str, profile: str | None = None) -> None:
         print(f"aimux-mcp: remote {remote!r} has no default_profile; pass --profile", file=sys.stderr)
         sys.exit(2)
 
-    for raw in sys.stdin:
-        raw = raw.strip()
-        if not raw:
-            continue
+    global _reap_client
+    _reap_client = ctl
+    _request_parent_death_signal()
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+    try:
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                req = json.loads(raw)
+            except json.JSONDecodeError:
+                _error(None, -32700, "parse error")
+                continue
+            try:
+                _dispatch(remote, prof, req)
+            except BrokenPipeError:
+                raise  # agent closed stdout pipe mid-write; fall through to reap
+            except Exception as e:
+                print(f"aimux-mcp: dispatch error: {e}", file=sys.stderr)
+    except BrokenPipeError:
+        pass  # agent gone; let the finally reap and exit
+    finally:
+        # Reap on every exit path: stdin EOF (agent exited — the primary case,
+        # since the kernel closes the pipe write end on any agent death), stdout
+        # BrokenPipeError, and KeyboardInterrupt (SIGINT, caught by cli.py).
         try:
-            req = json.loads(raw)
-        except json.JSONDecodeError:
-            _error(None, -32700, "parse error")
-            continue
-        try:
-            _dispatch(remote, prof, req)
+            n = _reap_all_sessions(ctl, timeout=5.0)
+            if n:
+                print(f"aimux-mcp: reaped {n} exec session(s) on exit", file=sys.stderr)
         except Exception as e:
-            print(f"aimux-mcp: dispatch error: {e}", file=sys.stderr)
+            print(f"aimux-mcp: reap on exit failed: {e}", file=sys.stderr)
