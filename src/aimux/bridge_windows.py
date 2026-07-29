@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
+import time
 from ctypes import wintypes
 
 from .bridge import BridgeError
@@ -151,10 +152,20 @@ def _raise_last(message: str) -> None:
 def _attach(pid: int) -> None:
     _check_windows()
     _console_lock.acquire()
-    kernel32.FreeConsole()
-    if not kernel32.AttachConsole(wintypes.DWORD(pid)):
-        _console_lock.release()
-        _raise_last(f"failed to attach to console for pid {pid}")
+    # ERROR_INVALID_HANDLE (6) can surface right after CREATE_NEW_CONSOLE when
+    # the child's console isn't ready yet, or during rapid session churn — retry
+    # a short window before giving up.
+    last_code = 0
+    for _ in range(20):
+        kernel32.FreeConsole()
+        if kernel32.AttachConsole(wintypes.DWORD(pid)):
+            return
+        last_code = ctypes.get_last_error()
+        if last_code != 6:
+            break
+        time.sleep(0.1)
+    _console_lock.release()
+    raise BridgeError(f"failed to attach to console for pid {pid} (Win32 error {last_code})")
 
 
 def _free() -> None:
