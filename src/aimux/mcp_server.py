@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -121,16 +122,17 @@ def _drain(c, remote: str, name: str, marker: str, yield_ms: int, expect_marker:
         except Exception:
             cap = {}
         out = str((cap or {}).get("content") or "")
-        if expect_marker and marker and marker in out:
-            tail = out.rsplit(marker, 1)[1]
-            tok = tail.lstrip(": \t\r\n").split()[0] if tail.strip() else ""
-            try:
-                exit_code = int(tok)
-            except Exception:
-                exit_code = None
-            out = out.rsplit(marker, 1)[0]
-            finished = True
-            break
+        if expect_marker and marker:
+            # Match the *execution output* "MARKER:<digits>" only — NOT the
+            # command echo-back, which also contains MARKER but as
+            # "echo MARKER:$?" (no digits). This avoids falsely detecting a
+            # finished command while a long-running one is still in flight.
+            m = re.search(re.escape(marker) + r":(\d+)", out)
+            if m:
+                exit_code = int(m.group(1))
+                out = out[: m.start()]
+                finished = True
+                break
     return out, exit_code, finished, time.time() - started
 
 
@@ -173,6 +175,7 @@ def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     sid = _create_exec_session(remote, profile, shell_cmd, workdir)
     name = _sessions[sid]["name"]
     marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
+    _sessions[sid]["marker"] = marker
     c = _client()
     c.send_keys(remote=remote, name=name, keys=[cmd, "Enter"], flags=[], timeout=15.0)
     c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?", "Enter"], flags=[], timeout=15.0)
@@ -202,12 +205,16 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
 
     name = sess["name"]
     c = _client()
-    marker = ""
     if has_chars:
         marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
+        sess["marker"] = marker
         c.send_keys(remote=remote, name=name, keys=[chars, "Enter"], flags=[], timeout=15.0)
         c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?", "Enter"], flags=[], timeout=15.0)
-    out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, has_chars)
+    else:
+        # empty poll: watch the session's outstanding marker (set by exec or a
+        # previous write) so we can still detect command completion.
+        marker = sess.get("marker", "")
+    out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, bool(marker))
     out_t, original = _truncate_output(out, max_tokens)
     return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
 
