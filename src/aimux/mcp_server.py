@@ -59,13 +59,23 @@ def _remote_execute(remote: str, profile: str, args: dict) -> dict:
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command is required")
     timeout = float(args.get("timeout") or 30.0)
+    workdir = args.get("workdir") or None
+    max_tokens = int(args.get("max_output_tokens") or 0)  # 0 = unlimited
+    shell_bin = args.get("shell") or _EXEC_SHELL
+    login = args.get("login")
+    if login is None:
+        login = True
+    # login=True  → normal interactive shell (loads rc → full env, but may print rc noise
+    #              like nvm "Now using node" prompts);
+    # login=False → --norc --noprofile (clean output, no rc noise, leaner env).
+    shell_cmd = shell_bin if login else f"{shell_bin} --norc --noprofile"
 
     name = f"mcp-exec-{uuid.uuid4().hex[:10]}"
     marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
     c = _client()
     c.create_session(
-        remote=remote, name=name, profile=profile, cmd=_EXEC_SHELL,
-        cwd=None, created_at=bridge.utc_now(), created_by="aimux-mcp",
+        remote=remote, name=name, profile=profile, cmd=shell_cmd,
+        cwd=workdir, created_at=bridge.utc_now(), created_by="aimux-mcp",
     )
     try:
         c.send_keys(remote=remote, name=name, keys=[command, "Enter"], flags=[], timeout=15.0)
@@ -89,6 +99,8 @@ def _remote_execute(remote: str, profile: str, args: dict) -> dict:
                 break
             if time.time() >= deadline:
                 break
+        if max_tokens > 0:
+            out, _ = _truncate_output(out, max_tokens)
         return {"output": out, "exit_code": exit_code}
     finally:
         try:
@@ -329,6 +341,10 @@ TOOLS = [
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute."},
                 "timeout": {"type": "number", "default": 30, "description": "Max seconds to wait."},
+                "workdir": {"type": "string", "description": "Working directory. Defaults to the remote login directory."},
+                "max_output_tokens": {"type": "number", "default": 0, "description": "Output token budget (ceil(UTF-8 bytes / 4)). 0 = unlimited."},
+                "shell": {"type": "string", "description": "Shell binary (e.g. bash, zsh). Defaults to $SHELL or /bin/bash."},
+                "login": {"type": "boolean", "default": True, "description": "True loads shell rc (full env, may print rc noise like nvm prompts); false skips rc (--norc --noprofile) for clean output."},
             },
             "required": ["command"],
         },
