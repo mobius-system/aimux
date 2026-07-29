@@ -127,7 +127,7 @@ def _drain(c, remote: str, name: str, marker: str, yield_ms: int, expect_marker:
             # command echo-back, which also contains MARKER but as
             # "echo MARKER:$?" (no digits). This avoids falsely detecting a
             # finished command while a long-running one is still in flight.
-            m = re.search(re.escape(marker) + r":(\d+)", out)
+            m = re.search(re.escape(marker) + r":?(\d+)", out)
             if m:
                 exit_code = int(m.group(1))
                 out = out[: m.start()]
@@ -157,18 +157,35 @@ def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, fini
 # ---------------------------------------------------------------------------
 
 
+def _exit_marker_cmd(marker: str, profile: str) -> str:
+    """Build the exit-code echo command for the session's shell family.
+    bash/mingw/posix/mac → echo MARKER:$?
+    Windows cmd          → echo MARKER%errorlevel%
+    PowerShell           → echo MARKER$LASTEXITCODE
+    """
+    sh = (profile or "").lower()
+    if "powershell" in sh or "pwsh" in sh:
+        return f"echo {marker}$LASTEXITCODE"
+    if sh == "cmd" or "win" in sh:
+        return f"echo {marker}%errorlevel%"
+    return f"echo {marker}:$?"
+
+
 def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     cmd = args.get("cmd")
     if not isinstance(cmd, str) or not cmd.strip():
         raise ValueError("cmd is required")
     workdir = args.get("workdir") or None
-    shell_bin = args.get("shell") or _EXEC_SHELL
+    shell_bin = args.get("shell") or None
     login = args.get("login")
     if login is None:
         login = True
-    # login=True  → normal interactive shell (loads rc → full env, may print rc noise);
-    # login=False → --norc --noprofile (clean output, leaner env).
-    shell_cmd = shell_bin if login else f"{shell_bin} --norc --noprofile"
+    # shell=None → client adapter default (Windows cmd.exe / Linux-Mac login shell).
+    # login=False (--norc --noprofile) only applies to an explicit bash-like shell.
+    if shell_bin:
+        shell_cmd = shell_bin if login else f"{shell_bin} --norc --noprofile"
+    else:
+        shell_cmd = None
     max_tokens = int(args.get("max_output_tokens") or 10000)
     yield_ms = max(250, min(30000, int(args.get("yield_time_ms") or 10000)))
 
@@ -178,7 +195,7 @@ def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     _sessions[sid]["marker"] = marker
     c = _client()
     c.send_keys(remote=remote, name=name, keys=[cmd, "Enter"], flags=[], timeout=15.0)
-    c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?", "Enter"], flags=[], timeout=15.0)
+    c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, profile), "Enter"], flags=[], timeout=15.0)
     out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, True)
     out_t, original = _truncate_output(out, max_tokens)
     return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
@@ -209,7 +226,7 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
         marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
         sess["marker"] = marker
         c.send_keys(remote=remote, name=name, keys=[chars, "Enter"], flags=[], timeout=15.0)
-        c.send_keys(remote=remote, name=name, keys=[f"echo {marker}:$?", "Enter"], flags=[], timeout=15.0)
+        c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, sess["profile"]), "Enter"], flags=[], timeout=15.0)
     else:
         # empty poll: watch the session's outstanding marker (set by exec or a
         # previous write) so we can still detect command completion.
