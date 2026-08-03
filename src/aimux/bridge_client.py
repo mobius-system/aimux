@@ -935,7 +935,12 @@ def _serve_event_stream(
         _handle_event(runtime, base, token, item)
 
 
-RECONNECT_INTERVALS: tuple[float, ...] = (5.0, 10.0, 20.0)
+# Reconnect backoff: quick retries first (ride out brief blips), then a fixed
+# 60s cadence. Total ~30 min before giving up — long enough to survive a broker
+# restart, a network drop, or a remote host rebooting mid long-running command.
+# User-requested: keep retrying for at least 30 minutes, max 1 minute between
+# attempts (was 3 retries / ~35s, gave up too easily and killed remote commands).
+RECONNECT_INTERVALS: tuple[float, ...] = (5.0, 10.0, 20.0, 40.0) + (60.0,) * 29
 
 
 def _register_with_retry(

@@ -419,3 +419,15 @@ def test_register_auth_failure_is_not_retried(monkeypatch):
     assert exc.value.exit_code == 4
     assert len(calls) == 1
     assert sleeps == []
+
+
+def test_reconnect_intervals_meet_persistence_sla():
+    """RECONNECT_INTERVALS must retry for >=30 min with max 1 min gaps.
+
+    User SLA: bridge reverse connect must not give up on transient disconnects
+    during long-running remote commands (was 3 retries / ~35s, killed remote
+    commands mid-flight).
+    """
+    intervals = bridge_client.RECONNECT_INTERVALS
+    assert sum(intervals) >= 1800, f"reconnect window {sum(intervals):.0f}s < 30min"
+    assert max(intervals) <= 60, f"max interval {max(intervals):.0f}s > 60s"
