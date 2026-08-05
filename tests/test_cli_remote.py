@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -52,6 +53,35 @@ def test_remote_test_json_reports_auth_required(tmp_path, monkeypatch):
         "status": "auth-required",
         "rtt_ms": 17,
     }
+
+
+def test_remote_ls_stream_emits_config_before_results_and_uses_completion_order(tmp_path, monkeypatch):
+    config = _write_ssh_config(
+        tmp_path,
+        "Host slow\n    HostName slow.example\n    User root\n"
+        "Host fast\n    HostName fast.example\n    User worker\n",
+    )
+    monkeypatch.setattr(ssh_mod, "_CONFIG_PATH", config)
+    monkeypatch.setattr("aimux.cli._bridge_client_or_none", lambda: None)
+
+    def probe(name, timeout):
+        if name == "slow":
+            time.sleep(0.05)
+        return ssh_mod.ProbeResult(name=name, status="reachable", rtt_ms=5 if name == "fast" else 50)
+
+    monkeypatch.setattr(ssh_mod, "probe", probe)
+
+    result = CliRunner().invoke(app, ["remote", "ls", "--stream", "--timeout", "2s"])
+
+    assert result.exit_code == EXIT_OK
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert events[0] == {"event": "start", "ssh_count": 2}
+    assert [event["remote"]["name"] for event in events[1:3]] == ["slow", "fast"]
+    assert all(event["phase"] == "discovered" for event in events[1:3])
+    assert all(event["remote"]["status"] == "probing" for event in events[1:3])
+    assert [event["remote"]["name"] for event in events[3:5]] == ["fast", "slow"]
+    assert all(event["phase"] == "result" for event in events[3:5])
+    assert events[-1] == {"event": "done", "count": 2}
 
 
 def test_remote_test_json_rejects_missing_host(tmp_path, monkeypatch):

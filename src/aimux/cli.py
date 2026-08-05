@@ -4,7 +4,7 @@ from __future__ import annotations
 import base64
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -724,9 +724,31 @@ def cmd_wait(
 
 # ---------- remote ls ----------
 
+def _stream_remote_event(event: str, **payload) -> None:
+    """Write one immediately visible NDJSON event for incremental consumers."""
+    print_json({"event": event, **payload})
+    sys.stdout.flush()
+
+
+def _ssh_remote_payload(h: ssh_mod.SshHost, r: ssh_mod.ProbeResult | None) -> dict:
+    return {
+        "name": h.name,
+        "type": "ssh",
+        "user": h.user,
+        "hostname": h.hostname,
+        "port": h.port,
+        "status": r.status if r else "probing",
+        "rtt_ms": r.rtt_ms if r else None,
+    }
+
+
 @remote_app.command("ls", help="List ssh-config hosts and probe reachability in parallel.")
 def cmd_remote_ls(
     json_out: Annotated[bool, typer.Option("--json")] = False,
+    stream: Annotated[
+        bool,
+        typer.Option("--stream", help="Emit config and probe results incrementally as NDJSON."),
+    ] = False,
     timeout: Annotated[str, typer.Option("--timeout", help="Per-host probe timeout, e.g. 5s.")] = "5s",
 ):
     try:
@@ -736,8 +758,54 @@ def cmd_remote_ls(
         raise typer.Exit(EXIT_USER_ERROR)
 
     hosts = ssh_mod.list_hosts()
-    bridge_remotes: list[dict] = []
     bridge_client_ctl = _bridge_client_or_none()
+
+    if stream:
+        _stream_remote_event("start", ssh_count=len(hosts))
+        for h in hosts:
+            _stream_remote_event("remote", phase="discovered", remote=_ssh_remote_payload(h, None))
+
+        futures = {}
+        bridge_count = 0
+        worker_count = len(hosts) + (1 if bridge_client_ctl is not None else 0)
+        if worker_count:
+            with ThreadPoolExecutor(max_workers=min(17, worker_count)) as pool:
+                for h in hosts:
+                    futures[pool.submit(ssh_mod.probe, h.name, timeout_s)] = ("ssh", h)
+                if bridge_client_ctl is not None:
+                    futures[pool.submit(bridge_client_ctl.list_remotes, timeout=2.0)] = ("bridge", None)
+
+                for future in as_completed(futures):
+                    kind, host = futures[future]
+                    if kind == "bridge":
+                        try:
+                            bridge_remotes = future.result()
+                        except bridge.BridgeError:
+                            bridge_remotes = []
+                        bridge_count = len(bridge_remotes)
+                        for remote in bridge_remotes:
+                            _stream_remote_event("remote", phase="result", remote=remote)
+                        continue
+
+                    try:
+                        probe_result = future.result()
+                    except Exception as exc:
+                        probe_result = ssh_mod.ProbeResult(
+                            name=host.name,
+                            status="unknown",
+                            rtt_ms=None,
+                            stderr=str(exc),
+                        )
+                    _stream_remote_event(
+                        "remote",
+                        phase="result",
+                        remote=_ssh_remote_payload(host, probe_result),
+                    )
+
+        _stream_remote_event("done", count=len(hosts) + bridge_count)
+        return
+
+    bridge_remotes: list[dict] = []
     if bridge_client_ctl is not None:
         try:
             bridge_remotes = bridge_client_ctl.list_remotes(timeout=2.0)
@@ -754,17 +822,7 @@ def cmd_remote_ls(
         out = []
         for h in hosts:
             r = results.get(h.name)
-            out.append(
-                {
-                    "name": h.name,
-                    "type": "ssh",
-                    "user": h.user,
-                    "hostname": h.hostname,
-                    "port": h.port,
-                    "status": r.status if r else "unknown",
-                    "rtt_ms": r.rtt_ms if r else None,
-                }
-            )
+            out.append(_ssh_remote_payload(h, r))
         for remote in bridge_remotes:
             out.append(remote)
         print_json(out)
