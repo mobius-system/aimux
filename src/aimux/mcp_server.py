@@ -22,6 +22,7 @@ import signal
 import sys
 import time
 import uuid
+from pathlib import PureWindowsPath
 
 from . import __version__
 from . import bridge
@@ -342,31 +343,61 @@ def _remote_ping(remote: str, profile: str, args: dict) -> dict:
 
 
 def _remote_apply_patch(remote: str, profile: str, args: dict) -> dict:
+    workdir = None
     if isinstance(args, dict):
         patch_text = args.get("input")
         if patch_text is None:
             patch_text = args.get("patch") or args.get("text") or ""
+        workdir = args.get("workdir") or None
     else:
         patch_text = str(args or "")
     if not isinstance(patch_text, str) or not patch_text.strip():
         raise ValueError("input (raw patch text) is required")
-    applied = _apply_codex_patch(remote, patch_text)
+    if workdir is not None and (not isinstance(workdir, str) or not workdir.strip()):
+        raise ValueError("workdir must be a non-empty remote directory")
+    applied = _apply_codex_patch(remote, patch_text, workdir=workdir)
     return {"applied": applied}
 
 
-def _apply_codex_patch(remote: str, patch_text: str) -> list:
+def _resolve_patch_path(path: str, workdir: str | None) -> str:
+    """Resolve relative patch paths against the remote working directory.
+
+    Bridge file operations run in the reverse client's process cwd, which is
+    unrelated to the agent's remote session cwd. Requiring an explicit
+    workdir for relative paths prevents a successful write to the wrong tree.
+    """
+    if not path or path.startswith("/") or path.startswith("\\"):
+        return path
+    if len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\"):
+        return path
+    if not workdir:
+        raise ValueError(
+            f"relative patch path {path!r} requires workdir; use an absolute remote path"
+        )
+    separator = "\\" if PureWindowsPath(workdir).drive else "/"
+    return workdir.rstrip("/\\") + separator + path
+
+
+def _write_verified(client, *, remote: str, path: str, data: bytes) -> None:
+    client.file_write(
+        remote=remote, path=path,
+        content_b64=base64.b64encode(data).decode("ascii"),
+    )
+    written = _file_bytes(client.file_read(remote=remote, path=path, timeout=180.0))
+    if written != data:
+        raise ValueError(f"remote write verification failed for {path!r}")
+
+
+def _apply_codex_patch(remote: str, patch_text: str, *, workdir: str | None = None) -> list:
     ops = _parse_codex_patch(patch_text)
     c = _client()
     results = []
     for op in ops:
         kind = op["kind"]
-        path = op["path"]
+        path = _resolve_patch_path(op["path"], workdir)
         if kind == "add":
             content = op["content"]
-            c.file_write(
-                remote=remote, path=path,
-                content_b64=base64.b64encode(content.encode("utf-8")).decode("ascii"),
-            )
+            _write_verified(c, remote=remote, path=path, data=content.encode("utf-8"))
             results.append(f"added: {path}")
         elif kind == "delete":
             c.file_delete(remote=remote, path=path, recursive=False)
@@ -375,10 +406,7 @@ def _apply_codex_patch(remote: str, patch_text: str) -> list:
             res = c.file_read(remote=remote, path=path, timeout=180.0)
             orig = _file_bytes(res).decode("utf-8", "replace")
             new = _apply_hunks(orig, op["hunks"])
-            c.file_write(
-                remote=remote, path=path,
-                content_b64=base64.b64encode(new.encode("utf-8")).decode("ascii"),
-            )
+            _write_verified(c, remote=remote, path=path, data=new.encode("utf-8"))
             results.append(f"updated: {path}")
     return results
 
@@ -485,7 +513,9 @@ def _apply_hunks(orig: str, hunks: list) -> str:
             continue
         search_str = "\n".join(search)
         replace_str = "\n".join(replace)
-        if search_str and search_str in text:
+        if search_str:
+            if search_str not in text:
+                raise ValueError("patch context not found")
             text = text.replace(search_str, replace_str, 1)
         elif replace_str:
             text = text.rstrip("\n") + "\n" + replace_str
@@ -534,6 +564,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "input": {"type": "string", "description": "The raw codex-style patch text. Do not wrap in a JSON object."},
+                "workdir": {"type": "string", "description": "Remote working directory for relative patch paths. Prefer absolute paths when omitted."},
             },
             "required": ["input"],
         },

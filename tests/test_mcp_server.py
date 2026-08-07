@@ -66,6 +66,11 @@ def test_apply_hunks_with_context():
     assert new == "a\nb\nC\nd\n"
 
 
+def test_apply_hunks_rejects_missing_context():
+    with pytest.raises(ValueError, match="patch context not found"):
+        mcp_server._apply_hunks("a\nb\n", [{"lines": ["@@", "-missing", "+new"]}])
+
+
 # ---- tools ----
 
 def test_view_image(fake):
@@ -106,6 +111,26 @@ def test_apply_patch_add_and_delete(fake):
     assert r["applied"] == ["added: /n", "deleted: /g"]
     assert fake.files["/n"] == b"hello world"
     assert "/g" not in fake.files
+
+
+def test_apply_patch_relative_path_requires_workdir(fake):
+    with pytest.raises(ValueError, match="requires workdir"):
+        mcp_server._remote_apply_patch(
+            "r", "p",
+            {"input": "*** Begin Patch\n*** Add File: src/conv.py\n+hello\n*** End Patch\n"},
+        )
+
+
+def test_apply_patch_relative_path_uses_workdir(fake):
+    result = mcp_server._remote_apply_patch(
+        "r", "p",
+        {
+            "workdir": "/workspace/project",
+            "input": "*** Begin Patch\n*** Add File: src/conv.py\n+hello\n*** End Patch\n",
+        },
+    )
+    assert result["applied"] == ["added: /workspace/project/src/conv.py"]
+    assert fake.files["/workspace/project/src/conv.py"] == b"hello"
 
 
 # ---- JSON-RPC dispatch ----
