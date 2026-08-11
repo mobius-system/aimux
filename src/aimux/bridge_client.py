@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import hashlib
 import json
 import os
@@ -222,6 +223,20 @@ def _keys_to_text(keys: list[str], flags: list[str]) -> str:
     return "".join(out)
 
 
+def _find_posix_shell() -> str:
+    """Return the first available POSIX shell on this system.
+
+    ``subprocess.Popen(..., shell=True)`` hard-codes ``/bin/sh``, but some
+    minimal container images (DLC training pods, distroless, etc.) ship only
+    ``/bin/bash`` or ``/bin/dash`` without a ``/bin/sh`` symlink.  Probe the
+    common candidates so ``shell=True`` always finds a working shell.
+    """
+    for sh in ("/bin/bash", "/bin/dash", "/bin/sh"):
+        if os.path.exists(sh):
+            return sh
+    return "/bin/sh"  # fallback — will give a clear FileNotFoundError
+
+
 class PosixPtyAdapter:
     visible = False
     capture_source = "pty-ring-buffer"
@@ -265,6 +280,7 @@ class PosixPtyAdapter:
         process = subprocess.Popen(
             command,
             shell=True,
+            executable=_find_posix_shell(),
             cwd=cwd,
             env=env,
             stdin=slave_fd,
@@ -417,6 +433,156 @@ class WindowsConsoleAdapter:
             subprocess.run(["taskkill", "/PID", str(session.pid), "/T", "/F"], capture_output=True, text=True)
 
 
+class WindowsPipeAdapter:
+    """A completely hidden Windows shell backed by ordinary pipes.
+
+    ``CREATE_NEW_CONSOLE`` (the implementation used by ``--silent-shell``)
+    necessarily creates a console window before ``SW_HIDE`` can hide it.  That
+    race is the source of the one-frame flash seen by Electron/TUI users.  The
+    v2 profile uses ``CREATE_NO_WINDOW`` and redirected standard handles, so no
+    console is ever allocated.  A small reader thread provides the same
+    send/capture contract as the console-buffer adapter without relying on
+    ``AttachConsole``.
+    """
+
+    visible = False
+    capture_source = "pipe-ring-buffer"
+    supports_ansi = True
+    _MAX_CAPTURE_CHARS = 512 * 1024
+
+    def __init__(self, name: str, command: str):
+        self.name = name
+        self.command = command
+
+    def profile_info(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "visible": self.visible,
+            "capture": self.capture_source,
+            "ansi": self.supports_ansi,
+            "available": True,
+        }
+
+    @classmethod
+    def _append_output(cls, session: ClientSession, chunk: bytes) -> None:
+        if not chunk:
+            return
+        lock = session.metadata["output_lock"]
+        with lock:
+            output: deque[str] = session.metadata["output"]
+            output.append(chunk.decode("utf-8", errors="replace"))
+            # Keep a bounded tail without joining on every read.  A command
+            # producing a large log must not retain the whole process lifetime.
+            total = session.metadata["output_chars"] + len(output[-1])
+            session.metadata["output_chars"] = total
+            while total > cls._MAX_CAPTURE_CHARS and output:
+                total -= len(output.popleft())
+            session.metadata["output_chars"] = total
+
+    @classmethod
+    def _reader(cls, session: ClientSession) -> None:
+        stream = session.process.stdout if session.process is not None else None
+        if stream is None:
+            return
+        try:
+            while True:
+                # BufferedReader.read1 returns as soon as bytes are available,
+                # unlike readline which would hide an interactive shell prompt.
+                read1 = stream.read1 if hasattr(stream, "read1") else stream.read
+                chunk = read1(4096)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
+                cls._append_output(session, chunk)
+        except (OSError, ValueError):
+            # The process may close its pipe while the bridge is shutting down.
+            pass
+
+    def create(self, *, name: str, cmd: str | None, cwd: str | None, created_at: str) -> ClientSession:
+        if sys.platform != "win32":
+            raise BridgeError(f"profile {self.name!r} is only available on Windows")
+        command = cmd or self.command
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            creationflags=no_window,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        session = ClientSession(
+            name=name,
+            profile=self.name,
+            command=command,
+            cwd=cwd,
+            created_at=created_at,
+            process=process,
+            pid=process.pid,
+            adapter=self,
+            metadata={"output": deque(), "output_chars": 0, "output_lock": threading.Lock()},
+        )
+        thread = threading.Thread(target=self._reader, args=(session,), name=f"aimux-{name}-output", daemon=True)
+        session.metadata["output_thread"] = thread
+        thread.start()
+        return session
+
+    def send_keys(self, session: ClientSession, keys: list[str], flags: list[str]) -> None:
+        stream = session.process.stdin if session.process is not None else None
+        if stream is None:
+            raise BridgeError(f"session {session.name!r} has no writable stdin", kind="session_gone")
+        text = _keys_to_text(keys, flags)
+        if not text:
+            return
+        # cmd.exe and PowerShell read CRLF from redirected stdin.  Preserve
+        # literal mode and control bytes while normalising Enter generated by
+        # the bridge key protocol.
+        text = re.sub(r"\r\n|\r|\n", "\r\n", text)
+        try:
+            stream.write(text.encode("utf-8"))
+            stream.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise BridgeError(f"session {session.name!r} stdin is closed", kind="session_gone") from exc
+
+    def capture(self, session: ClientSession, lines: int, ansi: bool) -> CaptureResult:
+        if lines <= 0:
+            raise BridgeError("--lines must be a positive integer")
+        with session.metadata["output_lock"]:
+            content = "".join(session.metadata["output"])
+        if not ansi:
+            content = _ANSI_RE.sub("", content)
+        rows = content.splitlines()
+        content = "\n".join(rows[-lines:])
+        if content:
+            content += "\n"
+        return CaptureResult(content=content, lines=lines, ansi=ansi, source=self.capture_source)
+
+    def kill(self, session: ClientSession) -> None:
+        process = session.process
+        if process is None or process.poll() is not None:
+            return
+        # Terminating only cmd.exe can leave a child shell behind.  taskkill
+        # handles the process tree, and CREATE_NO_WINDOW prevents taskkill from
+        # becoming a second source of console flashes.
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                creationflags=no_window,
+                check=False,
+            )
+        except (OSError, ValueError):
+            process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
 class MacTerminalAdapter:
     name = "mac-terminal"
     visible = True
@@ -501,16 +667,24 @@ def find_git_bash() -> str | None:
     return shutil.which("bash.exe")
 
 
-def build_adapters(silent_shell: bool = False) -> tuple[dict[str, TerminalAdapter], str]:
+def build_adapters(silent_shell: bool = False, silent_shell_v2: bool = False) -> tuple[dict[str, TerminalAdapter], str]:
     adapters: dict[str, TerminalAdapter] = {}
     if sys.platform == "win32":
-        adapters["cmd"] = WindowsConsoleAdapter("cmd", "cmd.exe", silent=silent_shell)
-        adapters["powershell"] = WindowsConsoleAdapter("powershell", "powershell.exe -NoLogo -NoExit", silent=silent_shell)
+        adapter_cls: type[WindowsConsoleAdapter | WindowsPipeAdapter]
+        if silent_shell_v2:
+            adapter_cls = WindowsPipeAdapter
+            adapters["cmd"] = adapter_cls("cmd", "cmd.exe")
+            adapters["powershell"] = adapter_cls("powershell", "powershell.exe -NoLogo -NoExit")
+        else:
+            adapter_cls = WindowsConsoleAdapter
+            adapters["cmd"] = adapter_cls("cmd", "cmd.exe", silent=silent_shell)
+            adapters["powershell"] = adapter_cls("powershell", "powershell.exe -NoLogo -NoExit", silent=silent_shell)
         if shutil.which("pwsh.exe") or shutil.which("pwsh"):
-            adapters["pwsh"] = WindowsConsoleAdapter("pwsh", "pwsh.exe -NoLogo", silent=silent_shell)
+            adapters["pwsh"] = adapter_cls("pwsh", "pwsh.exe -NoLogo") if silent_shell_v2 else adapter_cls("pwsh", "pwsh.exe -NoLogo", silent=silent_shell)
         bash = find_git_bash()
         if bash:
-            adapters["mingw64"] = WindowsConsoleAdapter("mingw64", f'"{bash}" --login -i', silent=silent_shell)
+            command = f'"{bash}" --login -i'
+            adapters["mingw64"] = adapter_cls("mingw64", command) if silent_shell_v2 else adapter_cls("mingw64", command, silent=silent_shell)
         return adapters, "cmd"
     if sys.platform == "darwin":
         adapters["mac-pty"] = PosixPtyAdapter("mac-pty")
@@ -521,10 +695,10 @@ def build_adapters(silent_shell: bool = False) -> tuple[dict[str, TerminalAdapte
 
 
 class ReverseClientRuntime:
-    def __init__(self, identifier: str, default_profile: str | None = None, silent_shell: bool = False):
+    def __init__(self, identifier: str, default_profile: str | None = None, silent_shell: bool = False, silent_shell_v2: bool = False):
         self.identifier = identifier
         self.client_id = str(uuid.uuid4())
-        self.adapters, detected_default = build_adapters(silent_shell=silent_shell)
+        self.adapters, detected_default = build_adapters(silent_shell=silent_shell, silent_shell_v2=silent_shell_v2)
         self.default_profile = default_profile or detected_default
         self.sessions: dict[str, ClientSession] = {}
 
@@ -1016,6 +1190,7 @@ def connect(
     replace: bool = False,
     reconnect: bool = True,
     silent_shell: bool = False,
+    silent_shell_v2: bool = False,
     reconnect_intervals: tuple[float, ...] | None = None,
     register_retry_intervals: tuple[float, ...] | None = None,
     sleep=time.sleep,
@@ -1024,7 +1199,12 @@ def connect(
     heartbeat_interval: float = BRIDGE_CLIENT_HEARTBEAT_INTERVAL,
 ) -> None:
     validate_identifier(identifier)
-    runtime = ReverseClientRuntime(identifier, default_profile=default_profile, silent_shell=silent_shell)
+    runtime = ReverseClientRuntime(
+        identifier,
+        default_profile=default_profile,
+        silent_shell=silent_shell,
+        silent_shell_v2=silent_shell_v2,
+    )
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
     logged_registration = False

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import io
+import subprocess
 import threading
 
 import pytest
@@ -49,6 +51,80 @@ def test_bridge_key_translation_supports_common_keys():
 
     with pytest.raises(bridge.BridgeError):
         _keys_to_text(["x"], ["-X"])
+
+
+def test_windows_pipe_adapter_never_allocates_console(monkeypatch):
+    """The v2 Windows profile must use pipes + CREATE_NO_WINDOW end-to-end."""
+    from aimux import bridge_client
+
+    class FakeStdout:
+        def __init__(self):
+            self.chunks = iter([b"ready\r\n", b""])
+
+        def read1(self, _size):
+            return next(self.chunks)
+
+    class FakeStdin(io.BytesIO):
+        def flush(self):
+            pass
+
+    class FakeProcess:
+        pid = 4242
+
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self._returncode = None
+
+        def poll(self):
+            return self._returncode
+
+        def wait(self, timeout=None):
+            self._returncode = 0
+            return 0
+
+        def terminate(self):
+            self._returncode = -15
+
+        def kill(self):
+            self._returncode = -9
+
+    calls = {}
+    process = FakeProcess()
+
+    def fake_popen(command, **kwargs):
+        calls["command"] = command
+        calls.update(kwargs)
+        return process
+
+    monkeypatch.setattr(bridge_client.sys, "platform", "win32")
+    monkeypatch.setattr(bridge_client.subprocess, "Popen", fake_popen)
+    adapter = bridge_client.WindowsPipeAdapter("cmd", "cmd.exe")
+    session = adapter.create(name="hidden", cmd=None, cwd=None, created_at="now")
+    thread = session.metadata["output_thread"]
+    thread.join(timeout=1)
+
+    assert calls["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert calls["stdin"] is subprocess.PIPE
+    assert calls["stdout"] is subprocess.PIPE
+    assert calls["stderr"] is subprocess.STDOUT
+    adapter.send_keys(session, ["echo ready", "Enter"], [])
+    assert process.stdin.getvalue() == b"echo ready\r\n"
+    assert adapter.capture(session, 10, ansi=False).content == "ready\n"
+
+
+def test_build_adapters_v2_keeps_legacy_profile_names(monkeypatch):
+    from aimux import bridge_client
+
+    monkeypatch.setattr(bridge_client.sys, "platform", "win32")
+    monkeypatch.setattr(bridge_client.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(bridge_client, "find_git_bash", lambda: None)
+    adapters, default = bridge_client.build_adapters(silent_shell_v2=True)
+
+    assert default == "cmd"
+    assert set(adapters) == {"cmd", "powershell"}
+    assert all(isinstance(adapter, bridge_client.WindowsPipeAdapter) for adapter in adapters.values())
+    assert all(adapter.profile_info()["visible"] is False for adapter in adapters.values())
 
 
 def test_broker_state_registers_bridge_remote(monkeypatch):

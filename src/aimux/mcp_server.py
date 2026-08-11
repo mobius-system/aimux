@@ -260,16 +260,37 @@ def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     max_tokens = int(args.get("max_output_tokens") or 10000)
     yield_ms = max(250, min(30000, int(args.get("yield_time_ms") or 10000)))
 
-    sid = _create_exec_session(remote, profile, shell_cmd, workdir)
-    name = _sessions[sid]["name"]
-    marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
-    _sessions[sid]["marker"] = marker
     c = _client()
-    c.send_keys(remote=remote, name=name, keys=[cmd, "Enter"], flags=[], timeout=15.0)
-    c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, profile), "Enter"], flags=[], timeout=15.0)
-    out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, True)
-    out_t, original = _truncate_output(out, max_tokens)
-    return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
+    max_retries = 2  # 3 total attempts
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        sid = _create_exec_session(remote, profile, shell_cmd, workdir)
+        name = _sessions[sid]["name"]
+        marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
+        _sessions[sid]["marker"] = marker
+        try:
+            c.send_keys(remote=remote, name=name, keys=[cmd, "Enter"], flags=[], timeout=15.0)
+            c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, profile), "Enter"], flags=[], timeout=15.0)
+            out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, True)
+            out_t, original = _truncate_output(out, max_tokens)
+            return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
+        except bridge.BridgeError as e:
+            _close_exec_session(sid, c)
+            if e.kind in ("session_gone", "not_found") and attempt < max_retries:
+                last_error = e
+                print(f"aimux-mcp: exec session lost ({e.kind}), retrying ({attempt + 1}/{max_retries})...",
+                      file=sys.stderr)
+                continue
+            raise
+        except Exception:
+            _close_exec_session(sid, c)
+            raise
+
+    # All retries exhausted — should not reach here because the last attempt
+    # either returns or re-raises, but keep as a safety net.
+    assert last_error is not None
+    raise last_error
 
 
 # ---------------------------------------------------------------------------
@@ -293,16 +314,33 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
 
     name = sess["name"]
     c = _client()
-    if has_chars:
-        marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
-        sess["marker"] = marker
-        c.send_keys(remote=remote, name=name, keys=[chars, "Enter"], flags=[], timeout=15.0)
-        c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, sess["profile"]), "Enter"], flags=[], timeout=15.0)
-    else:
-        # empty poll: watch the session's outstanding marker (set by exec or a
-        # previous write) so we can still detect command completion.
-        marker = sess.get("marker", "")
-    out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, bool(marker))
+    try:
+        if has_chars:
+            marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
+            sess["marker"] = marker
+            c.send_keys(remote=remote, name=name, keys=[chars, "Enter"], flags=[], timeout=15.0)
+            c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, sess["profile"]), "Enter"], flags=[], timeout=15.0)
+        else:
+            # empty poll: watch the session's outstanding marker (set by exec or a
+            # previous write) so we can still detect command completion.
+            marker = sess.get("marker", "")
+        out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, bool(marker))
+    except bridge.BridgeError as e:
+        if e.kind in ("session_gone", "not_found") and not has_chars:
+            # Empty poll on a dead session: the remote shell exited (or was
+            # killed). Report as finished so callers see a clean terminal state
+            # instead of a cryptic error.
+            _close_exec_session(sid, c)
+            return {
+                "output": "",
+                "original_token_count": 0,
+                "wall_time_seconds": 0,
+                "exit_code": -1,
+                "note": "session ended (shell exited)",
+            }
+        # Session gone mid-write or any other error: clean up and re-raise.
+        _close_exec_session(sid, c)
+        raise
     out_t, original = _truncate_output(out, max_tokens)
     return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
 
