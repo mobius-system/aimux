@@ -226,10 +226,9 @@ def _keys_to_text(keys: list[str], flags: list[str]) -> str:
 def _find_posix_shell() -> str:
     """Return the first available POSIX shell on this system.
 
-    ``subprocess.Popen(..., shell=True)`` hard-codes ``/bin/sh``, but some
-    minimal container images (DLC training pods, distroless, etc.) ship only
-    ``/bin/bash`` or ``/bin/dash`` without a ``/bin/sh`` symlink.  Probe the
-    common candidates so ``shell=True`` always finds a working shell.
+    Some minimal container images (DLC training pods, distroless, etc.) ship
+    only ``/bin/bash`` or ``/bin/dash`` without a ``/bin/sh`` symlink. Probe
+    the common candidates so command sessions always find a working shell.
     """
     for sh in ("/bin/bash", "/bin/dash", "/bin/sh"):
         if os.path.exists(sh):
@@ -261,39 +260,49 @@ class PosixPtyAdapter:
     def create(self, *, name: str, cmd: str | None, cwd: str | None, created_at: str) -> ClientSession:
         import pty
 
-        command = cmd or self.command or os.environ.get("SHELL") or "/bin/sh"
+        requested_command = cmd or self.command
+        default_shell = os.environ.get("SHELL") or _find_posix_shell()
         master_fd, slave_fd = pty.openpty()
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
 
-        def setup_child_tty() -> None:
-            if hasattr(os, "setsid"):
-                os.setsid()
-            try:
-                import fcntl
-                import termios
-
-                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
-            except Exception:
-                pass
+        if requested_command:
+            tokens = shlex.split(requested_command)
+            executable_name = Path(tokens[0]).name.lower() if tokens else ""
+            shell_names = {"bash", "dash", "fish", "ksh", "sh", "zsh"}
+            if executable_name in shell_names and all(part.startswith("-") for part in tokens[1:]):
+                # MCP's explicit ``shell`` option is a shell specification, not
+                # a one-shot command. Launch it directly and force interactive
+                # mode so it stays alive for send_keys/capture.
+                argv = tokens if "-i" in tokens else [*tokens, "-i"]
+            else:
+                # Preserve the historical --cmd shell syntax (pipes,
+                # redirections, etc.) while avoiding shell=True's nested shell.
+                argv = [_find_posix_shell(), "-lc", requested_command]
+        else:
+            # A direct interactive shell is critical here.  The old path used
+            # shell=True plus a preexec_fn that called setsid/TIOCSCTTY.  Some
+            # bundled/conda Python runtimes crash that fork child with SIGSEGV
+            # before exec, so create appeared successful but the first
+            # send_keys immediately reported session_gone.
+            argv = [default_shell, "-i"]
 
         process = subprocess.Popen(
-            command,
-            shell=True,
-            executable=_find_posix_shell(),
+            argv,
+            shell=False,
             cwd=cwd,
             env=env,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
-            preexec_fn=setup_child_tty if hasattr(os, "setsid") else None,
+            start_new_session=True,
             close_fds=True,
         )
         os.close(slave_fd)
         session = ClientSession(
             name=name,
             profile=self.name,
-            command=command,
+            command=requested_command or default_shell,
             cwd=cwd,
             created_at=created_at,
             process=process,
@@ -768,7 +777,17 @@ class ReverseClientRuntime:
         if session is None:
             raise BridgeError(f"session {name!r} not found", kind="not_found")
         if not session.is_running():
-            raise BridgeError(f"session {name!r} is no longer running", kind="session_gone")
+            returncode = session.process.returncode if session.process is not None else None
+            detail = ""
+            if returncode is not None:
+                detail = f" (returncode={returncode}"
+                if returncode < 0:
+                    try:
+                        detail += f", signal={signal.Signals(-returncode).name}"
+                    except ValueError:
+                        pass
+                detail += ")"
+            raise BridgeError(f"session {name!r} is no longer running{detail}", kind="session_gone")
         return session
 
     def _send_keys(self, payload: dict[str, Any]) -> dict[str, Any]:

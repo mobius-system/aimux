@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import subprocess
 import threading
+import time
 
 import pytest
 from loguru import logger
@@ -125,6 +127,53 @@ def test_build_adapters_v2_keeps_legacy_profile_names(monkeypatch):
     assert set(adapters) == {"cmd", "powershell"}
     assert all(isinstance(adapter, bridge_client.WindowsPipeAdapter) for adapter in adapters.values())
     assert all(adapter.profile_info()["visible"] is False for adapter in adapters.values())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX PTY")
+def test_posix_pty_default_shell_stays_alive_and_accepts_input(tmp_path):
+    from aimux import bridge_client
+
+    adapter = bridge_client.PosixPtyAdapter("posix-pty", command="/bin/sh")
+    session = adapter.create(name="pty-alive", cmd=None, cwd=str(tmp_path), created_at="now")
+    try:
+        time.sleep(0.1)
+        assert session.process is not None
+        assert session.process.poll() is None
+        adapter.send_keys(session, ["printf AIMUX_PTY_OK", "Enter"], [])
+        deadline = time.monotonic() + 2
+        content = ""
+        while time.monotonic() < deadline:
+            content = adapter.capture(session, 20, ansi=False).content
+            if "AIMUX_PTY_OK" in content:
+                break
+            time.sleep(0.05)
+        assert "AIMUX_PTY_OK" in content
+    finally:
+        adapter.kill(session)
+
+
+def test_runtime_reports_signal_for_crashed_session(monkeypatch):
+    from aimux import bridge_client
+
+    class CrashedProcess:
+        returncode = -11
+
+        @staticmethod
+        def poll():
+            return -11
+
+    runtime = bridge_client.ReverseClientRuntime("test")
+    runtime.sessions["crashed"] = bridge_client.ClientSession(
+        name="crashed",
+        profile="posix-pty",
+        command="/bin/sh",
+        cwd=None,
+        created_at="now",
+        process=CrashedProcess(),
+    )
+
+    with pytest.raises(bridge.BridgeError, match=r"returncode=-11, signal=SIGSEGV"):
+        runtime._get("crashed")
 
 
 def test_broker_state_registers_bridge_remote(monkeypatch):
