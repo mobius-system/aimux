@@ -5,6 +5,7 @@ import base64
 from collections import deque
 import hashlib
 import json
+import locale
 import os
 import platform
 import queue
@@ -463,6 +464,35 @@ class WindowsPipeAdapter:
         self.name = name
         self.command = command
 
+    def _stdin_encoding(self) -> str:
+        """Return the byte encoding expected by redirected Windows shells.
+
+        Bridge messages carry Unicode text, but cmd.exe and Windows PowerShell
+        5.1 decode redirected stdin using the Windows console/OEM code page.
+        Writing UTF-8 unconditionally therefore turns Chinese text into
+        mojibake on CP936 systems. CREATE_NO_WINDOW may leave this process
+        without a console (GetConsoleCP returns 0), so retain Windows' OEM and
+        ANSI code pages as deterministic fallbacks.
+        """
+        if self.name in {"mingw64", "pwsh"}:
+            # Git Bash and modern PowerShell use UTF-8 for redirected input.
+            return "utf-8"
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                kernel32 = ctypes.windll.kernel32
+                for getter_name in ("GetConsoleCP", "GetOEMCP", "GetACP"):
+                    getter = getattr(kernel32, getter_name, None)
+                    if getter is None:
+                        continue
+                    code_page = int(getter())
+                    if code_page > 0:
+                        return "utf-8" if code_page == 65001 else f"cp{code_page}"
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        return locale.getpreferredencoding(False) or "utf-8"
+
     def profile_info(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -479,7 +509,16 @@ class WindowsPipeAdapter:
         lock = session.metadata["output_lock"]
         with lock:
             output: deque[str] = session.metadata["output"]
-            output.append(chunk.decode("utf-8", errors="replace"))
+            try:
+                decoded = chunk.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                # Native cmd/Windows PowerShell output may use the same OEM
+                # code page as stdin, while child programs can still emit
+                # UTF-8. Prefer UTF-8 per chunk and fall back only when it is
+                # invalid, preserving both common sources in one session.
+                fallback = session.metadata.get("output_fallback_encoding") or "utf-8"
+                decoded = chunk.decode(fallback, errors="replace")
+            output.append(decoded)
             # Keep a bounded tail without joining on every read.  A command
             # producing a large log must not retain the whole process lifetime.
             total = session.metadata["output_chars"] + len(output[-1])
@@ -522,6 +561,7 @@ class WindowsPipeAdapter:
             stderr=subprocess.STDOUT,
             close_fds=True,
         )
+        stdin_encoding = self._stdin_encoding()
         session = ClientSession(
             name=name,
             profile=self.name,
@@ -531,7 +571,13 @@ class WindowsPipeAdapter:
             process=process,
             pid=process.pid,
             adapter=self,
-            metadata={"output": deque(), "output_chars": 0, "output_lock": threading.Lock()},
+            metadata={
+                "output": deque(),
+                "output_chars": 0,
+                "output_lock": threading.Lock(),
+                "stdin_encoding": stdin_encoding,
+                "output_fallback_encoding": stdin_encoding,
+            },
         )
         thread = threading.Thread(target=self._reader, args=(session,), name=f"aimux-{name}-output", daemon=True)
         session.metadata["output_thread"] = thread
@@ -550,7 +596,15 @@ class WindowsPipeAdapter:
         # the bridge key protocol.
         text = re.sub(r"\r\n|\r|\n", "\r\n", text)
         try:
-            stream.write(text.encode("utf-8"))
+            encoding = session.metadata.get("stdin_encoding") or self._stdin_encoding()
+            try:
+                payload = text.encode(encoding)
+            except (LookupError, UnicodeEncodeError) as exc:
+                raise BridgeError(
+                    f"session {session.name!r} input contains characters that cannot be encoded as {encoding}",
+                    kind="encoding_error",
+                ) from exc
+            stream.write(payload)
             stream.flush()
         except (BrokenPipeError, OSError, ValueError) as exc:
             raise BridgeError(f"session {session.name!r} stdin is closed", kind="session_gone") from exc
@@ -682,14 +736,16 @@ def build_adapters(silent_shell: bool = False, silent_shell_v2: bool = False) ->
         adapter_cls: type[WindowsConsoleAdapter | WindowsPipeAdapter]
         if silent_shell_v2:
             adapter_cls = WindowsPipeAdapter
-            adapters["cmd"] = adapter_cls("cmd", "cmd.exe")
-            adapters["powershell"] = adapter_cls("powershell", "powershell.exe -NoLogo -NoExit")
+            # /Q and -Command - suppress raw OEM-encoded command echo. Without
+            # this, capture receives a mixed CP936 echo plus UTF-8 child output.
+            adapters["cmd"] = adapter_cls("cmd", "cmd.exe /D /Q")
+            adapters["powershell"] = adapter_cls("powershell", "powershell.exe -NoLogo -NoExit -Command -")
         else:
             adapter_cls = WindowsConsoleAdapter
             adapters["cmd"] = adapter_cls("cmd", "cmd.exe", silent=silent_shell)
             adapters["powershell"] = adapter_cls("powershell", "powershell.exe -NoLogo -NoExit", silent=silent_shell)
         if shutil.which("pwsh.exe") or shutil.which("pwsh"):
-            adapters["pwsh"] = adapter_cls("pwsh", "pwsh.exe -NoLogo") if silent_shell_v2 else adapter_cls("pwsh", "pwsh.exe -NoLogo", silent=silent_shell)
+            adapters["pwsh"] = adapter_cls("pwsh", "pwsh.exe -NoLogo -NoExit -Command -") if silent_shell_v2 else adapter_cls("pwsh", "pwsh.exe -NoLogo", silent=silent_shell)
         bash = find_git_bash()
         if bash:
             command = f'"{bash}" --login -i'

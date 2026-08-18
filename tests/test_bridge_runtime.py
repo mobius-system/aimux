@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import io
 import os
@@ -115,6 +116,93 @@ def test_windows_pipe_adapter_never_allocates_console(monkeypatch):
     assert adapter.capture(session, 10, ansi=False).content == "ready\n"
 
 
+def test_windows_pipe_adapter_encodes_chinese_for_console_code_page(monkeypatch):
+    from aimux import bridge_client
+
+    class FakeStdin(io.BytesIO):
+        def flush(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+    adapter = bridge_client.WindowsPipeAdapter("powershell", "powershell.exe")
+    session = bridge_client.ClientSession(
+        name="chinese-input",
+        profile="powershell",
+        command="powershell.exe",
+        cwd=None,
+        created_at="now",
+        process=FakeProcess(),
+        adapter=adapter,
+    )
+    monkeypatch.setattr(adapter, "_stdin_encoding", lambda: "cp936")
+
+    adapter.send_keys(session, ["python.exe test.py 中文测试", "Enter"], [])
+
+    assert session.process.stdin.getvalue() == "python.exe test.py 中文测试\r\n".encode("cp936")
+    assert "中文测试".encode("utf-8") not in session.process.stdin.getvalue()
+
+
+def test_windows_pipe_adapter_keeps_utf8_for_mingw_and_pwsh():
+    from aimux import bridge_client
+
+    assert bridge_client.WindowsPipeAdapter("mingw64", "bash.exe -i")._stdin_encoding() == "utf-8"
+    assert bridge_client.WindowsPipeAdapter("pwsh", "pwsh.exe")._stdin_encoding() == "utf-8"
+
+
+def test_windows_pipe_output_falls_back_to_console_code_page():
+    from aimux import bridge_client
+
+    session = bridge_client.ClientSession(
+        name="native-output",
+        profile="cmd",
+        command="cmd.exe /Q",
+        cwd=None,
+        created_at="now",
+        metadata={
+            "output": deque(),
+            "output_chars": 0,
+            "output_lock": threading.Lock(),
+            "output_fallback_encoding": "cp936",
+        },
+    )
+
+    bridge_client.WindowsPipeAdapter._append_output(session, "版权所有".encode("cp936"))
+    bridge_client.WindowsPipeAdapter._append_output(session, "中文测试".encode("utf-8"))
+
+    assert "".join(session.metadata["output"]) == "版权所有中文测试"
+
+
+def test_windows_pipe_adapter_reports_unencodable_input(monkeypatch):
+    from aimux import bridge_client
+
+    class FakeStdin(io.BytesIO):
+        def flush(self):
+            pass
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+    adapter = bridge_client.WindowsPipeAdapter("cmd", "cmd.exe")
+    session = bridge_client.ClientSession(
+        name="emoji-input",
+        profile="cmd",
+        command="cmd.exe",
+        cwd=None,
+        created_at="now",
+        process=FakeProcess(),
+        adapter=adapter,
+    )
+    monkeypatch.setattr(adapter, "_stdin_encoding", lambda: "cp936")
+
+    with pytest.raises(bridge.BridgeError, match=r"cannot be encoded as cp936") as exc_info:
+        adapter.send_keys(session, ["echo 🚀", "Enter"], [])
+
+    assert exc_info.value.kind == "encoding_error"
+    assert session.process.stdin.getvalue() == b""
+
+
 def test_build_adapters_v2_keeps_legacy_profile_names(monkeypatch):
     from aimux import bridge_client
 
@@ -127,6 +215,8 @@ def test_build_adapters_v2_keeps_legacy_profile_names(monkeypatch):
     assert set(adapters) == {"cmd", "powershell"}
     assert all(isinstance(adapter, bridge_client.WindowsPipeAdapter) for adapter in adapters.values())
     assert all(adapter.profile_info()["visible"] is False for adapter in adapters.values())
+    assert adapters["cmd"].command == "cmd.exe /D /Q"
+    assert adapters["powershell"].command.endswith("-Command -")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires a POSIX PTY")
