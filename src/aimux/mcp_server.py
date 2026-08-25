@@ -223,6 +223,15 @@ def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, fini
     return res
 
 
+def _append_enter_for_stdin(chars: str, requested: object) -> bool:
+    """Keep line-command compatibility while preserving pager control keys."""
+    if isinstance(requested, bool):
+        return requested
+    if chars in {"q", "Q", "\x03", "\x04", "\x1b"}:
+        return False
+    return not chars.endswith(("\r", "\n"))
+
+
 # ---------------------------------------------------------------------------
 # remote_exec_command
 # ---------------------------------------------------------------------------
@@ -308,6 +317,7 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
         raise ValueError(f"unknown or expired session_id: {sid}")
     chars = args.get("chars") or ""
     has_chars = bool(chars)
+    append_enter = _append_enter_for_stdin(chars, args.get("append_enter"))
     max_tokens = int(args.get("max_output_tokens") or 10000)
     default_yield = 250 if has_chars else 5000
     yield_ms = max(0, min(30000, int(args.get("yield_time_ms") or default_yield)))
@@ -318,7 +328,8 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
         if has_chars:
             marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
             sess["marker"] = marker
-            c.send_keys(remote=remote, name=name, keys=[chars, "Enter"], flags=[], timeout=15.0)
+            keys = [chars, "Enter"] if append_enter else [chars]
+            c.send_keys(remote=remote, name=name, keys=keys, flags=[], timeout=15.0)
             c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, sess["profile"]), "Enter"], flags=[], timeout=15.0)
         else:
             # empty poll: watch the session's outstanding marker (set by exec or a
@@ -587,7 +598,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "chars": {"type": "string", "description": "Bytes to write to stdin."},
+                "chars": {"type": "string", "description": "Characters to write to stdin."},
+                "append_enter": {"type": "boolean", "description": "Append Enter after chars. Defaults to true for command lines; common pager/control keys (q, Ctrl-C, Ctrl-D, Escape) are sent raw."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget. Defaults to 10000."},
                 "session_id": {"type": "number", "description": "Identifier of the running unified exec session."},
                 "yield_time_ms": {"type": "number", "description": "Wait before yielding output. Non-empty writes default to 250 ms; empty polls wait 5000+ ms."},

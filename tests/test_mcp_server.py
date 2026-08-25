@@ -6,6 +6,27 @@ import pytest
 from aimux import mcp_server
 
 
+class ExecClient:
+    def __init__(self):
+        self.sent = []
+        self.captures = []
+        self.killed = []
+
+    def create_session(self, **kwargs):
+        return {"ok": True}
+
+    def send_keys(self, **kwargs):
+        self.sent.append(kwargs)
+        return {"ok": True}
+
+    def capture(self, **kwargs):
+        return self.captures.pop(0) if self.captures else {"content": ""}
+
+    def kill_session(self, **kwargs):
+        self.killed.append(kwargs)
+        return {"ok": True}
+
+
 class FakeClient:
     """Stand-in for BridgeControlClient; keeps an in-memory remote filesystem."""
 
@@ -91,6 +112,36 @@ def test_view_image_jpeg_and_detail(fake):
 def test_ping(fake):
     assert mcp_server._remote_ping("r", "p", {}) == {"ok": True}
     assert fake.health_called
+
+
+def test_write_stdin_control_key_is_raw(monkeypatch):
+    c = ExecClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+    sid = mcp_server._create_exec_session("r", "posix-pty", "less file", None)
+    c.captures = [{"content": ""}]
+
+    result = mcp_server._remote_write_stdin("r", "posix-pty", {"session_id": sid, "chars": "q", "yield_time_ms": 250})
+
+    assert c.sent[0]["keys"] == ["q"]
+    assert c.sent[1]["keys"][0].startswith("echo __AIMUX_EXIT_")
+    assert result["session_id"] == sid
+
+
+def test_write_stdin_command_keeps_implicit_enter_and_supports_override(monkeypatch):
+    c = ExecClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+    sid = mcp_server._create_exec_session("r", "posix-pty", "bash", None)
+    c.captures = [{"content": ""}, {"content": ""}]
+
+    mcp_server._remote_write_stdin("r", "posix-pty", {"session_id": sid, "chars": "echo ready", "yield_time_ms": 250})
+    assert c.sent[0]["keys"] == ["echo ready", "Enter"]
+
+    c.sent.clear()
+    c.captures = [{"content": ""}]
+    mcp_server._remote_write_stdin("r", "posix-pty", {"session_id": sid, "chars": "raw", "append_enter": False, "yield_time_ms": 250})
+    assert c.sent[0]["keys"] == ["raw"]
 
 
 def test_apply_patch_end_to_end(fake):
