@@ -251,6 +251,18 @@ def _exit_marker_cmd(marker: str, profile: str) -> str:
     return f"echo {marker}:$?"
 
 
+def _command_with_exit_marker(cmd: str, marker: str, profile: str) -> str:
+    """Keep the exit marker in the shell parser, never in child stdin."""
+    marker_cmd = _exit_marker_cmd(marker, profile)
+    sh = (profile or "").lower()
+    if "powershell" in sh or "pwsh" in sh:
+        return f"& {{ {cmd} }}; {marker_cmd}"
+    if sh == "cmd" or "win" in sh:
+        # CALL triggers a second percent-expansion pass after ``cmd`` exits.
+        return f"{cmd} & call echo {marker}%%errorlevel%%"
+    return f"{cmd}; {marker_cmd}"
+
+
 def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     cmd = args.get("cmd")
     if not isinstance(cmd, str) or not cmd.strip():
@@ -279,8 +291,13 @@ def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
         marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
         _sessions[sid]["marker"] = marker
         try:
-            c.send_keys(remote=remote, name=name, keys=[cmd, "Enter"], flags=[], timeout=15.0)
-            c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, profile), "Enter"], flags=[], timeout=15.0)
+            c.send_keys(
+                remote=remote,
+                name=name,
+                keys=[_command_with_exit_marker(cmd, marker, profile), "Enter"],
+                flags=[],
+                timeout=15.0,
+            )
             out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, True)
             out_t, original = _truncate_output(out, max_tokens)
             return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
@@ -326,11 +343,13 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
     c = _client()
     try:
         if has_chars:
-            marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
-            sess["marker"] = marker
+            # The original exec command owns the outstanding marker. Do not
+            # enqueue another shell command here: an interactive child (pager,
+            # password prompt, raw stdin reader) could consume that marker as
+            # input. This tool is stdin, not command execution.
+            marker = sess.get("marker", "")
             keys = [chars, "Enter"] if append_enter else [chars]
             c.send_keys(remote=remote, name=name, keys=keys, flags=[], timeout=15.0)
-            c.send_keys(remote=remote, name=name, keys=[_exit_marker_cmd(marker, sess["profile"]), "Enter"], flags=[], timeout=15.0)
         else:
             # empty poll: watch the session's outstanding marker (set by exec or a
             # previous write) so we can still detect command completion.

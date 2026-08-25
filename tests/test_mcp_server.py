@@ -124,7 +124,6 @@ def test_write_stdin_control_key_is_raw(monkeypatch):
     result = mcp_server._remote_write_stdin("r", "posix-pty", {"session_id": sid, "chars": "q", "yield_time_ms": 250})
 
     assert c.sent[0]["keys"] == ["q"]
-    assert c.sent[1]["keys"][0].startswith("echo __AIMUX_EXIT_")
     assert result["session_id"] == sid
 
 
@@ -142,6 +141,17 @@ def test_write_stdin_command_keeps_implicit_enter_and_supports_override(monkeypa
     c.captures = [{"content": ""}]
     mcp_server._remote_write_stdin("r", "posix-pty", {"session_id": sid, "chars": "raw", "append_enter": False, "yield_time_ms": 250})
     assert c.sent[0]["keys"] == ["raw"]
+
+
+def test_exec_marker_is_chained_after_command_not_sent_as_followup_stdin():
+    posix = mcp_server._command_with_exit_marker("python3 -c 'read(1)'", "__AIMUX_EXIT_ab12__", "posix-pty")
+    assert posix == "python3 -c 'read(1)'; echo __AIMUX_EXIT_ab12__:$?"
+
+    powershell = mcp_server._command_with_exit_marker("Read-Host", "__AIMUX_EXIT_ab12__", "powershell")
+    assert powershell == "& { Read-Host }; echo __AIMUX_EXIT_ab12__$LASTEXITCODE"
+
+    cmd = mcp_server._command_with_exit_marker("type nul", "__AIMUX_EXIT_ab12__", "cmd")
+    assert cmd == "type nul & call echo __AIMUX_EXIT_ab12__%%errorlevel%%"
 
 
 def test_apply_patch_end_to_end(fake):
