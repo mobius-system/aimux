@@ -1,10 +1,11 @@
 """aimux MCP server — expose one bridge remote as MCP tools over stdio.
 
-Codex-facing tools (5, aligned with codex native tool specs):
+Codex-facing tools (6, aligned with codex native tool specs):
   remote_exec_command  Run a command in a PTY; return output or session_id.
   remote_write_stdin   Write chars to an existing exec session, return output.
   remote_apply_patch   Apply a codex-style patch (FREEFORM input).
   remote_view_image    Return a remote image file as a data URL.
+  remote_download_file Download a remote file to the local filesystem.
   remote_ping          Health check.
 
 Transport: newline-delimited JSON-RPC 2.0 over stdin/stdout (MCP stdio).
@@ -15,6 +16,7 @@ remote parameter. Logs go to stderr only (stdout is the protocol).
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -22,7 +24,7 @@ import signal
 import sys
 import time
 import uuid
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 
 from . import __version__
 from . import bridge
@@ -397,6 +399,38 @@ def _remote_view_image(remote: str, profile: str, args: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# remote_download_file
+# ---------------------------------------------------------------------------
+
+
+def _remote_download_file(remote: str, profile: str, args: dict) -> dict:
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError("path is required")
+    local_raw = args.get("local_path")
+    if local_raw is not None and (not isinstance(local_raw, str) or not local_raw.strip()):
+        raise ValueError("local_path must be a non-empty string when provided")
+    overwrite = bool(args.get("overwrite", False))
+
+    local = Path(local_raw.strip()) if local_raw else Path(os.path.basename(path))
+    if not local.name or local.is_dir():
+        raise ValueError(f"local_path resolves to a directory: {local}")
+    local = local.expanduser().resolve()
+    if local.exists() and not overwrite:
+        raise FileExistsError(f"local file already exists (pass overwrite=true to replace): {local}")
+
+    res = _client().file_read(remote=remote, path=path, timeout=180.0)
+    raw = _file_bytes(res)
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.write_bytes(raw)
+    return {
+        "local_path": str(local),
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # remote_ping
 # ---------------------------------------------------------------------------
 
@@ -651,6 +685,19 @@ TOOLS = [
         },
     },
     {
+        "name": "remote_download_file",
+        "description": "Download a file from the remote machine to the local filesystem for further processing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Remote file path to download."},
+                "local_path": {"type": "string", "description": "Local destination path. Defaults to the remote file's basename in the current working directory."},
+                "overwrite": {"type": "boolean", "default": False, "description": "Replace an existing local file. Default false refuses to overwrite."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
         "name": "remote_ping",
         "description": "Health check.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -662,6 +709,7 @@ _TOOL_FUNCS = {
     "remote_write_stdin": _remote_write_stdin,
     "remote_apply_patch": _remote_apply_patch,
     "remote_view_image": _remote_view_image,
+    "remote_download_file": _remote_download_file,
     "remote_ping": _remote_ping,
 }
 

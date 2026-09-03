@@ -209,7 +209,7 @@ def test_jsonrpc_tools_list(monkeypatch):
     monkeypatch.setattr(mcp_server, "_send", lambda obj: sent.append(obj))
     mcp_server._dispatch("rem", "prof", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = [t["name"] for t in sent[0]["result"]["tools"]]
-    assert names == ["remote_exec_command", "remote_write_stdin", "remote_apply_patch", "remote_view_image", "remote_ping"]
+    assert names == ["remote_exec_command", "remote_write_stdin", "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping"]
 
 
 def test_jsonrpc_tools_call_ping(monkeypatch, fake):
