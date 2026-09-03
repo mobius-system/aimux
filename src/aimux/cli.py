@@ -1030,6 +1030,49 @@ def cmd_bridge_deploy(
         raise typer.Exit(EXIT_USER_ERROR)
 
 
+@bridge_app.command("restart", help="Restart the aimux bridge broker recorded in runtime.json (keeps host/port/token).")
+def cmd_bridge_restart(
+    timeout: Annotated[float, typer.Option("--timeout", help="Seconds to wait for the old broker to exit.")] = 10.0,
+):
+    runtime = bridge.read_runtime()
+    if runtime is None or runtime.pid is None:
+        err("error: no running bridge broker found (runtime.json missing or has no pid); use 'aimux bridge deploy' to start one")
+        raise typer.Exit(EXIT_USER_ERROR)
+    if runtime.pid == os.getpid():
+        err("error: refusing to restart myself")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    import signal
+    import time as _time
+
+    try:
+        os.kill(runtime.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # already dead; stale runtime.json — fall through and re-serve
+    except PermissionError as e:
+        err(f"error: cannot signal old broker pid {runtime.pid}: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        try:
+            os.kill(runtime.pid, 0)
+        except ProcessLookupError:
+            break
+        _time.sleep(0.1)
+    else:
+        err(f"error: old broker pid {runtime.pid} did not exit within {timeout:g}s")
+        raise typer.Exit(EXIT_TIMEOUT)
+
+    # Port may need a moment to be released by the kernel after process exit.
+    _time.sleep(0.2)
+    try:
+        bridge_server.serve(runtime.host, runtime.port, token=runtime.token)
+    except OSError as e:
+        err(f"error: failed to restart bridge broker on {runtime.host}:{runtime.port}: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+
 # ---------- reverse connect ----------
 
 @reverse_app.command("connect", help="Reverse-connect this machine to an aimux bridge broker.")
