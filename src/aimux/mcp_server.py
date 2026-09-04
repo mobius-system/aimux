@@ -3,7 +3,7 @@
 Codex-facing tools (6, aligned with codex native tool specs):
   remote_exec_command  Run a command in a PTY; return output or session_id.
   remote_write_stdin   Write chars to an existing exec session, return output.
-  remote_apply_patch   Apply a codex-style patch (FREEFORM input).
+  remote_apply_patch   Apply a patch (FREEFORM input).
   remote_view_image    Return a remote image file as a data URL.
   remote_download_file Download a remote file to the local filesystem.
   remote_ping          Health check.
@@ -663,7 +663,7 @@ TOOLS = [
     {
         "name": "remote_apply_patch",
         "description": (
-            "Apply a codex-style patch to edit files on the remote machine. "
+            "Apply a patch to edit files on the remote machine. "
             "FREEFORM: pass the raw patch text as `input`; do NOT wrap it in JSON. "
             "Patch shape: `*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ context line\\n-old line\\n+new line\\n*** End Patch`. "
             "Supported ops: `*** Add File:` / `*** Update File:` / `*** Delete File:`. "
@@ -676,7 +676,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "input": {"type": "string", "description": "Raw codex-style patch text (*** Begin Patch ... *** End Patch). Context lines must match the file verbatim; one edit site per @@ hunk."},
+                "input": {"type": "string", "description": "Raw patch text (*** Begin Patch ... *** End Patch). Context lines must match the file verbatim; one edit site per @@ hunk."},
                 "workdir": {"type": "string", "description": "Remote working directory for relative patch paths. Prefer absolute paths when omitted."},
             },
             "required": ["input"],
@@ -684,12 +684,12 @@ TOOLS = [
     },
     {
         "name": "remote_view_image",
-        "description": "View a local image file from the filesystem when visual inspection is needed.",
+        "description": "Read an image file from the remote machine and return it as a data URL for visual inspection.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "detail": {"type": "string", "enum": ["high", "original"], "default": "high", "description": "Image detail level. Defaults to high; use original to preserve exact resolution."},
-                "path": {"type": "string", "description": "Local filesystem path to an image file."},
+                "path": {"type": "string", "description": "Remote file path to the image."},
             },
             "required": ["path"],
         },
