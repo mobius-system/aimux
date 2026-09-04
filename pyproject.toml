@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aimux"
-version = "0.1.26"
+version = "0.1.27"
 description = "AI-agent-friendly tmux wrapper: unified local + remote sessions, single-pane sessions, safe primitives."
 readme = "README.md"
 requires-python = ">=3.10"
