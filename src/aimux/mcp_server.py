@@ -662,11 +662,21 @@ TOOLS = [
     },
     {
         "name": "remote_apply_patch",
-        "description": "Use the remote_apply_patch tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON. The input is the raw codex-style patch text (*** Begin Patch ... *** End Patch).",
+        "description": (
+            "Apply a codex-style patch to edit files on the remote machine. "
+            "FREEFORM: pass the raw patch text as `input`; do NOT wrap it in JSON. "
+            "Patch shape: `*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ context line\\n-old line\\n+new line\\n*** End Patch`. "
+            "Supported ops: `*** Add File:` / `*** Update File:` / `*** Delete File:`. "
+            "Inside each `@@ ...` hunk, lines beginning with a single leading space are context (anchor — must match the file byte-for-byte, including blank lines and indentation); "
+            "`-` lines are removed; `+` lines are inserted. "
+            "Rules: (1) one edit site per `@@` hunk — never bundle multiple distant locations into one giant hunk; "
+            "(2) context lines must be copied verbatim from the file (a mismatch raises 'patch context not found'); "
+            "(3) prefer a few small hunks over one big one."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "input": {"type": "string", "description": "The raw codex-style patch text. Do not wrap in a JSON object."},
+                "input": {"type": "string", "description": "Raw codex-style patch text (*** Begin Patch ... *** End Patch). Context lines must match the file verbatim; one edit site per @@ hunk."},
                 "workdir": {"type": "string", "description": "Remote working directory for relative patch paths. Prefer absolute paths when omitted."},
             },
             "required": ["input"],
