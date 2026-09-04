@@ -195,18 +195,26 @@ def cmd_new(
         err("error: --profile is only valid for bridge remotes")
         raise typer.Exit(EXIT_USER_ERROR)
 
-    if tmux.has_session(name):
+    bridge_client_ctl: bridge.BridgeControlClient | None = None
+    bridge_remote_info: dict | None = None
+    ssh_exists = False
+    if remote:
+        # Resolve bridge remotes before checking the local tmux namespace.
+        # Bridge sessions live on ``remote/name`` and may legitimately share a
+        # name with a local or SSH wrapper session.
+        bridge_client_ctl, bridge_remote_info = _bridge_remote(remote)
+
+    # Local tmux is a namespace of its own.  Only check it for local sessions,
+    # or for SSH remotes (which use a local tmux wrapper).  Never let a local
+    # same-name session block creation on a bridge remote.
+    if bridge_remote_info is None and tmux.has_session(name):
         if reuse:
             return
         err(f"error: session {name!r} already exists")
         raise typer.Exit(EXIT_USER_ERROR)
 
-    bridge_client_ctl: bridge.BridgeControlClient | None = None
-    bridge_remote_info: dict | None = None
-    ssh_exists = False
     if remote:
         ssh_exists = ssh_mod.host_exists(remote)
-        bridge_client_ctl, bridge_remote_info = _bridge_remote(remote)
 
         if bridge_remote_info is not None:
             if ssh_exists:

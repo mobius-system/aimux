@@ -79,6 +79,39 @@ def test_new_bridge_remote_uses_profile_and_does_not_create_tmux(monkeypatch):
     assert fake.created[0]["cmd"] == "cmd.exe"
 
 
+def test_new_bridge_remote_allows_same_name_as_local_tmux(monkeypatch):
+    """Bridge and local tmux sessions have independent name namespaces."""
+    fake = FakeBridgeClient()
+    monkeypatch.setattr(tmux, "has_session", lambda name: True)
+    monkeypatch.setattr(ssh_mod, "host_exists", lambda name: False)
+    monkeypatch.setattr("aimux.cli._bridge_remote", lambda name: (fake, {"name": name, "status": "connected"}))
+
+    result = CliRunner().invoke(
+        app,
+        ["new", "--remote", "winbox", "--profile", "cmd", "--name", "task"],
+    )
+
+    assert result.exit_code == EXIT_OK
+    assert fake.created[0]["remote"] == "winbox"
+    assert fake.created[0]["name"] == "task"
+
+
+def test_new_bridge_reuse_only_matches_remote_namespace(monkeypatch):
+    fake = FakeBridgeClient()
+    fake.list_sessions = lambda **kwargs: [{"location": "other", "name": "task"}]
+    monkeypatch.setattr(tmux, "has_session", lambda name: True)
+    monkeypatch.setattr(ssh_mod, "host_exists", lambda name: False)
+    monkeypatch.setattr("aimux.cli._bridge_remote", lambda name: (fake, {"name": name, "status": "connected"}))
+
+    result = CliRunner().invoke(
+        app,
+        ["new", "--remote", "winbox", "--profile", "cmd", "--name", "task", "--reuse"],
+    )
+
+    assert result.exit_code == EXIT_OK
+    assert len(fake.created) == 1
+
+
 def test_new_ssh_remote_rejects_profile(monkeypatch):
     monkeypatch.setattr(tmux, "has_session", lambda name: False)
     monkeypatch.setattr(ssh_mod, "host_exists", lambda name: True)
@@ -114,6 +147,18 @@ def _bridge_session() -> session_mod.Session:
         profile="cmd",
         client_status="connected",
     )
+
+
+def test_short_session_name_is_ambiguous_across_locations():
+    local = session_mod.Session(
+        name="task", attached=False, location="local", host=None,
+        created_at=None, created_by=None, output_sync_file=None,
+        managed=True, backend="tmux", transport="local",
+    )
+    bridge_session = _bridge_session()
+
+    with pytest.raises(session_mod.IdError, match="ambiguous session name 'task'"):
+        session_mod.resolve("task", [local, bridge_session])
 
 
 def test_attach_rejects_bridge_session(monkeypatch):
