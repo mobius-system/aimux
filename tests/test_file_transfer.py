@@ -39,7 +39,7 @@ def test_send_files_rejects_missing_host_before_sftp(tmp_path, monkeypatch):
         lambda *args, **kwargs: pytest.fail("send_paths should not run for a missing host"),
     )
 
-    result = CliRunner().invoke(app, ["send_files", "missing", "/tmp/out", str(local_file)])
+    result = CliRunner().invoke(app, ["send-files", "missing", "/tmp/out", str(local_file)])
 
     assert result.exit_code == EXIT_USER_ERROR
     assert "host 'missing' not found in ~/.ssh/config" in _combined_output(result)
@@ -63,7 +63,7 @@ def test_send_files_reports_auth_required_from_sftp(tmp_path, monkeypatch):
 
     monkeypatch.setattr(transfer.subprocess, "run", fake_run)
 
-    result = CliRunner().invoke(app, ["send_files", "worker", "/tmp/out", str(local_file)])
+    result = CliRunner().invoke(app, ["send-files", "worker", "/tmp/out", str(local_file)])
 
     assert result.exit_code == EXIT_AUTH_REQUIRED
     assert "sftp upload to 'worker' failed" in _combined_output(result)
@@ -111,7 +111,7 @@ def test_send_files_uploads_multiple_paths_to_remote_directory(tmp_path, monkeyp
 
     monkeypatch.setattr(transfer.subprocess, "run", fake_run)
 
-    result = CliRunner().invoke(app, ["send_files", "worker", "/tmp/out", str(first), str(second)])
+    result = CliRunner().invoke(app, ["send-files", "worker", "/tmp/out", str(first), str(second)])
 
     assert result.exit_code == EXIT_OK
     assert "uploaded 2 file(s) to worker:/tmp/out" in result.stdout
@@ -172,7 +172,7 @@ def test_get_files_downloads_multiple_remote_paths_to_local_directory(tmp_path, 
 
     result = CliRunner().invoke(
         app,
-        ["get_files", "worker", str(destination), "/var/log/app.log", "/srv/data/"],
+        ["get-files", "worker", str(destination), "/var/log/app.log", "/srv/data/"],
     )
 
     assert result.exit_code == EXIT_OK

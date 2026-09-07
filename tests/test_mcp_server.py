@@ -174,24 +174,21 @@ def test_apply_patch_add_and_delete(fake):
     assert "/g" not in fake.files
 
 
-def test_apply_patch_relative_path_requires_workdir(fake):
-    with pytest.raises(ValueError, match="requires workdir"):
+def test_apply_patch_relative_path_rejected(fake):
+    with pytest.raises(ValueError, match="must be absolute"):
         mcp_server._remote_apply_patch(
             "r", "p",
             {"input": "*** Begin Patch\n*** Add File: src/conv.py\n+hello\n*** End Patch\n"},
         )
 
 
-def test_apply_patch_relative_path_uses_workdir(fake):
+def test_apply_patch_windows_absolute_path_accepted(fake):
     result = mcp_server._remote_apply_patch(
         "r", "p",
-        {
-            "workdir": "/workspace/project",
-            "input": "*** Begin Patch\n*** Add File: src/conv.py\n+hello\n*** End Patch\n",
-        },
+        {"input": "*** Begin Patch\n*** Add File: C:\\proj\\src\\conv.py\n+hello\n*** End Patch\n"},
     )
-    assert result["applied"] == ["added: /workspace/project/src/conv.py"]
-    assert fake.files["/workspace/project/src/conv.py"] == b"hello"
+    assert result["applied"] == ["added: C:\\proj\\src\\conv.py"]
+    assert fake.files["C:\\proj\\src\\conv.py"] == b"hello"
 
 
 # ---- JSON-RPC dispatch ----

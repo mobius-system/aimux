@@ -24,7 +24,7 @@ import signal
 import sys
 import time
 import uuid
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 from . import __version__
 from . import bridge
@@ -445,39 +445,30 @@ def _remote_ping(remote: str, profile: str, args: dict) -> dict:
 
 
 def _remote_apply_patch(remote: str, profile: str, args: dict) -> dict:
-    workdir = None
     if isinstance(args, dict):
         patch_text = args.get("input")
         if patch_text is None:
             patch_text = args.get("patch") or args.get("text") or ""
-        workdir = args.get("workdir") or None
     else:
         patch_text = str(args or "")
     if not isinstance(patch_text, str) or not patch_text.strip():
         raise ValueError("input (raw patch text) is required")
-    if workdir is not None and (not isinstance(workdir, str) or not workdir.strip()):
-        raise ValueError("workdir must be a non-empty remote directory")
-    applied = _apply_codex_patch(remote, patch_text, workdir=workdir)
+    applied = _apply_codex_patch(remote, patch_text)
     return {"applied": applied}
 
 
-def _resolve_patch_path(path: str, workdir: str | None) -> str:
-    """Resolve relative patch paths against the remote working directory.
+def _resolve_patch_path(path: str, workdir: str | None = None) -> str:
+    """Patch paths must be absolute.
 
     Bridge file operations run in the reverse client's process cwd, which is
-    unrelated to the agent's remote session cwd. Requiring an explicit
-    workdir for relative paths prevents a successful write to the wrong tree.
+    unrelated to the agent's remote session cwd — a relative path would
+    silently read/write the wrong tree, so refuse it outright.
     """
-    if not path or path.startswith("/") or path.startswith("\\"):
+    if path and (path.startswith("/") or path.startswith("\\")):
         return path
     if len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\"):
         return path
-    if not workdir:
-        raise ValueError(
-            f"relative patch path {path!r} requires workdir; use an absolute remote path"
-        )
-    separator = "\\" if PureWindowsPath(workdir).drive else "/"
-    return workdir.rstrip("/\\") + separator + path
+    raise ValueError(f"patch path {path!r} must be absolute")
 
 
 def _write_verified(client, *, remote: str, path: str, data: bytes) -> None:
@@ -490,13 +481,13 @@ def _write_verified(client, *, remote: str, path: str, data: bytes) -> None:
         raise ValueError(f"remote write verification failed for {path!r}")
 
 
-def _apply_codex_patch(remote: str, patch_text: str, *, workdir: str | None = None) -> list:
+def _apply_codex_patch(remote: str, patch_text: str) -> list:
     ops = _parse_codex_patch(patch_text)
     c = _client()
     results = []
     for op in ops:
         kind = op["kind"]
-        path = _resolve_patch_path(op["path"], workdir)
+        path = _resolve_patch_path(op["path"])
         if kind == "add":
             content = op["content"]
             _write_verified(c, remote=remote, path=path, data=content.encode("utf-8"))
@@ -665,8 +656,9 @@ TOOLS = [
         "description": (
             "Apply a patch to edit files on the remote machine. "
             "FREEFORM: pass the raw patch text as `input`; do NOT wrap it in JSON. "
-            "Patch shape: `*** Begin Patch\\n*** Update File: path/to/file.py\\n@@ context line\\n-old line\\n+new line\\n*** End Patch`. "
+            "Patch shape: `*** Begin Patch\\n*** Update File: /abs/path/file.py\\n@@ context line\\n-old line\\n+new line\\n*** End Patch`. "
             "Supported ops: `*** Add File:` / `*** Update File:` / `*** Delete File:`. "
+            "Paths must be ABSOLUTE (a relative path raises 'patch path must be absolute'). "
             "Inside each `@@ ...` hunk, lines beginning with a single leading space are context (anchor — must match the file byte-for-byte, including blank lines and indentation); "
             "`-` lines are removed; `+` lines are inserted. "
             "Rules: (1) one edit site per `@@` hunk — never bundle multiple distant locations into one giant hunk; "
@@ -676,8 +668,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "input": {"type": "string", "description": "Raw patch text (*** Begin Patch ... *** End Patch). Context lines must match the file verbatim; one edit site per @@ hunk."},
-                "workdir": {"type": "string", "description": "Remote working directory for relative patch paths. Prefer absolute paths when omitted."},
+                "input": {"type": "string", "description": "Raw patch text (*** Begin Patch ... *** End Patch). Paths must be absolute; context lines must match the file verbatim; one edit site per @@ hunk."},
             },
             "required": ["input"],
         },

@@ -35,8 +35,11 @@ ls                          List all aimux sessions.
 new                         Create a new session.
 attach                      Attach to a session. ⚠️  Human use only — agents should use send-keys + capture.
 send-keys                   Send keys to a session. Behaves exactly like 'tmux send-keys': supports -F/-H/-K/-l/-M/-R/-X/-N <count>. Pass 'Enter' as a key to submit a line.     
-send_files                  Upload multiple local files or directories to an SSH host using sftp.
-get_files                   Download multiple remote files or directories from an SSH host using sftp.
+send-files                  Upload multiple local files or directories to an SSH host using sftp.
+get-files                   Download multiple remote files or directories from an SSH host using sftp.
+sync-dir                    Differentially synchronize a local directory with a bridge remote directory.
+read                        Read a remote file and print a metadata header followed by numbered content.
+apply-patch                 Apply a patch to create, edit, or delete files (absolute paths only).
 capture                     Capture pane output (last N lines).
 kill                        Destroy a single session. Does not accept wildcards or batch.
 wait-last-command-complete  Block until the pane's foreground process is back at a shell. Local sessions only.
@@ -121,14 +124,14 @@ target.
 
 ### File transfer for bridge remotes
 
-`aimux send_files` and `aimux get_files` work the same way for bridge remotes
+`aimux send-files` and `aimux get-files` work the same way for bridge remotes
 as for SSH hosts — the CLI auto-detects the remote type and dispatches
 accordingly. Bridge transfers use a base64-encoded `file.*` message family
 over the existing SSE+POST channel, with no sftp dependency on the client.
 
 ```bash
-aimux send_files winbox 'C:\Users\dev\proj' ./src --gitignore
-aimux get_files winbox ./logs 'C:\Users\dev\proj\logs'
+aimux send-files winbox 'C:\Users\dev\proj' ./src --gitignore
+aimux get-files winbox ./logs 'C:\Users\dev\proj\logs'
 ```
 
 Differences vs the SSH path:
@@ -142,16 +145,16 @@ Differences vs the SSH path:
 - `..` segments in remote paths are rejected to prevent traversal.
 
 ```bash
-# aimux send_files REMOTE REMOTE_DIR LOCAL_PATH... [--gitignore]
-# aimux get_files REMOTE LOCAL_DIR REMOTE_PATH...
-aimux send_files local-8824 /tmp/upload /home/testdir/tests
-aimux get_files local-8824 /home/testdir/tests /tmp/upload
+# aimux send-files REMOTE REMOTE_DIR LOCAL_PATH... [--gitignore]
+# aimux get-files REMOTE LOCAL_DIR REMOTE_PATH...
+aimux send-files local-8824 /tmp/upload /home/testdir/tests
+aimux get-files local-8824 /home/testdir/tests /tmp/upload
 ```
 
 Use `--gitignore` on upload when ignored files should be skipped:
 
 ```bash
-aimux send_files local-8824 /tmp/upload /home/testdir/tests --gitignore
+aimux send-files local-8824 /tmp/upload /home/testdir/tests --gitignore
 ```
 
 5. Clean up.

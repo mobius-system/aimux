@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -140,6 +141,22 @@ def _bridge_remote(name: str) -> tuple[bridge.BridgeControlClient | None, dict |
         return client, client.get_remote(name, timeout=2.0)
     except bridge.BridgeError:
         return None, None
+
+
+def _add_underscore_alias(name: str) -> None:
+    """Register `<name>` (e.g. send_files) as a hidden alias for the
+    hyphenated command (send-files). Renamed commands keep working for
+    older docs / agent muscle memory without cluttering --help."""
+    import copy
+
+    for existing in app.registered_commands:
+        if getattr(existing, "name", None) == name.replace("_", "-"):
+            cloned = copy.copy(existing)
+            cloned.name = name
+            cloned.hidden = True
+            app.registered_commands.append(cloned)
+            return
+    raise RuntimeError(f"cannot alias {name!r}: hyphenated command not found")
 
 
 # ---------- ls ----------
@@ -386,7 +403,7 @@ def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> 
     raise typer.Exit(EXIT_USER_ERROR)
 
 
-@app.command("send_files", help="Upload multiple local files or directories to an SSH or bridge remote.")
+@app.command("send-files", help="Upload multiple local files or directories to an SSH or bridge remote.")
 def cmd_send_files(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
     remote_path: Annotated[str, typer.Argument(help="Destination directory on the remote host.")],
@@ -429,9 +446,9 @@ def cmd_send_files(
         print(f"skipped {result.skipped_files} gitignored file(s)")
 
 
-# ---------- get_files ----------
+# ---------- get-files ----------
 
-@app.command("get_files", help="Download multiple remote files or directories from an SSH or bridge remote.")
+@app.command("get-files", help="Download multiple remote files or directories from an SSH or bridge remote.")
 def cmd_get_files(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
     local_dir: Annotated[str, typer.Argument(help="Local destination directory.")],
@@ -464,18 +481,18 @@ def cmd_get_files(
     print(f"downloaded {result.downloaded_paths} path(s) from {remote} to {result.plan.local_dir}")
 
 
-# ---------- sync_dir ----------
+# ---------- sync-dir ----------
 
 def _sync_dir_progress(phase: str, payload: dict[str, object]) -> None:
     if phase == "scan_source":
-        print(f"sync_dir: scanning {payload.get('location')} source {payload.get('path')}")
+        print(f"sync-dir: scanning {payload.get('location')} source {payload.get('path')}")
         return
     if phase == "scan_destination":
-        print(f"sync_dir: scanning {payload.get('location')} destination {payload.get('path')}")
+        print(f"sync-dir: scanning {payload.get('location')} destination {payload.get('path')}")
         return
     if phase == "plan":
         print(
-            "sync_dir: plan "
+            "sync-dir: plan "
             f"{payload.get('changed_files')} changed file(s), "
             f"{payload.get('deleted_paths')} delete(s), "
             f"{payload.get('dirs')} new dir(s)"
@@ -483,24 +500,24 @@ def _sync_dir_progress(phase: str, payload: dict[str, object]) -> None:
         return
     if phase == "archive":
         print(
-            f"sync_dir: building archive with {payload.get('files')} file(s) "
+            f"sync-dir: building archive with {payload.get('files')} file(s) "
             f"and {payload.get('dirs')} dir(s)"
         )
         return
     if phase == "transfer":
-        print(f"sync_dir: transferring archive ({payload.get('archive_size')} byte(s))")
+        print(f"sync-dir: transferring archive ({payload.get('archive_size')} byte(s))")
         return
     if phase == "apply":
-        print(f"sync_dir: applying changes on {payload.get('location')}")
+        print(f"sync-dir: applying changes on {payload.get('location')}")
         return
     if phase == "noop":
-        print("sync_dir: no changes")
+        print("sync-dir: no changes")
         return
     if phase == "done":
-        print("sync_dir: done")
+        print("sync-dir: done")
 
 
-@app.command("sync_dir", help="Differentially synchronize a local directory with a bridge remote directory.")
+@app.command("sync-dir", help="Differentially synchronize a local directory with a bridge remote directory.")
 def cmd_sync_dir(
     remote: Annotated[str, typer.Argument(help="Bridge remote name.")],
     remote_path: Annotated[str, typer.Argument(help="Remote directory path.")],
@@ -560,6 +577,12 @@ def cmd_sync_dir(
             f"synced {result.synced_files} file(s) from bridge remote {remote}:{remote_path} "
             f"to {result.local_path}; deleted {result.deleted_paths} path(s)"
         )
+
+
+# Hidden underscore aliases for the renamed hyphenated commands (back-compat).
+_add_underscore_alias("send_files")
+_add_underscore_alias("get_files")
+_add_underscore_alias("sync_dir")
 
 
 # ---------- capture ----------
@@ -1186,6 +1209,72 @@ def _file_require_ssh(remote: str) -> None:
         raise typer.Exit(EXIT_USER_ERROR)
 
 
+def _require_absolute(path: str, *, what: str = "--path") -> str:
+    """read/apply-patch only accept absolute paths: a relative remote path
+    silently resolves against the reverse client's process cwd (an unrelated
+    tree), so make the target explicit or refuse."""
+    if path.startswith("/") or path.startswith("\\"):
+        return path
+    if len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\"):
+        return path
+    err(f"error: {what} must be an absolute path (got {path!r})")
+    raise typer.Exit(EXIT_USER_ERROR)
+
+
+def _detect_encoding(data: bytes) -> str:
+    """Best-effort BOM/strict-decode sniffing, stdlib only (no chardet dep).
+
+    Returns 'binary' for non-text payloads; callers render those as a byte
+    summary instead of content."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "utf-32"
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    if not data:
+        return "utf-8"
+    # Binary sniff: NUL bytes anywhere, or a dense run of non-printable control
+    # bytes (sampled over the first 4 KiB — enough signal, cheap on big files).
+    window = data[:4096]
+    n_control = sum(1 for b in window if b < 9 or (13 < b < 32))
+    if b"\x00" in window or n_control > len(window) * 0.30:
+        return "binary"
+    try:
+        data.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "latin-1"
+
+
+def _read_remote_bytes(remote: str, path: str) -> bytes:
+    """Single bridge/SSH read funnel reused by `read` and `apply-patch`."""
+    client, info = _bridge_remote(remote)
+    if client is not None and info is not None:
+        try:
+            resp = client.file_read(remote=remote, path=path)
+        except bridge.BridgeError as e:
+            _exit_bridge_error(e)
+        import base64 as _b64
+
+        v = resp.get("content_b64")
+        if isinstance(v, str) and v:
+            return _b64.b64decode(v)
+        v = resp.get("content")
+        if isinstance(v, str) and v:
+            try:
+                return _b64.b64decode(v)
+            except Exception:
+                return v.encode("utf-8")
+        return b""
+    _file_require_ssh(remote)
+    try:
+        return transfer.ssh_file_read(remote, path)
+    except transfer.TransferError as e:
+        err(f"error: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+
 @file_app.command("list", help="List a remote directory.")
 def cmd_file_list(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
@@ -1319,6 +1408,263 @@ def cmd_file_write(
             err(f"error: {e}")
             raise typer.Exit(EXIT_USER_ERROR)
     print(f"wrote {len(data)} byte(s) to {remote}:{path}")
+
+
+# ---------- read / apply-patch (top-level, absolute-path only) ----------
+
+
+@app.command(
+    "read",
+    help=(
+        "Read a remote file and print a metadata header followed by numbered content.\n"
+        "Header: path, detected encoding (utf-8/utf-8-sig/utf-16/utf-32/latin-1/binary),\n"
+        "size in bytes with line range, and sha256. Content lines are prefixed 'N→'\n"
+        "(cat -n style) unless --no-lineno. Use --offset/--limit to page through long\n"
+        "files instead of dumping everything. --raw emits the original bytes only\n"
+        "(redirect to a file for a faithful copy); --json emits one machine-readable\n"
+        "object. Binary files report 'binary' and show a byte count instead of content\n"
+        "(--json adds content_b64). The path must be ABSOLUTE; relative paths are\n"
+        "rejected to avoid hitting the wrong tree."
+    ),
+)
+def cmd_read(
+    remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
+    path: Annotated[str, typer.Option("--path", help="Absolute path of the file to read.")],
+    offset: Annotated[int, typer.Option("--offset", help="First line to show (1-based). Defaults to 1.")] = 1,
+    limit: Annotated[int, typer.Option("--limit", help="Max lines to show. Defaults to 2000.")] = 2000,
+    json_out: Annotated[bool, typer.Option("--json", help="Output a single JSON object.")] = False,
+    raw: Annotated[bool, typer.Option("--raw", help="Raw bytes only, no header or line numbers.")] = False,
+    no_lineno: Annotated[bool, typer.Option("--no-lineno", help="Content without line numbers.")] = False,
+):
+    path = _require_absolute(path)
+    if offset < 1:
+        err("error: --offset must be >= 1")
+        raise typer.Exit(EXIT_USER_ERROR)
+    if limit < 1:
+        err("error: --limit must be >= 1")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    data = _read_remote_bytes(remote, path)
+    encoding = _detect_encoding(data)
+    size = len(data)
+    digest = hashlib.sha256(data).hexdigest()
+
+    if raw:
+        sys.stdout.buffer.write(data)
+        return
+
+    if encoding == "binary":
+        content = f"<binary {size} bytes>"
+        total_lines = 0
+        shown = (0, 0)
+        truncated = False
+    else:
+        text = data.decode(encoding, errors="replace")
+        lines = text.splitlines()
+        total_lines = len(lines)
+        start = min(offset, total_lines + 1)
+        picked = lines[start - 1 : start - 1 + limit]
+        shown = (start, start + len(picked) - 1)
+        truncated = len(picked) < total_lines
+        if no_lineno:
+            content = "\n".join(picked)
+        else:
+            content = "\n".join(f"{i}→{line}" for i, line in zip(range(start, start + len(picked)), picked))
+
+    if json_out:
+        payload: dict[str, object] = {
+            "path": path,
+            "encoding": encoding,
+            "size": size,
+            "sha256": digest,
+            "total_lines": total_lines,
+            "offset": shown[0],
+            "limit": shown[1] - shown[0] + 1 if shown[1] >= shown[0] else 0,
+            "truncated": truncated,
+            "content": content,
+        }
+        if encoding == "binary":
+            payload["content_b64"] = base64.b64encode(data).decode("ascii")
+        print_json(payload)
+        return
+
+    print(f"path:     {path}")
+    print(f"encoding: {encoding}")
+    if total_lines:
+        print(f"size:     {size} bytes (lines 1-{total_lines}; showing {shown[0]}-{shown[1]})")
+    else:
+        print(f"size:     {size} bytes")
+    print(f"sha256:   {digest}")
+    print("─" * 44)
+    if content:
+        print(content)
+
+
+@app.command(
+    "apply-patch",
+    help=(
+        "Apply a patch to create, edit, or delete files.\n"
+        "Patch shape (read from stdin, or a file via --file):\n"
+        "  *** Begin Patch\n"
+        "  *** Update File: /abs/path/file.py\n"
+        "  @@ context line\n"
+        "  -old line\n"
+        "  +new line\n"
+        "  *** End Patch\n"
+        "Supported ops: *** Add File: / *** Update File: / *** Delete File:.\n"
+        "Paths must be ABSOLUTE — a relative path is rejected with 'patch path must be absolute'.\n"
+        "Inside each '@@ ...' hunk: a single leading space marks a context line (anchor — must\n"
+        "match the file byte-for-byte, including blank lines and indentation); '-' lines are\n"
+        "removed; '+' lines are inserted. A context mismatch raises 'patch context not found'.\n"
+        "Rules: (1) one edit site per @@ hunk — never bundle distant locations into one giant\n"
+        "hunk; (2) copy context lines verbatim from the file; (3) prefer a few small hunks.\n"
+        "Targets: omit --remote for local files (atomic tmp+rename on update); --remote picks\n"
+        "a bridge or SSH remote. --dry-run validates context without writing ('would ...').\n"
+        "Add File refuses to overwrite an existing file unless --force is given."
+    ),
+)
+def cmd_apply_patch(
+    patch_file: Annotated[
+        Optional[str],
+        typer.Option("--file", help="Read the patch from this file instead of stdin."),
+    ] = None,
+    remote: Annotated[
+        Optional[str],
+        typer.Option("--remote", help="Bridge or SSH remote to patch on. Omit for local files."),
+    ] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Validate context matches without writing.")] = False,
+    force: Annotated[bool, typer.Option("--force", help="Let Add File overwrite an existing file.")] = False,
+):
+    from . import mcp_server
+
+    if patch_file is not None:
+        try:
+            patch_text = Path(patch_file).read_text(encoding="utf-8")
+        except OSError as e:
+            err(f"error: cannot read patch file: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+    else:
+        patch_text = sys.stdin.read()
+    if not patch_text.strip():
+        err("error: empty patch input")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    try:
+        ops = mcp_server._parse_codex_patch(patch_text)
+    except Exception as e:
+        err(f"error: cannot parse patch: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+    if not ops:
+        err("error: patch contains no file operations")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    bad = [op["path"] for op in ops if not (
+        op["path"].startswith(("/", "\\"))
+        or (len(op["path"]) >= 3 and op["path"][1] == ":" and op["path"][2] in ("/", "\\"))
+    )]
+    if bad:
+        err("error: patch paths must be absolute:")
+        for p in bad:
+            err(f"  - {p}")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    if remote is not None:
+        client, info = _bridge_remote(remote)
+        if client is not None and info is not None:
+            if dry_run:
+                results = []
+                for op in ops:
+                    p = op["path"]
+                    if op["kind"] == "update":
+                        orig = _read_remote_bytes(remote, p).decode("utf-8", "replace")
+                        mcp_server._apply_hunks(orig, op["hunks"])  # raises on context mismatch
+                        results.append(f"would update: {p}")
+                    else:
+                        results.append(f"would {op['kind']}: {p}")
+                for line in results:
+                    print(line)
+                return
+            applied = mcp_server._remote_apply_patch(remote, "", {"input": patch_text})
+            for line in applied["applied"]:
+                print(line)
+            return
+        # SSH remote: read → apply → write back, one round-trip per updated file.
+        _file_require_ssh(remote)
+        try:
+            for op in ops:
+                p = op["path"]
+                if op["kind"] == "add":
+                    data = op["content"].encode("utf-8")
+                    if not force:
+                        # Refuse to clobber: stat first via a read attempt.
+                        try:
+                            transfer.ssh_file_read(remote, p)
+                            err(f"error: {p} already exists (use --force to overwrite)")
+                            raise typer.Exit(EXIT_USER_ERROR)
+                        except transfer.TransferError:
+                            pass
+                    if not dry_run:
+                        transfer.ssh_file_write(remote, p, data)
+                    print(f"{'would ' if dry_run else ''}added: {p}")
+                elif op["kind"] == "delete":
+                    raise typer.Exit(_ssh_delete_not_supported())
+                else:
+                    orig_bytes = transfer.ssh_file_read(remote, p)
+                    orig = orig_bytes.decode("utf-8", "replace")
+                    new = mcp_server._apply_hunks(orig, op["hunks"])
+                    if not dry_run:
+                        transfer.ssh_file_write(remote, p, new.encode("utf-8"))
+                    print(f"{'would ' if dry_run else ''}updated: {p}")
+        except transfer.TransferError as e:
+            err(f"error: {e}")
+            raise typer.Exit(EXIT_USER_ERROR)
+        return
+
+    # Local mode: same engine, local IO, atomic replace on update.
+    import tempfile
+
+    for op in ops:
+        p = op["path"]
+        target = Path(p)
+        if op["kind"] == "add":
+            if target.exists() and not force:
+                err(f"error: {p} already exists (use --force to overwrite)")
+                raise typer.Exit(EXIT_USER_ERROR)
+            if dry_run:
+                print(f"would add: {p}")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(op["content"], encoding="utf-8")
+            print(f"added: {p}")
+        elif op["kind"] == "delete":
+            if dry_run:
+                print(f"would delete: {p}")
+                continue
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            print(f"deleted: {p}")
+        else:
+            orig = target.read_text(encoding="utf-8", errors="replace")
+            new = mcp_server._apply_hunks(orig, op["hunks"])
+            if dry_run:
+                print(f"would update: {p}")
+                continue
+            fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".aimux-patch-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(new)
+                os.replace(tmp, target)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            print(f"updated: {p}")
+
+
+def _ssh_delete_not_supported() -> int:
+    err("error: Delete File over SSH is not supported; use 'aimux file delete' instead")
+    return EXIT_USER_ERROR
 
 
 @file_app.command("mkdir", help="Create a remote directory (with parents).")

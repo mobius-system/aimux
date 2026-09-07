@@ -28,8 +28,11 @@ ls                          List all aimux sessions.
 new                         Create a new session.
 attach                      Attach to a session. ⚠️  Human use only — agents should use send-keys + capture.
 send-keys                   Send keys to a session. Behaves exactly like 'tmux send-keys': supports -F/-H/-K/-l/-M/-R/-X/-N <count>. Pass 'Enter' as a key to submit a line.     
-send_files                  Upload multiple local files or directories to an SSH host using sftp.
-get_files                   Download multiple remote files or directories from an SSH host using sftp.
+send-files                  Upload multiple local files or directories to an SSH host using sftp.
+get-files                   Download multiple remote files or directories from an SSH host using sftp.
+sync-dir                    Differentially synchronize a local directory with a bridge remote directory.
+read                        Read a remote file and print a metadata header followed by numbered content.
+apply-patch                 Apply a patch to create, edit, or delete files (absolute paths only).
 capture                     Capture pane output (last N lines).
 kill                        Destroy a single session. Does not accept wildcards or batch.
 wait-last-command-complete  Block until the pane's foreground process is back at a shell. Local sessions only.
@@ -74,16 +77,16 @@ aimux capture "local-8824/testsession" --lines 200
 3. Upload and download files.
 
 ```bash
-# aimux send_files REMOTE REMOTE_DIR LOCAL_PATH... [--gitignore]
-# aimux get_files REMOTE LOCAL_DIR REMOTE_PATH...
-aimux send_files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests
-aimux get_files local-8824 /home/fuqingxu/cc-workspace/aimux /tmp/upload
+# aimux send-files REMOTE REMOTE_DIR LOCAL_PATH... [--gitignore]
+# aimux get-files REMOTE LOCAL_DIR REMOTE_PATH...
+aimux send-files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests
+aimux get-files local-8824 /home/fuqingxu/cc-workspace/aimux /tmp/upload
 ```
 
 Use `--gitignore` on upload when ignored files should be skipped:
 
 ```bash
-aimux send_files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests --gitignore
+aimux send-files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests --gitignore
 ```
 
 4. Clean up.

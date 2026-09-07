@@ -62,12 +62,44 @@ def test_patch_multi_hunk_one_file(mcp, tmp_path):
     assert p.read_text() == "ONE\ntwo\nthree\nfour\nFIVE\n"
 
 
-def test_patch_relative_path_uses_workdir(mcp, tmp_path):
-    workdir = tmp_path
-    res = mcp.call(
-        "remote_apply_patch",
-        workdir=str(workdir),
-        input=_patch("*** Add File: rel/sub/child.txt\n+relative ok\n"),
+def test_patch_relative_path_rejected(mcp, tmp_path):
+    with pytest.raises(RuntimeError, match="must be absolute"):
+        mcp.call(
+            "remote_apply_patch",
+            workdir=str(tmp_path),  # even with workdir supplied, relative paths now refuse
+            input=_patch("*** Add File: rel/sub/child.txt\n+relative ok\n"),
+        )
+
+
+def test_read_pages_and_reports_metadata(mcp, tmp_path):
+    """The CLI `aimux read` command against the real bridge remote."""
+    import subprocess, json as _json
+
+    p = tmp_path / "readme.txt"
+    p.write_text("\n".join(f"line-{i}" for i in range(1, 31)) + "\n")
+    out = subprocess.run(
+        ["aimux", "read", "localbox", "--path", str(p), "--offset", "5", "--limit", "2", "--json"],
+        capture_output=True, text=True, timeout=60,
     )
-    assert res["applied"] == [f"added: {workdir / 'rel' / 'sub' / 'child.txt'}"], res
-    assert (workdir / "rel" / "sub" / "child.txt").read_text() == "relative ok"
+    assert out.returncode == 0, out.stderr
+    obj = _json.loads(out.stdout)
+    assert obj["total_lines"] == 30
+    assert obj["offset"] == 5 and obj["limit"] == 2
+    assert obj["truncated"] is True
+    assert obj["content"] == "5→line-5\n6→line-6"
+
+
+def test_cli_apply_patch_remote_flag(mcp, tmp_path):
+    """`aimux apply-patch --remote localbox` full round-trip over the bridge."""
+    import subprocess
+
+    p = tmp_path / "remote-target.txt"
+    p.write_text("before\n")
+    patch = f"*** Begin Patch\n*** Update File: {p}\n@@\n-before\n+after\n*** End Patch\n"
+    out = subprocess.run(
+        ["aimux", "apply-patch", "--remote", "localbox"],
+        input=patch, capture_output=True, text=True, timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert "updated:" in out.stdout
+    assert p.read_text() == "after\n"

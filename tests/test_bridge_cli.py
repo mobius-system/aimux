@@ -212,3 +212,23 @@ def test_kill_bridge_session_calls_bridge_client(monkeypatch):
 
     assert result.exit_code == EXIT_OK
     assert fake.killed == [{"remote": "winbox", "name": "task"}]
+
+
+def test_renamed_commands_have_hidden_underscore_aliases():
+    """send-files/get-files/sync-dir are primary; underscore spellings stay
+    invocable (hidden) for back-compat with older docs/agent muscle memory."""
+    CliRunner_mod = None
+    from typer.testing import CliRunner
+
+    import re
+
+    help_out = CliRunner().invoke(app, ["--help"]).output
+    assert "send-files" in help_out and "send_files" not in help_out
+    assert "get-files" in help_out and "get_files" not in help_out
+    assert "sync-dir" in help_out and "sync_dir" not in help_out
+
+    for alias in ("send_files", "get_files", "sync_dir"):
+        r = CliRunner().invoke(app, [alias])
+        # rc 2 = argument-usage error (command found), NOT "no such command"
+        assert r.exit_code == 2, (alias, r.output)
+        assert "No such command" not in r.output, (alias, r.output)

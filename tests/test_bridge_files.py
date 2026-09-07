@@ -871,7 +871,7 @@ def test_cli_send_files_dispatches_to_bridge(monkeypatch, tmp_path):
     local = tmp_path / "a.txt"
     local.write_text("hello")
 
-    result = CliRunner().invoke(app, ["send_files", "remote-1", "/remote/out", str(local)])
+    result = CliRunner().invoke(app, ["send-files", "remote-1", "/remote/out", str(local)])
 
     assert result.exit_code == EXIT_OK, result.output
     assert "uploaded 1 file(s) to bridge remote remote-1:/remote/out" in result.output
@@ -886,7 +886,7 @@ def test_cli_get_files_dispatches_to_bridge(monkeypatch, tmp_path):
     monkeypatch.setattr("aimux.cli.ssh_mod.host_exists", lambda name: False)
 
     dest = tmp_path / "downloads"
-    result = CliRunner().invoke(app, ["get_files", "remote-1", str(dest), "/remote/data.txt"])
+    result = CliRunner().invoke(app, ["get-files", "remote-1", str(dest), "/remote/data.txt"])
 
     assert result.exit_code == EXIT_OK, result.output
     assert "downloaded 1 path(s) from bridge remote remote-1" in result.output
@@ -907,7 +907,7 @@ def test_cli_sync_dir_dispatches_to_bridge(monkeypatch, tmp_path):
     result = CliRunner().invoke(
         app,
         [
-            "sync_dir",
+            "sync-dir",
             "--to-remote",
             "--exclude",
             "ignored.txt",
@@ -918,9 +918,9 @@ def test_cli_sync_dir_dispatches_to_bridge(monkeypatch, tmp_path):
     )
 
     assert result.exit_code == EXIT_OK, result.output
-    assert "sync_dir: scanning local source" in result.output
-    assert "sync_dir: plan 1 changed file(s), 0 delete(s), 1 new dir(s)" in result.output
-    assert "sync_dir: transferring archive" in result.output
+    assert "sync-dir: scanning local source" in result.output
+    assert "sync-dir: plan 1 changed file(s), 0 delete(s), 1 new dir(s)" in result.output
+    assert "sync-dir: transferring archive" in result.output
     assert "synced 1 file(s) to bridge remote remote-1:/remote/project" in result.output
     assert fake.remote_files["/remote/project/a.txt"] == b"hello"
     assert "/remote/project/ignored.txt" not in fake.remote_files
@@ -931,7 +931,7 @@ def test_cli_send_files_falls_through_to_ssh_error_when_no_bridge(monkeypatch, t
     monkeypatch.setattr("aimux.cli._bridge_remote", lambda name: (None, None))
     monkeypatch.setattr("aimux.cli.ssh_mod.host_exists", lambda name: False)
 
-    result = CliRunner().invoke(app, ["send_files", "unknown-remote", "/out", str(tmp_path / "x")])
+    result = CliRunner().invoke(app, ["send-files", "unknown-remote", "/out", str(tmp_path / "x")])
 
     assert result.exit_code == EXIT_USER_ERROR
     assert "not found in ~/.ssh/config or bridge registry" in result.output

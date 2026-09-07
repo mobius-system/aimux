@@ -1,6 +1,6 @@
 # aimux Bridge Server 兼容性规范 v0.1
 
-任何语言实现的 server，只要满足本规范，即可与现有 Python 客户端（`aimux reverse connect`）和 CLI（`aimux send-keys / capture / send_files / get_files` 等）互通。
+任何语言实现的 server，只要满足本规范，即可与现有 Python 客户端（`aimux reverse connect`）和 CLI（`aimux send-keys / capture / send-files / get-files` 等）互通。
 
 参考实现：`src/aimux/bridge_server.py`（Python，约 400 行，仅用标准库）。
 
@@ -408,8 +408,8 @@ CLI 用同一个 `aimux remote ls` 同时显示 SSH 和 bridge 远程。冲突�
 3. `aimux remote ls` 看到客户端
 4. `aimux new --remote X --profile Y --name Z` 创建 session，客户端收到 `session.create`
 5. `aimux send-keys X/Z -- echo hi Enter` → `aimux capture X/Z --lines=50` 拿到 "hi"
-6. `aimux send_files X /remote/path /local/file` → 字节精确
-7. `aimux get_files X /local/dir /remote/path` → 字节精确
+6. `aimux send-files X /remote/path /local/file` → 字节精确
+7. `aimux get-files X /local/dir /remote/path` → 字节精确
 8. `aimux kill X/Z`
 9. SIGTERM broker → runtime.json 被删除
 
