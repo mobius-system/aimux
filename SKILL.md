@@ -79,14 +79,14 @@ aimux capture "local-8824/testsession" --lines 200
 ```bash
 # aimux send-files REMOTE REMOTE_DIR LOCAL_PATH... [--gitignore]
 # aimux get-files REMOTE LOCAL_DIR REMOTE_PATH...
-aimux send-files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests
-aimux get-files local-8824 /home/fuqingxu/cc-workspace/aimux /tmp/upload
+aimux send-files local-8824 /tmp/upload ~/aimux-tests
+aimux get-files local-8824 ~/aimux /tmp/upload
 ```
 
 Use `--gitignore` on upload when ignored files should be skipped:
 
 ```bash
-aimux send-files local-8824 /tmp/upload /home/fuqingxu/cc-workspace/aimux/2fdacb03/tests --gitignore
+aimux send-files local-8824 /tmp/upload ~/aimux-tests --gitignore
 ```
 
 4. Clean up.

@@ -31,6 +31,19 @@ packages = ["src/aimux"]
 [tool.hatch.build.targets.wheel.force-include]
 "src/aimux/aimux.conf" = "aimux/aimux.conf"
 
+# The repo root hosts sibling git-worktree checkouts (agent sandboxes); an
+# unrestricted sdist would bundle them — including .git pointers with
+# absolute host paths. Restrict the sdist to the package + docs instead.
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src/aimux",
+    "README.md",
+    "SKILL.md",
+    "design.md",
+    "docs",
+    "tests",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

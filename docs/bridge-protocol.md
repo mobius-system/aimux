@@ -96,7 +96,7 @@
       "status": "attached",
       "client_status": "connected",
       "created_at": "...",
-      "created_by": "fuqingxu",
+      "created_by": "alice",
       "cmd": "cmd.exe",
       "cwd": "C:\\Users\\dev",
       "pid": 1234
@@ -215,7 +215,7 @@ endpoint 完成目标握手后进入双向流转发。
   "cmd": "cmd.exe",
   "cwd": "C:\\Users\\dev",
   "created_at": "2026-06-16T...",
-  "created_by": "fuqingxu",
+  "created_by": "alice",
   "timeout": 30
 }
 ```
