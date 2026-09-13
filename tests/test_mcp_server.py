@@ -92,6 +92,59 @@ def test_apply_hunks_rejects_missing_context():
         mcp_server._apply_hunks("a\nb\n", [{"lines": ["@@", "-missing", "+new"]}])
 
 
+def test_parse_rejects_missing_begin_marker():
+    # The exact "silent {}" failure: an op line without the Begin/End wrapper
+    # must raise a self-explanatory error, not parse to zero ops.
+    with pytest.raises(ValueError, match="Begin Patch"):
+        mcp_server._parse_codex_patch("*** Add File: patch_probe_rel.txt\nrelative path test\n")
+
+
+def test_parse_rejects_missing_end_marker():
+    with pytest.raises(ValueError, match="End Patch"):
+        mcp_server._parse_codex_patch("*** Begin Patch\n*** Add File: /x\n+hello\n")
+
+
+def test_parse_rejects_no_operations():
+    with pytest.raises(ValueError, match="no file operations"):
+        mcp_server._parse_codex_patch("*** Begin Patch\n*** End Patch\n")
+
+
+@pytest.mark.parametrize(
+    ("header", "message"),
+    [
+        ("*** Add File:", "missing a path"),
+        ("*** Update File:", "missing a path"),
+        ("*** Delete File", "malformed Delete File"),
+    ],
+)
+def test_parse_rejects_malformed_operation_headers(header, message):
+    with pytest.raises(ValueError, match=message):
+        mcp_server._parse_codex_patch(
+            f"*** Begin Patch\n{header}\n*** End Patch\n"
+        )
+
+
+def test_parse_rejects_update_without_hunk():
+    with pytest.raises(ValueError, match="contains no hunks"):
+        mcp_server._parse_codex_patch(
+            "*** Begin Patch\n*** Update File: /tmp/file\n-old\n+new\n*** End Patch\n"
+        )
+
+
+def test_parse_rejects_update_without_edits():
+    with pytest.raises(ValueError, match="contains no edits"):
+        mcp_server._parse_codex_patch(
+            "*** Begin Patch\n*** Update File: /tmp/file\n@@\n context\n*** End Patch\n"
+        )
+
+
+def test_parse_rejects_unknown_marker():
+    with pytest.raises(ValueError, match="unsupported patch marker"):
+        mcp_server._parse_codex_patch(
+            "*** Begin Patch\n*** Rename File: /tmp/file\n*** End Patch\n"
+        )
+
+
 # ---- tools ----
 
 def test_view_image(fake):
@@ -182,6 +235,16 @@ def test_apply_patch_relative_path_rejected(fake):
         )
 
 
+def test_apply_patch_bad_format_raises_not_silent_empty(fake):
+    # Regression guard: a malformed patch must surface as an error, never as a
+    # successful `{"applied": []}` that makes the agent think the tool is broken.
+    with pytest.raises(ValueError, match="Begin Patch"):
+        mcp_server._remote_apply_patch(
+            "r", "p",
+            {"input": "*** Add File: /cpfs01/user/x/patch_probe.txt\nrelative path test\n"},
+        )
+
+
 def test_apply_patch_windows_absolute_path_accepted(fake):
     result = mcp_server._remote_apply_patch(
         "r", "p",
@@ -227,6 +290,21 @@ def test_jsonrpc_unknown_tool(monkeypatch):
         "params": {"name": "nope", "arguments": {}},
     })
     assert sent[0]["error"]["code"] == -32601
+
+
+def test_jsonrpc_apply_patch_format_error_is_visible(monkeypatch, fake):
+    sent = []
+    monkeypatch.setattr(mcp_server, "_send", lambda obj: sent.append(obj))
+    mcp_server._dispatch("rem", "prof", {
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {
+            "name": "remote_apply_patch",
+            "arguments": {"input": "*** Add File: /tmp/file\nhello\n"},
+        },
+    })
+    result = sent[0]["result"]
+    assert result["isError"] is True
+    assert "Begin Patch" in result["content"][0]["text"]
 
 
 def test_jsonrpc_initialized_notification_no_response(monkeypatch):

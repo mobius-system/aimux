@@ -510,12 +510,23 @@ def _parse_codex_patch(text: str) -> list:
     Supports ``*** Add File``, ``*** Update File``, ``*** Delete File``.
     Update hunks: ``@@`` is a hunk delimiter (not content); ``+`` add,
     ``-`` remove, any other line is context.
+
+    Raises ``ValueError`` with a self-explanatory message when the input is
+    not a well-formed patch (missing ``*** Begin Patch`` / ``*** End Patch``
+    markers, or no recognizable file operations) instead of silently returning
+    ``[]`` — an empty result made callers conclude the tool was broken rather
+    than that their patch format was wrong.
     """
     ops = []
     lines = text.splitlines()
     i, n = 0, len(lines)
     while i < n and not lines[i].startswith("*** Begin Patch"):
         i += 1
+    if i >= n:
+        raise ValueError(
+            "patch is missing the '*** Begin Patch' marker; wrap the whole patch as:\n"
+            "*** Begin Patch\n*** Update File: /abs/path/file.py\n@@ ...\n-old\n+new\n*** End Patch"
+        )
     i += 1
 
     cur = None
@@ -534,9 +545,38 @@ def _parse_codex_patch(text: str) -> list:
         if cur is None:
             return
         flush_block()
+        path = cur.get("path", "")
+        if not path:
+            raise ValueError(
+                f"{cur['kind'].capitalize()} File operation is missing a path; "
+                f"use '*** {cur['kind'].capitalize()} File: /absolute/path'"
+            )
         if cur["kind"] == "add":
             cur["content"] = "\n".join(cur_add_lines)
         elif cur["kind"] == "update":
+            if not cur_hunks:
+                raise ValueError(
+                    f"Update File {path!r} contains no hunks; add an '@@' hunk "
+                    "with '-' removals and/or '+' additions"
+                )
+            if not any(
+                line.startswith("@@")
+                for hunk in cur_hunks
+                for line in hunk["lines"]
+            ):
+                raise ValueError(
+                    f"Update File {path!r} contains no hunks; each edit block must start with '@@'"
+                )
+            if not any(
+                line.startswith(("+", "-"))
+                for hunk in cur_hunks
+                for line in hunk["lines"]
+                if not line.startswith("@@")
+            ):
+                raise ValueError(
+                    f"Update File {path!r} contains no edits; each '@@' hunk "
+                    "needs at least one '-' removal or '+' addition"
+                )
             cur["hunks"] = list(cur_hunks)
         ops.append(cur)
         cur = None
@@ -544,25 +584,36 @@ def _parse_codex_patch(text: str) -> list:
         cur_hunks = []
         cur_block = []
 
+    found_end = False
     while i < n:
         line = lines[i]
         if line.startswith("*** End Patch"):
+            found_end = True
             flush_op()
             break
-        if line.startswith("*** Add File: "):
+        if line.startswith("*** Add File"):
+            if not line.startswith("*** Add File:"):
+                raise ValueError("malformed Add File operation; expected '*** Add File: /absolute/path'")
             flush_op()
-            cur = {"kind": "add", "path": line[len("*** Add File: "):].strip()}
+            cur = {"kind": "add", "path": line[len("*** Add File:"):].strip()}
             cur_add_lines = []
-        elif line.startswith("*** Update File: "):
+        elif line.startswith("*** Update File"):
+            if not line.startswith("*** Update File:"):
+                raise ValueError("malformed Update File operation; expected '*** Update File: /absolute/path'")
             flush_op()
-            cur = {"kind": "update", "path": line[len("*** Update File: "):].strip()}
+            cur = {"kind": "update", "path": line[len("*** Update File:"):].strip()}
             cur_hunks = []
             cur_block = []
-        elif line.startswith("*** Delete File: "):
+        elif line.startswith("*** Delete File"):
+            if not line.startswith("*** Delete File:"):
+                raise ValueError("malformed Delete File operation; expected '*** Delete File: /absolute/path'")
             flush_op()
-            cur = {"kind": "delete", "path": line[len("*** Delete File: "):].strip()}
+            cur = {"kind": "delete", "path": line[len("*** Delete File:"):].strip()}
         elif line.startswith("*** "):
-            pass  # ignore other markers (e.g. End of File)
+            if line.strip() != "*** End of File":
+                raise ValueError(
+                    f"unsupported patch marker {line!r}; expected Add/Update/Delete File or '*** End of File'"
+                )
         elif cur is None:
             pass
         elif cur["kind"] == "add":
@@ -577,6 +628,14 @@ def _parse_codex_patch(text: str) -> list:
                 cur_block.append(" " + line)
         i += 1
     flush_op()
+    if not found_end:
+        raise ValueError("patch is missing the '*** End Patch' marker (truncated input?)")
+    if not ops:
+        raise ValueError(
+            "patch contains no file operations; expected at least one "
+            "'*** Add File: <path>' / '*** Update File: <path>' / "
+            "'*** Delete File: <path>' line between the Begin/End markers"
+        )
     return ops
 
 
