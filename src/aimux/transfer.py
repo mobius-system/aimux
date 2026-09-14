@@ -721,6 +721,10 @@ _validate_sftp_path = validate_transfer_path
 # well below this; anything larger should use sync_dir/chunking instead.
 DEFAULT_BRIDGE_MAX_FILE_SIZE = 1024 * 1024 * 1024
 DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE = 1024 * 1024 * 1024
+# Files at or above this size download over the remote's independent streaming
+# data connection (raw 1 MiB chunks) instead of one base64 JSON message, so a
+# large file never OOMs the remote nor trips the control-path timeouts.
+STREAM_THRESHOLD = 1024 * 1024
 SyncProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
@@ -755,14 +759,17 @@ def bridge_send_files(
             raise TransferError(
                 f"file exceeds bridge size limit ({len(data)} > {max_file_size} bytes): {entry.local}"
             )
-        content_b64 = base64.b64encode(data).decode("ascii")
-        client.file_write(
-            remote=remote,
-            path=entry.remote,
-            content_b64=content_b64,
-            mode=0o644,
-            max_size=max_file_size,
-        )
+        if len(data) >= STREAM_THRESHOLD:
+            client.file_write_stream(remote=remote, path=entry.remote, data=data)
+        else:
+            content_b64 = base64.b64encode(data).decode("ascii")
+            client.file_write(
+                remote=remote,
+                path=entry.remote,
+                content_b64=content_b64,
+                mode=0o644,
+                max_size=max_file_size,
+            )
     return SendFilesResult(
         plan=plan,
         uploaded_files=len(plan.files),
@@ -1421,12 +1428,15 @@ def _bridge_download_one(
         raise TransferError(
             f"file exceeds bridge size limit ({size} > {max_file_size} bytes): {remote_path}"
         )
-    response = client.file_read(remote=remote, path=remote_path)
-    content_b64 = str(response.get("content_b64") or "")
-    try:
-        data = base64.b64decode(content_b64, validate=True)
-    except (ValueError, base64.binascii.Error) as e:
-        raise TransferError(f"invalid base64 from bridge for {remote_path!r}: {e}")
+    if size >= STREAM_THRESHOLD:
+        data = client.file_read_stream(remote=remote, path=remote_path)
+    else:
+        response = client.file_read(remote=remote, path=remote_path)
+        content_b64 = str(response.get("content_b64") or "")
+        try:
+            data = base64.b64decode(content_b64, validate=True)
+        except (ValueError, base64.binascii.Error) as e:
+            raise TransferError(f"invalid base64 from bridge for {remote_path!r}: {e}")
     if len(data) > max_file_size:
         raise TransferError(
             f"file exceeds bridge size limit ({len(data)} > {max_file_size} bytes): {remote_path}"

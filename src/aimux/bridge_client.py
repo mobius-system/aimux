@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 import hashlib
+import http.client
 import json
 import locale
 import os
@@ -40,6 +41,10 @@ from .transfer import (
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _STREAM_EOF = object()
 BRIDGE_CLIENT_HEARTBEAT_INTERVAL = 180.0
+# Streaming file uploads are read/sent in 1 MiB chunks so the reverse client
+# never holds a whole file in memory while it uploads over its own outbound
+# data connection.
+STREAM_CHUNK_SIZE = 1024 * 1024
 
 # Backoff schedule used when /client/register returns 409 Conflict (a stale
 # server-side record for the same identifier) or the broker is temporarily
@@ -1099,6 +1104,15 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
     request_id = str(event.get("id") or "")
     message_type = str(event.get("type") or "")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    # Streaming file operations run on their own outbound data connection in a
+    # separate thread so they never block the control loop (which must keep
+    # servicing session.send-keys / capture / other commands mid-transfer).
+    if message_type == "file.open_read":
+        _handle_open_read(runtime, base, token, request_id, payload)
+        return
+    if message_type == "file.open_write":
+        _handle_open_write(runtime, base, token, request_id, payload)
+        return
     if _is_logged_bridge_command(message_type):
         logger.info(
             "bridge client received command identifier={} request_id={} type={} details={}",
@@ -1146,6 +1160,148 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
             message_type,
         )
     _post_json(f"{base}/client/result", token, response_payload)
+
+
+def _stream_file_upload(base: str, token: str, request_id: str, path: Path, runtime: ReverseClientRuntime) -> None:
+    """Stream a local file up to the broker over the remote's own outbound data
+    connection (``POST /client/data``) in 1 MiB chunks. Runs on a dedicated
+    thread so the control loop stays free. On failure, reports the error via
+    ``/client/result`` so the broker's read-stream handler can surface it."""
+    conn: http.client.HTTPConnection | None = None
+    try:
+        parsed = urllib.parse.urlsplit(base)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=None)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=None)
+        size = path.stat().st_size
+        conn.putrequest("POST", f"/client/data?id={urllib.parse.quote(request_id)}")
+        conn.putheader("Authorization", f"Bearer {token}")
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.putheader("Content-Length", str(size))
+        conn.endheaders()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        response = conn.getresponse()
+        response.read()
+        logger.info(
+            "bridge client streamed file identifier={} request_id={} size={}",
+            runtime.identifier,
+            request_id,
+            size,
+        )
+    except Exception as exc:  # pragma: no cover - network path
+        logger.exception("bridge client file stream failed identifier={} request_id={}", runtime.identifier, request_id)
+        _post_json(
+            f"{base}/client/result",
+            token,
+            {"id": request_id, "ok": False, "error": {"kind": "client_error", "message": str(exc), "code": 1}},
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_open_read(runtime: ReverseClientRuntime, base: str, token: str, request_id: str, payload: dict[str, Any]) -> None:
+    """Handle ``file.open_read``: validate the path, then stream it up on a
+    separate thread. Validation errors are reported synchronously via
+    ``/client/result``; success hands off to the data-connection thread."""
+    try:
+        path = runtime._file_path(payload)
+        if not path.is_file():
+            raise BridgeError(f"not a regular file: {path}", kind="not_found")
+    except BridgeError as exc:
+        _post_json(
+            f"{base}/client/result",
+            token,
+            {"id": request_id, "ok": False, "error": {"kind": exc.kind, "message": exc.message, "code": exc.exit_code}},
+        )
+        return
+    threading.Thread(
+        target=_stream_file_upload,
+        args=(base, token, request_id, path, runtime),
+        daemon=True,
+    ).start()
+
+
+def _stream_file_download(base: str, token: str, request_id: str, path: Path, runtime: ReverseClientRuntime) -> None:
+    """Pull a file down from the broker over the remote's own outbound data
+    connection (``GET /client/data``) in 1 MiB chunks, writing to disk as it
+    arrives. Reports the write result via ``/client/result`` when done."""
+    conn: http.client.HTTPConnection | None = None
+    try:
+        parsed = urllib.parse.urlsplit(base)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=None)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=None)
+        conn.putrequest("GET", f"/client/data?id={urllib.parse.quote(request_id)}")
+        conn.putheader("Authorization", f"Bearer {token}")
+        conn.putheader("Accept", "application/octet-stream")
+        conn.endheaders()
+        response = conn.getresponse()
+        if response.status != 200:
+            body = response.read().decode("utf-8", errors="replace")
+            raise BridgeError(f"data stream error {response.status}: {body}", kind="remote_disconnected")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        size = 0
+        with open(path, "wb") as handle:
+            while True:
+                chunk = response.read(STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                size += len(chunk)
+        _post_json(f"{base}/client/result", token, {"id": request_id, "ok": True, "payload": {"size": size}})
+        logger.info(
+            "bridge client received file identifier={} request_id={} size={}",
+            runtime.identifier,
+            request_id,
+            size,
+        )
+    except Exception as exc:  # pragma: no cover - network path
+        logger.exception("bridge client file download failed identifier={} request_id={}", runtime.identifier, request_id)
+        _post_json(
+            f"{base}/client/result",
+            token,
+            {"id": request_id, "ok": False, "error": {"kind": "client_error", "message": str(exc), "code": 1}},
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _handle_open_write(runtime: ReverseClientRuntime, base: str, token: str, request_id: str, payload: dict[str, Any]) -> None:
+    """Handle ``file.open_write``: validate the path, then pull the file on a
+    separate thread. Validation errors are reported synchronously."""
+    try:
+        path = runtime._file_path(payload)
+    except BridgeError as exc:
+        _post_json(
+            f"{base}/client/result",
+            token,
+            {"id": request_id, "ok": False, "error": {"kind": exc.kind, "message": exc.message, "code": exc.exit_code}},
+        )
+        return
+    threading.Thread(
+        target=_stream_file_download,
+        args=(base, token, request_id, path, runtime),
+        daemon=True,
+    ).start()
 
 
 def _serve_event_stream(

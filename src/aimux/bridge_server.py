@@ -36,6 +36,14 @@ from .bridge import (
 
 BRIDGE_SERVER_HEARTBEAT_LOG_INTERVAL = 180.0
 
+# Streaming file transfer: chunks relayed between the CLI and the remote's
+# independent data connection are bounded to 1 MiB so neither side ever holds
+# a whole file in memory, and the reverse control SSE is never head-of-line
+# blocked by bulk data.
+STREAM_CHUNK_SIZE = 1024 * 1024
+STREAM_OPEN_TIMEOUT = 60.0  # remote must open its data connection within this
+STREAM_IDLE_TIMEOUT = 60.0  # max gap between chunks before we give up
+
 # TCP keepalive tuning so the broker detects half-open reverse clients
 # (Windows sleep / VPN switch / network drop) within tens of seconds instead
 # of waiting for the kernel retransmit timeout (~minutes). The 15s SSE
@@ -105,6 +113,11 @@ class BridgeBrokerState:
         self.clients: dict[str, ClientInfo] = {}
         self.sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self.pending: dict[str, PendingRequest] = {}
+        # request_id -> (data_q, ready_event, result_q). data_q carries chunks
+        # (bytes | None EOF | dict error); ready_event (write only) is set by the
+        # remote's GET /client/data; result_q (write only) carries the remote's
+        # write outcome so it never races the data chunks on data_q.
+        self._streams: dict[str, tuple[queue.Queue, threading.Event | None, queue.Queue | None]] = {}
         self.lock = threading.RLock()
 
     def register_client(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -317,12 +330,27 @@ class BridgeBrokerState:
         request_id = str(payload.get("id") or "")
         with self.lock:
             pending = self.pending.pop(request_id, None)
+            stream = self._streams.get(request_id)
         if pending is not None:
             pending.result = payload
             pending.event.set()
             logger.info("bridge broker received result request_id={} ok={}", request_id, bool(payload.get("ok")))
-        else:
-            logger.warning("bridge broker received result for unknown request_id={}", request_id)
+            return
+        if stream is not None:
+            # A streaming request reports its outcome here. Reads report only
+            # failures (their success is the byte stream itself) — forwarded on
+            # the data queue. Writes report both success and failure on a
+            # dedicated result queue, which the write-stream handler awaits
+            # without racing the data chunks.
+            q, _ready, result_q = stream
+            (result_q if result_q is not None else q).put(payload)
+            logger.info(
+                "bridge broker received stream result request_id={} ok={}",
+                request_id,
+                bool(payload.get("ok")),
+            )
+            return
+        logger.warning("bridge broker received result for unknown request_id={}", request_id)
 
     def _fail_pending_locked(self, remote: str, *, reason: str) -> int:
         failed = 0
@@ -427,6 +455,74 @@ class BridgeBrokerState:
             raise BridgeError(f"unknown file action {action!r}", kind="bad_request")
         return self.submit(remote, f"file.{action}", payload, timeout)
 
+    # -- streaming file transfer (independent data connection) ----------------
+
+    def open_read_stream(self, remote: str, path: str) -> tuple[str, queue.Queue]:
+        """Ask the remote to open a data connection and stream a file to us.
+
+        Returns ``(request_id, q)`` where ``q`` receives ``bytes`` chunks, a
+        ``None`` EOF sentinel, or a ``dict`` error payload. Fire-and-forget on
+        the control SSE: the remote streams over its own outbound connection
+        so bulk data never blocks the control channel.
+        """
+        with self.lock:
+            client = self.clients.get(remote)
+            if client is None:
+                raise BridgeError(f"bridge remote {remote!r} not found", kind="not_found")
+            if not client.connected or client.queue is None:
+                raise BridgeError(f"bridge remote {remote!r} is disconnected", kind="remote_disconnected", exit_code=2)
+            request_id = str(uuid.uuid4())
+            q: queue.Queue = queue.Queue()
+            self._streams[request_id] = (q, None, None)
+            client.queue.put({"id": request_id, "type": "file.open_read", "payload": {"path": path}})
+            logger.info(
+                "bridge broker opened read stream remote={!r} request_id={} path={!r}",
+                remote,
+                request_id,
+                path,
+            )
+        return request_id, q
+
+    def open_write_stream(self, remote: str, path: str, size: int) -> tuple[str, queue.Queue, threading.Event, queue.Queue]:
+        """Ask the remote to open a data connection and pull a file we will send.
+
+        Mirrors ``open_read_stream`` but for the send (broker->remote) direction:
+        the remote opens a ``GET /client/data``, signals readiness via an event,
+        then consumes chunks we relay from the CLI's upload body. The write
+        outcome is delivered on a separate result queue so it never races the
+        data chunks.
+        """
+        with self.lock:
+            client = self.clients.get(remote)
+            if client is None:
+                raise BridgeError(f"bridge remote {remote!r} not found", kind="not_found")
+            if not client.connected or client.queue is None:
+                raise BridgeError(f"bridge remote {remote!r} is disconnected", kind="remote_disconnected", exit_code=2)
+            request_id = str(uuid.uuid4())
+            q: queue.Queue = queue.Queue()
+            ready = threading.Event()
+            result_q: queue.Queue = queue.Queue()
+            self._streams[request_id] = (q, ready, result_q)
+            client.queue.put(
+                {"id": request_id, "type": "file.open_write", "payload": {"path": path, "size": size}}
+            )
+            logger.info(
+                "bridge broker opened write stream remote={!r} request_id={} path={!r} size={}",
+                remote,
+                request_id,
+                path,
+                size,
+            )
+        return request_id, q, ready, result_q
+
+    def get_stream(self, request_id: str) -> tuple[queue.Queue, threading.Event | None, queue.Queue | None] | None:
+        with self.lock:
+            return self._streams.get(request_id)
+
+    def close_stream(self, request_id: str) -> None:
+        with self.lock:
+            self._streams.pop(request_id, None)
+
 
 def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -467,6 +563,12 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     identifier = (query.get("identifier") or [""])[0]
                     self._events(identifier)
                     return
+                if parsed.path == "/client/data":
+                    self._require_auth()
+                    query = urllib.parse.parse_qs(parsed.query)
+                    request_id = (query.get("id") or [""])[0]
+                    self._data_download(request_id)
+                    return
                 self._json(HTTPStatus.NOT_FOUND, {"error": {"kind": "not_found", "message": "not found"}})
             except BridgeError as e:
                 self._bridge_error(e)
@@ -477,6 +579,20 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == port_forward.FORWARD_PATH:
                     self._require_auth()
                     port_forward.handle_bridge_forward(self)
+                    return
+                if parsed.path == "/client/data":
+                    self._require_auth()
+                    query = urllib.parse.parse_qs(parsed.query)
+                    request_id = (query.get("id") or [""])[0]
+                    self._data_upload(request_id)
+                    return
+                parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/")]
+                if len(parts) == 5 and parts[:2] == ["api", "remotes"] and parts[3] == "files" and parts[4] == "write-stream":
+                    self._require_auth()
+                    query = urllib.parse.parse_qs(parsed.query)
+                    remote = parts[2]
+                    path = (query.get("path") or [""])[0]
+                    self._write_stream(remote, path)
                     return
                 payload = self._read_json()
                 if parsed.path == "/client/register":
@@ -512,6 +628,9 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     self._require_auth()
                     remote, action = parts[2], parts[4]
                     timeout = float(payload.pop("timeout", 60) or 60)
+                    if action == "read-stream":
+                        self._read_stream(remote, payload)
+                        return
                     self._json(HTTPStatus.OK, state.file_op(remote, action, payload, timeout))
                     return
                 self._json(HTTPStatus.NOT_FOUND, {"error": {"kind": "not_found", "message": "not found"}})
@@ -607,6 +726,172 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                 pass
             finally:
                 state.disconnect_events(identifier, q)
+
+        def _data_upload(self, request_id: str) -> None:
+            """Relay the remote's raw /client/data body into the waiting CLI stream.
+
+            Reads the request body in 1 MiB chunks and pushes each onto the
+            stream queue; ``None`` marks EOF, a ``dict`` marks a mid-stream
+            failure. Runs in its own handler thread (ThreadingHTTPServer), so
+            bulk data never stalls the control SSE handler for this remote.
+            """
+            stream = state.get_stream(request_id)
+            if stream is None:
+                raise BridgeError(f"unknown data stream {request_id!r}", kind="not_found")
+            q = stream[0]
+            length = int(self.headers.get("Content-Length") or 0)
+            remaining = length if length > 0 else None
+            try:
+                while True:
+                    if remaining is not None and remaining <= 0:
+                        break
+                    read_size = STREAM_CHUNK_SIZE
+                    if remaining is not None:
+                        read_size = min(read_size, remaining)
+                    chunk = self.rfile.read(read_size)
+                    if not chunk:
+                        break
+                    if remaining is not None:
+                        remaining -= len(chunk)
+                    q.put(chunk)
+                q.put(None)
+            except (BrokenPipeError, ConnectionError, OSError) as exc:
+                q.put({"error": {"kind": "remote_disconnected", "message": str(exc), "code": 2}})
+            finally:
+                state.close_stream(request_id)
+            self._json(HTTPStatus.OK, {"ok": True})
+
+        def _read_stream(self, remote: str, payload: dict[str, Any]) -> None:
+            """Stream a file read back to the CLI as application/octet-stream.
+
+            Fire-and-forget on the control SSE; waits for the remote's
+            independent data connection, then relays its chunks verbatim using
+            chunked transfer-encoding (size is not known up front).
+            """
+            path = str(payload.get("path") or "")
+            if not path:
+                raise BridgeError("path is required", kind="bad_request")
+            request_id, q = state.open_read_stream(remote, path)
+            try:
+                item = q.get(timeout=STREAM_OPEN_TIMEOUT)
+            except queue.Empty:
+                state.close_stream(request_id)
+                raise BridgeError(
+                    f"bridge remote {remote!r} did not open its data stream in time",
+                    kind="timeout",
+                    exit_code=124,
+                )
+            if isinstance(item, dict):
+                state.close_stream(request_id)
+                error = item.get("error") if isinstance(item.get("error"), dict) else {}
+                raise BridgeError(
+                    str(error.get("message") or "remote failed to open the data stream"),
+                    kind=str(error.get("kind") or "client_error"),
+                    exit_code=int(error.get("code") or 1),
+                )
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self._aimux_response_started = True
+            try:
+                while item is not None:
+                    if isinstance(item, dict):
+                        break  # mid-stream failure: end the chunked body early
+                    data = bytes(item)
+                    if data:
+                        self.wfile.write(f"{len(data):X}\r\n".encode("ascii") + data + b"\r\n")
+                    try:
+                        item = q.get(timeout=STREAM_IDLE_TIMEOUT)
+                    except queue.Empty:
+                        break
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            finally:
+                state.close_stream(request_id)
+
+        def _data_download(self, request_id: str) -> None:
+            """Relay chunks queued by the CLI's write-stream request into the
+            remote's ``GET /client/data`` response. Signals readiness first, so
+            the write-stream handler only starts reading the CLI body once the
+            remote is actually connected (no eager buffering)."""
+            stream = state.get_stream(request_id)
+            if stream is None:
+                raise BridgeError(f"unknown data stream {request_id!r}", kind="not_found")
+            q, ready, _result_q = stream
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self._aimux_response_started = True
+            if ready is not None:
+                ready.set()
+            try:
+                while True:
+                    item = q.get(timeout=STREAM_IDLE_TIMEOUT)
+                    if item is None:
+                        break
+                    if isinstance(item, dict):
+                        break  # error: end the chunked body early
+                    data = bytes(item)
+                    if data:
+                        self.wfile.write(f"{len(data):X}\r\n".encode("ascii") + data + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except queue.Empty:
+                pass
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+
+        def _write_stream(self, remote: str, path: str) -> None:
+            """Stream a CLI file upload through to the remote's data connection.
+
+            Waits for the remote to open its ``GET /client/data``, relays the
+            CLI request body chunk-by-chunk, then waits for the remote's write
+            result before answering the CLI.
+            """
+            if not path:
+                raise BridgeError("path is required", kind="bad_request")
+            length = int(self.headers.get("Content-Length") or 0)
+            request_id, q, ready, result_q = state.open_write_stream(remote, path, length)
+            if not ready.wait(timeout=STREAM_OPEN_TIMEOUT):
+                state.close_stream(request_id)
+                raise BridgeError(
+                    f"bridge remote {remote!r} did not open its data stream in time",
+                    kind="timeout",
+                    exit_code=124,
+                )
+            remaining = length
+            try:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(STREAM_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    q.put(chunk)
+                q.put(None)
+            except (BrokenPipeError, ConnectionError, OSError) as exc:
+                q.put({"error": {"kind": "remote_disconnected", "message": str(exc), "code": 2}})
+            try:
+                result = result_q.get(timeout=STREAM_IDLE_TIMEOUT)
+            except queue.Empty:
+                state.close_stream(request_id)
+                raise BridgeError(f"bridge remote {remote!r} did not report write result in time", kind="timeout", exit_code=124)
+            finally:
+                state.close_stream(request_id)
+            if isinstance(result, dict):
+                if not result.get("ok"):
+                    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+                    raise BridgeError(
+                        str(error.get("message") or "remote write failed"),
+                        kind=str(error.get("kind") or "client_error"),
+                        exit_code=int(error.get("code") or 1),
+                    )
+            self._json(HTTPStatus.OK, {"ok": True, "size": length})
 
         def _bridge_error(self, e: BridgeError) -> None:
             status = HTTPStatus.BAD_REQUEST

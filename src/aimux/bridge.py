@@ -191,6 +191,46 @@ def _request_json(
         raise BridgeError(f"bridge broker returned invalid JSON: {e}")
 
 
+def _request_bytes(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 180.0,
+) -> bytes:
+    """Like ``_request_json`` but returns the raw response body (used by the
+    streaming file-read endpoint, whose response is ``application/octet-stream``
+    rather than JSON). Shares the same error decoding as ``_request_json``."""
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/octet-stream")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        payload_obj = _decode_error(raw)
+        msg = payload_obj.get("message") or payload_obj.get("error") or raw or e.reason
+        kind = str(payload_obj.get("kind") or "bridge_error")
+        try:
+            code = int(payload_obj.get("code") or 1)
+        except (TypeError, ValueError):
+            code = 1
+        if e.code in (401, 403):
+            raise BridgeAuthError(str(msg))
+        if e.code == 504 or code == 124:
+            raise BridgeTimeoutError(str(msg))
+        raise BridgeError(str(msg), kind=kind, exit_code=code)
+    except urllib.error.URLError as e:
+        raise BridgeUnreachableError(f"bridge broker is unreachable: {e.reason}")
+    except TimeoutError:
+        raise BridgeTimeoutError("bridge broker request timed out")
+
+
 def _decode_error(raw: str) -> dict[str, Any]:
     try:
         data = json.loads(raw)
@@ -325,6 +365,59 @@ class BridgeControlClient:
             {"path": path},
             timeout=timeout,
         )
+
+    def file_read_stream(self, *, remote: str, path: str, timeout: float = 180.0) -> bytes:
+        """Read a file's raw bytes over the remote's independent data connection.
+
+        Unlike ``file_read`` (which base64-encodes the whole file in one JSON
+        message), this streams raw bytes in 1 MiB chunks, bounding memory on
+        both sides. Returns the full contents as ``bytes``.
+        """
+        return _request_bytes(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/read-stream",
+            self.runtime.token,
+            {"path": path},
+            timeout=timeout,
+        )
+
+    def file_write_stream(self, *, remote: str, path: str, data: bytes, timeout: float = 180.0) -> dict[str, Any]:
+        """Write raw bytes to a remote file over the remote's independent data
+        connection (raw 1 MiB chunks, no base64). Returns the broker's JSON
+        result ``{"ok": True, "size": ...}``.
+        """
+        url = f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/write-stream?path={_quote(path)}"
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Authorization", f"Bearer {self.runtime.token}")
+        req.add_header("Content-Type", "application/octet-stream")
+        req.add_header("Content-Length", str(len(data)))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", errors="replace")
+            payload_obj = _decode_error(raw)
+            msg = payload_obj.get("message") or payload_obj.get("error") or raw or e.reason
+            kind = str(payload_obj.get("kind") or "bridge_error")
+            try:
+                code = int(payload_obj.get("code") or 1)
+            except (TypeError, ValueError):
+                code = 1
+            if e.code in (401, 403):
+                raise BridgeAuthError(str(msg))
+            if e.code == 504 or code == 124:
+                raise BridgeTimeoutError(str(msg))
+            raise BridgeError(str(msg), kind=kind, exit_code=code)
+        except urllib.error.URLError as e:
+            raise BridgeUnreachableError(f"bridge broker is unreachable: {e.reason}")
+        except TimeoutError:
+            raise BridgeTimeoutError("bridge broker request timed out")
+        if not raw.strip():
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise BridgeError(f"bridge broker returned invalid JSON: {e}")
 
     def file_write(
         self,
