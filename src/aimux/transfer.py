@@ -736,11 +736,13 @@ def bridge_send_files(
     *,
     gitignore: bool = False,
     max_file_size: int = DEFAULT_BRIDGE_MAX_FILE_SIZE,
+    progress: "bridge_mod.ProgressCallback | None" = None,
 ) -> SendFilesResult:
     """Upload local paths to a bridge remote via the file.write message family.
 
     Reuses the same planning logic as send_paths; the sftp batch is replaced by
-    per-file base64-encoded writes through the broker.
+    per-file base64-encoded writes through the broker. ``progress`` is called
+    with ``(done_bytes, total_bytes)`` per chunk for the current streaming file.
     """
     plan = build_send_files_plan(local_paths, remote_path, gitignore=gitignore)
     if not plan.has_work:
@@ -760,7 +762,7 @@ def bridge_send_files(
                 f"file exceeds bridge size limit ({len(data)} > {max_file_size} bytes): {entry.local}"
             )
         if len(data) >= STREAM_THRESHOLD:
-            client.file_write_stream(remote=remote, path=entry.remote, data=data)
+            client.file_write_stream(remote=remote, path=entry.remote, data=data, progress=progress)
         else:
             content_b64 = base64.b64encode(data).decode("ascii")
             client.file_write(
@@ -784,8 +786,13 @@ def bridge_get_files(
     local_dir: str | Path,
     *,
     max_file_size: int = DEFAULT_BRIDGE_MAX_FILE_SIZE,
+    progress: "bridge_mod.ProgressCallback | None" = None,
 ) -> GetFilesResult:
-    """Download remote paths from a bridge remote via the file.read message family."""
+    """Download remote paths from a bridge remote via the file.read message family.
+
+    ``progress`` is called with ``(done_bytes, total_bytes)`` per chunk for the
+    current streaming file (large files only).
+    """
     remotes = tuple(remote_paths)
     if not remotes:
         raise TransferError("get_files requires at least one remote path")
@@ -803,10 +810,10 @@ def bridge_get_files(
         stat = client.file_stat(remote=remote, path=remote_path)
         rtype = str(stat.get("type") or "none")
         if rtype == "dir":
-            _bridge_download_dir(client, remote, remote_path, destination, max_file_size, entries)
+            _bridge_download_dir(client, remote, remote_path, destination, max_file_size, entries, progress)
         elif rtype == "file":
             local_file = destination / _bridge_remote_basename(remote_path)
-            _bridge_download_one(client, remote, remote_path, local_file, int(stat.get("size") or 0), max_file_size)
+            _bridge_download_one(client, remote, remote_path, local_file, int(stat.get("size") or 0), max_file_size, progress)
             entries.append(DownloadEntry(remote=remote_path, local=local_file))
         else:
             raise TransferError(f"remote path does not exist: {remote_path}")
@@ -1393,6 +1400,7 @@ def _bridge_download_dir(
     destination: Path,
     max_file_size: int,
     entries: list[DownloadEntry],
+    progress: "bridge_mod.ProgressCallback | None" = None,
 ) -> None:
     base_name = _bridge_remote_basename(remote_root)
     listing = client.file_list(remote=remote, path=remote_root, recursive=True)
@@ -1412,7 +1420,7 @@ def _bridge_download_dir(
         local_file = destination / base_name / rel
         local_file.parent.mkdir(parents=True, exist_ok=True)
         size = int(item.get("size") or 0)
-        _bridge_download_one(client, remote, item_path, local_file, size, max_file_size)
+        _bridge_download_one(client, remote, item_path, local_file, size, max_file_size, progress)
         entries.append(DownloadEntry(remote=item_path, local=local_file))
 
 
@@ -1423,13 +1431,14 @@ def _bridge_download_one(
     local_file: Path,
     size: int,
     max_file_size: int,
+    progress: "bridge_mod.ProgressCallback | None" = None,
 ) -> None:
     if size and size > max_file_size:
         raise TransferError(
             f"file exceeds bridge size limit ({size} > {max_file_size} bytes): {remote_path}"
         )
     if size >= STREAM_THRESHOLD:
-        data = client.file_read_stream(remote=remote, path=remote_path)
+        data = client.file_read_stream(remote=remote, path=remote_path, progress=progress, total=size)
     else:
         response = client.file_read(remote=remote, path=remote_path)
         content_b64 = str(response.get("content_b64") or "")

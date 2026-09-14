@@ -81,3 +81,36 @@ def test_send_files_routes_large_file_through_stream(broker, tmp_path):
 
     out_file = remote_dir / "local_src.bin"
     assert out_file.read_bytes() == payload
+
+
+def test_stream_read_progress_callback(broker, tmp_path):
+    size = STREAM_THRESHOLD + (3 * 1024 * 1024)
+    payload = _big_bytes(size)
+    remote = tmp_path / "prog.bin"
+    remote.write_bytes(payload)
+
+    seen: list[tuple[int, int]] = []
+    data = broker.file_read_stream(
+        remote=REMOTE, path=str(remote),
+        progress=lambda d, t: seen.append((d, t)), total=size,
+    )
+    assert data == payload
+    assert seen and seen[-1] == (size, size)
+    assert all(t == size for _, t in seen)
+    assert all(seen[i][0] <= seen[i + 1][0] for i in range(len(seen) - 1))
+
+
+def test_stream_write_progress_callback(broker, tmp_path):
+    size = STREAM_THRESHOLD + (2 * 1024 * 1024)
+    payload = _big_bytes(size)
+    remote = tmp_path / "prog_up.bin"
+
+    seen: list[tuple[int, int]] = []
+    res = broker.file_write_stream(
+        remote=REMOTE, path=str(remote), data=payload,
+        progress=lambda d, t: seen.append((d, t)),
+    )
+    assert res.get("ok") is True
+    assert remote.read_bytes() == payload
+    assert seen and seen[-1] == (size, size)
+    assert all(t == size for _, t in seen)

@@ -8,7 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from typing import Annotated
 
@@ -417,7 +417,8 @@ def cmd_send_files(
     if bridge_client_ctl is not None and bridge_info is not None:
         try:
             result = transfer.bridge_send_files(
-                bridge_client_ctl, remote, local_paths, remote_path, gitignore=gitignore
+                bridge_client_ctl, remote, local_paths, remote_path, gitignore=gitignore,
+                progress=_stream_progress(),
             )
         except bridge.BridgeError as e:
             _exit_bridge_error(e)
@@ -457,7 +458,7 @@ def cmd_get_files(
     bridge_client_ctl, bridge_info = _bridge_remote(remote)
     if bridge_client_ctl is not None and bridge_info is not None:
         try:
-            result = transfer.bridge_get_files(bridge_client_ctl, remote, remote_paths, local_dir)
+            result = transfer.bridge_get_files(bridge_client_ctl, remote, remote_paths, local_dir, progress=_stream_progress())
         except bridge.BridgeError as e:
             _exit_bridge_error(e)
         except transfer.TransferError as e:
@@ -482,6 +483,43 @@ def cmd_get_files(
 
 
 # ---------- sync-dir ----------
+
+
+def _human_size(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.0f}{unit}" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{n}B"
+
+
+def _stream_progress() -> Callable[[int, int], None]:
+    """Return a progress callback that renders a single-line percentage bar.
+
+    Only re-renders when the whole-percent value changes (or on completion),
+    so a large multi-chunk transfer stays on one line.
+    """
+    last = [-1]
+
+    def _cb(done: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = int(done * 100 / total)
+        if pct == last[0] and done < total:
+            return
+        last[0] = pct
+        width = 20
+        filled = int(width * done / total)
+        bar = "#" * filled + "-" * (width - filled)
+        if done >= total:
+            sys.stdout.write(f"\r  {pct:3d}% [{bar}] {_human_size(done)}/{_human_size(total)}\n")
+        else:
+            sys.stdout.write(f"\r  {pct:3d}% [{bar}] {_human_size(done)}/{_human_size(total)}")
+        sys.stdout.flush()
+
+    return _cb
+
 
 def _sync_dir_progress(phase: str, payload: dict[str, object]) -> None:
     if phase == "scan_source":

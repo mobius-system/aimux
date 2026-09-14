@@ -1,6 +1,7 @@
 """Bridge runtime discovery and control-client helpers."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import socket
@@ -10,10 +11,15 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 RUNTIME_ENV = "AIMUX_BRIDGE_RUNTIME"
+# Streaming file transfers relay raw bytes in 1 MiB chunks; the chunk size also
+# sets the granularity of the progress callback.
+STREAM_CHUNK_SIZE = 1024 * 1024
+# progress(done_bytes, total_bytes)
+ProgressCallback = Callable[[int, int], None]
 RUNTIME_DIR_ENV = "AIMUX_RUNTIME_DIR"
 
 
@@ -198,10 +204,14 @@ def _request_bytes(
     payload: dict[str, Any] | None = None,
     *,
     timeout: float = 180.0,
+    progress: ProgressCallback | None = None,
+    total: int = 0,
 ) -> bytes:
     """Like ``_request_json`` but returns the raw response body (used by the
     streaming file-read endpoint, whose response is ``application/octet-stream``
-    rather than JSON). Shares the same error decoding as ``_request_json``."""
+    rather than JSON). Shares the same error decoding as ``_request_json``.
+    When ``progress`` is given, the response is read in 1 MiB chunks and the
+    callback is invoked with ``(done_bytes, total_bytes)`` after each chunk."""
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method=method)
     req.add_header("Authorization", f"Bearer {token}")
@@ -210,7 +220,18 @@ def _request_bytes(
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+            if progress is None:
+                return resp.read()
+            chunks: list[bytes] = []
+            done = 0
+            while True:
+                chunk = resp.read(STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                done += len(chunk)
+                progress(done, total)
+            return b"".join(chunks)
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace")
         payload_obj = _decode_error(raw)
@@ -366,12 +387,22 @@ class BridgeControlClient:
             timeout=timeout,
         )
 
-    def file_read_stream(self, *, remote: str, path: str, timeout: float = 180.0) -> bytes:
+    def file_read_stream(
+        self,
+        *,
+        remote: str,
+        path: str,
+        timeout: float = 180.0,
+        progress: ProgressCallback | None = None,
+        total: int = 0,
+    ) -> bytes:
         """Read a file's raw bytes over the remote's independent data connection.
 
         Unlike ``file_read`` (which base64-encodes the whole file in one JSON
         message), this streams raw bytes in 1 MiB chunks, bounding memory on
-        both sides. Returns the full contents as ``bytes``.
+        both sides. Returns the full contents as ``bytes``. ``progress`` is
+        called with ``(done_bytes, total_bytes)`` after each chunk; ``total``
+        is the expected size (from a prior ``file_stat``).
         """
         return _request_bytes(
             "POST",
@@ -379,45 +410,76 @@ class BridgeControlClient:
             self.runtime.token,
             {"path": path},
             timeout=timeout,
+            progress=progress,
+            total=total,
         )
 
-    def file_write_stream(self, *, remote: str, path: str, data: bytes, timeout: float = 180.0) -> dict[str, Any]:
+    def file_write_stream(
+        self,
+        *,
+        remote: str,
+        path: str,
+        data: bytes,
+        timeout: float = 180.0,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         """Write raw bytes to a remote file over the remote's independent data
         connection (raw 1 MiB chunks, no base64). Returns the broker's JSON
-        result ``{"ok": True, "size": ...}``.
+        result ``{"ok": True, "size": ...}``. ``progress`` is called with
+        ``(done_bytes, total_bytes)`` after each uploaded chunk.
         """
         url = f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/write-stream?path={_quote(path)}"
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("Authorization", f"Bearer {self.runtime.token}")
-        req.add_header("Content-Type", "application/octet-stream")
-        req.add_header("Content-Length", str(len(data)))
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path_part = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        conn = cls(host, port, timeout=timeout)
+        total = len(data)
+        view = memoryview(data)
+        status = 0
+        raw = ""
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="replace")
+            conn.putrequest("POST", path_part)
+            conn.putheader("Authorization", f"Bearer {self.runtime.token}")
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(total))
+            conn.endheaders()
+            done = 0
+            while done < total:
+                chunk = view[done:done + STREAM_CHUNK_SIZE]
+                if not chunk:
+                    break
+                conn.send(bytes(chunk))
+                done += len(chunk)
+                if progress is not None:
+                    progress(done, total)
+            response = conn.getresponse()
+            status = response.status
+            raw = response.read().decode("utf-8")
+        except (http.client.HTTPException, OSError) as exc:
+            raise BridgeUnreachableError(f"bridge broker is unreachable: {exc}") from exc
+        finally:
+            conn.close()
+        if status != 200:
             payload_obj = _decode_error(raw)
-            msg = payload_obj.get("message") or payload_obj.get("error") or raw or e.reason
+            msg = payload_obj.get("message") or payload_obj.get("error") or raw or "request failed"
             kind = str(payload_obj.get("kind") or "bridge_error")
             try:
                 code = int(payload_obj.get("code") or 1)
             except (TypeError, ValueError):
                 code = 1
-            if e.code in (401, 403):
+            if status in (401, 403):
                 raise BridgeAuthError(str(msg))
-            if e.code == 504 or code == 124:
+            if status == 504 or code == 124:
                 raise BridgeTimeoutError(str(msg))
             raise BridgeError(str(msg), kind=kind, exit_code=code)
-        except urllib.error.URLError as e:
-            raise BridgeUnreachableError(f"bridge broker is unreachable: {e.reason}")
-        except TimeoutError:
-            raise BridgeTimeoutError("bridge broker request timed out")
         if not raw.strip():
             return {}
         try:
             return json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise BridgeError(f"bridge broker returned invalid JSON: {e}")
+        except json.JSONDecodeError as exc:
+            raise BridgeError(f"bridge broker returned invalid JSON: {exc}")
 
     def file_write(
         self,
