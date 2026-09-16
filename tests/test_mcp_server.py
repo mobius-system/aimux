@@ -451,3 +451,28 @@ def test_exec_interactive_true_uses_pty_path(monkeypatch):
     keys = c.sent[0]["keys"]
     assert "echo __AIMUX_EXIT_" in keys[0]  # marker path, not a temp-file launch
     assert not keys[0].startswith("bash /tmp/incoming_command_")
+
+
+def test_apply_hunks_whitespace_mismatch_reports_specific_error():
+    # File has "# ---" at column 0; the patch context wrote " # ---" (one extra
+    # leading space). The error must name the whitespace mismatch, not just say
+    # "context not found".
+    orig = "# ---\ndef foo():\n    pass\n"
+    hunks = [{"lines": ["@@", "  # ---", "+x"]}]
+    with pytest.raises(ValueError) as exc:
+        mcp_server._apply_hunks(orig, hunks)
+    msg = str(exc.value)
+    assert "whitespace mismatch" in msg
+    assert "' # ---'" in msg  # the patch's (wrong) context line
+    assert "'# ---'" in msg   # the file's (correct) line
+
+
+def test_apply_hunks_skips_whitespace_diag_on_huge_file(monkeypatch):
+    # Above the size threshold the O(file) whitespace scan is skipped; the
+    # error falls back to the generic message.
+    monkeypatch.setattr(mcp_server, "_WS_DIAG_MAX_BYTES", 10)
+    orig = "# ---\n" + ("x" * 100) + "\n"  # > 10 bytes
+    hunks = [{"lines": ["@@", "  # ---", "+y"]}]
+    with pytest.raises(ValueError) as exc:
+        mcp_server._apply_hunks(orig, hunks)
+    assert str(exc.value) == "patch context not found"

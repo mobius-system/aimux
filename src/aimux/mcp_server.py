@@ -789,6 +789,41 @@ def _parse_codex_patch(text: str) -> list:
     return ops
 
 
+# Skip the whitespace-mismatch scan above this file size. The scan is O(file
+# bytes) and only runs on the failure path, so it is cheap for normal source
+# files (~10 ms for 10k lines), but on pathological multi-megabyte files the
+# extra pass isn't worth it just to polish an error message.
+_WS_DIAG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _describe_context_mismatch(text: str, search_lines: list[str]) -> str:
+    """Explain a 'context not found' failure.
+
+    The most common agent error is a leading/trailing whitespace slip when
+    copying a context line (e.g. the file has ``# ---`` at column 0 but the
+    patch wrote `` # ---``). Detect that case and name the exact line so the
+    agent can fix the indentation instead of guessing.
+    """
+    if len(text) > _WS_DIAG_MAX_BYTES:
+        return "patch context not found"
+    file_by_stripped: dict[str, str] = {}
+    for fl in text.splitlines():
+        s = fl.strip()
+        if s:
+            file_by_stripped.setdefault(s, fl)
+    for i, ctx in enumerate(search_lines):
+        s = ctx.strip()
+        if not s:
+            continue
+        if s in file_by_stripped and file_by_stripped[s] != ctx:
+            return (
+                f"patch context not found: whitespace mismatch on context line {i + 1}. "
+                f"Patch line: {ctx!r}; file line: {file_by_stripped[s]!r}. "
+                "Copy the context byte-for-byte (leading/trailing spaces count)."
+            )
+    return "patch context not found"
+
+
 def _apply_hunks(orig: str, hunks: list) -> str:
     """Apply codex-style hunks by building search/replace blocks per hunk."""
     text = orig
@@ -817,7 +852,7 @@ def _apply_hunks(orig: str, hunks: list) -> str:
         replace_str = "\n".join(replace)
         if search_str:
             if search_str not in text:
-                raise ValueError("patch context not found")
+                raise ValueError(_describe_context_mismatch(text, search))
             text = text.replace(search_str, replace_str, 1)
         elif replace_str:
             text = text.rstrip("\n") + "\n" + replace_str
@@ -872,8 +907,9 @@ TOOLS = [
             "Inside each `@@ ...` hunk, lines beginning with a single leading space are context (anchor — must match the file byte-for-byte, including blank lines and indentation); "
             "`-` lines are removed; `+` lines are inserted. "
             "Rules: (1) one edit site per `@@` hunk — never bundle multiple distant locations into one giant hunk; "
-            "(2) context lines must be copied verbatim from the file (a mismatch raises 'patch context not found'); "
-            "(3) prefer a few small hunks over one big one."
+            "(2) context lines are matched strictly — do not add or omit leading/trailing spaces (an extra or missing space raises 'patch context not found'); "
+            "(3) prefer a few small hunks over one big one. "
+            "remote_apply_patch uses strict matching — be careful not to add or omit any space."
         ),
         "inputSchema": {
             "type": "object",
