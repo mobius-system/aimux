@@ -1,5 +1,6 @@
 """Unit tests for aimux.mcp_server (stdio MCP server, codex-facing tools)."""
 import base64
+import re
 
 import pytest
 
@@ -312,3 +313,141 @@ def test_jsonrpc_initialized_notification_no_response(monkeypatch):
     monkeypatch.setattr(mcp_server, "_send", lambda obj: sent.append(obj))
     mcp_server._dispatch("rem", "prof", {"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert sent == []  # notifications get no response
+
+
+# ---- temp-file exec (POSIX) ----
+
+
+class ExecTempClient:
+    """Session ops + in-memory remote FS for the temp-file exec path."""
+
+    def __init__(self):
+        self.files: dict[str, bytes] = {}
+        self.writes: list[tuple[str, bytes]] = []
+        self.sent: list[list[str]] = []
+        self.killed: list[dict] = []
+
+    def create_session(self, **kw):
+        return {"ok": True}
+
+    def kill_session(self, **kw):
+        self.killed.append(kw)
+        return {"ok": True}
+
+    def send_keys(self, *, remote, name, keys, flags, timeout=30.0):
+        self.sent.append(list(keys))
+        # keys[0] is the launch line, keys[1:] is "Enter". Simulate the remote
+        # shell running it: exit 0, output = the command we wrote to the script.
+        launch = str(keys[0])
+        m = re.match(r"(\S+) (\S+) > (\S+) 2>&1; echo \$\? > (\S+)", launch)
+        assert m, f"unexpected launch line: {launch!r}"
+        _, script, out, code = m.groups()
+        self.files[code] = b"0"
+        self.files[out] = self.files.get(script, b"") + b"\n"
+        return {"ok": True}
+
+    def file_write(self, *, remote, path, content_b64, mode=None, max_size=None, timeout=180.0):
+        data = base64.b64decode(content_b64)
+        self.files[path] = data
+        self.writes.append((path, data))
+        return {"ok": True}
+
+    def file_stat(self, *, remote, path, timeout=60.0):
+        if path in self.files:
+            return {"exists": True, "type": "file", "size": len(self.files[path])}
+        return {"exists": False, "type": "none", "size": 0}
+
+    def file_read(self, *, remote, path, timeout=180.0):
+        return {"content_b64": base64.b64encode(self.files[path]).decode()}
+
+    def file_delete(self, *, remote, path, recursive=False, timeout=60.0):
+        self.files.pop(path, None)
+        return {"ok": True}
+
+
+def test_exec_temp_base_naming():
+    base = mcp_server._exec_temp_base()
+    assert re.match(r"^incoming_command_\d{8}_\d{6}_\d{6}$", base)
+
+
+def test_exec_temp_paths_same_base():
+    s, o, c = mcp_server._exec_temp_paths()
+    assert s.startswith("/tmp/incoming_command_") and s.endswith(".sh")
+    base = s[:-3]  # strip the .sh extension
+    assert o == base + ".out"
+    assert c == base + ".code"
+
+
+def test_exec_tempfile_writes_script_runs_and_cleans_up(monkeypatch):
+    c = ExecTempClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command(
+        "r", "posix-pty", {"cmd": "echo hello\npwd", "yield_time_ms": 1000}
+    )
+
+    assert r["exit_code"] == 0
+    assert r["output"] == "echo hello\npwd\n"
+    # command was written verbatim to the script file
+    assert any(path.endswith(".sh") and data == b"echo hello\npwd" for path, data in c.writes)
+    # launch line ran the script and redirected output + exit code
+    assert len(c.sent) == 1
+    assert c.sent[0][0].startswith("bash /tmp/incoming_command_")
+    # finished -> session killed + all three temp files cleaned up
+    assert c.killed
+    assert c.files == {}
+
+
+def test_exec_tempfile_still_running_returns_session_id(monkeypatch):
+    class StuckClient(ExecTempClient):
+        def send_keys(self, **kw):
+            self.sent.append(list(kw["keys"]))
+            return {"ok": True}
+
+    c = StuckClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command(
+        "r", "posix-pty", {"cmd": "sleep 100", "yield_time_ms": 300}
+    )
+
+    assert "session_id" in r
+    assert "exit_code" not in r  # still running -> no exit code yet
+    assert r["session_id"] in mcp_server._sessions  # retained for later poll
+
+
+def test_exec_windows_profile_still_uses_marker_path(monkeypatch):
+    # Windows keeps the PTY + exit-marker path for now: the command is sent via
+    # send_keys with an echo-marker suffix, NOT via a temp script.
+    c = ExecClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+    c.captures = [{"content": ""}]
+
+    mcp_server._remote_exec_command("r", "cmd", {"cmd": "dir", "yield_time_ms": 250})
+
+    assert c.sent
+    keys = c.sent[0]["keys"]
+    assert len(keys) == 2 and keys[1] == "Enter"
+    assert "echo __AIMUX_EXIT_" in keys[0]  # marker suffix, not a temp-file launch
+    assert not keys[0].startswith("bash /tmp/incoming_command_")
+
+
+def test_exec_interactive_true_uses_pty_path(monkeypatch):
+    # interactive=true must keep the live-PTY marker path (for write_stdin),
+    # not the one-shot temp-script path.
+    c = ExecClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+    c.captures = [{"content": ""}]
+
+    mcp_server._remote_exec_command(
+        "r", "posix-pty", {"cmd": "python3 -i", "interactive": True, "yield_time_ms": 250}
+    )
+
+    assert c.sent
+    keys = c.sent[0]["keys"]
+    assert "echo __AIMUX_EXIT_" in keys[0]  # marker path, not a temp-file launch
+    assert not keys[0].startswith("bash /tmp/incoming_command_")

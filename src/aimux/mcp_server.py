@@ -1,7 +1,7 @@
 """aimux MCP server — expose one bridge remote as MCP tools over stdio.
 
 Codex-facing tools (6, aligned with codex native tool specs):
-  remote_exec_command  Run a command in a PTY; return output or session_id.
+  remote_exec_command  Run a command (one-shot temp-script by default; interactive=true keeps a live PTY); return clean output + exit code, or session_id.
   remote_write_stdin   Write chars to an existing exec session, return output.
   remote_apply_patch   Apply a patch (FREEFORM input).
   remote_view_image    Return a remote image file as a data URL.
@@ -87,6 +87,16 @@ def _close_exec_session(sid: int, c) -> None:
         c.kill_session(remote=sess["remote"], name=sess["name"])
     except Exception:
         pass
+    # Best-effort cleanup of the temp script/output/code files created by the
+    # temp-file exec path. Missing files are a no-op on the remote.
+    for key in ("tmp_script", "tmp_out", "tmp_code"):
+        path = sess.get(key)
+        if not path:
+            continue
+        try:
+            c.file_delete(remote=sess["remote"], path=path)
+        except Exception:
+            pass
 
 
 def _reap_all_sessions(c, *, timeout: float = 5.0) -> int:
@@ -235,6 +245,85 @@ def _append_enter_for_stdin(chars: str, requested: object) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# temp-file exec: write the command verbatim to a temp script, run it with
+# stdout+stderr and the exit code redirected to temp files, then read both back
+# cleanly. This replaces the PTY send_keys echo + screen-scrape + exit-marker
+# dance for non-interactive exec (POSIX).
+# ---------------------------------------------------------------------------
+
+
+def _is_windows_profile(profile: str) -> bool:
+    p = (profile or "").lower()
+    return "win" in p or p in {"cmd", "powershell", "pwsh"}
+
+
+def _exec_temp_base() -> str:
+    """Unique temp base name: incoming_command_<UTC timestamp>."""
+    now = time.time()
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime(now))
+    micros = int((now % 1) * 1_000_000)
+    return f"incoming_command_{ts}_{micros:06d}"
+
+
+def _exec_temp_paths() -> tuple[str, str, str]:
+    """Return (script, out, code) absolute paths under the remote temp dir."""
+    base = _exec_temp_base()
+    return f"/tmp/{base}.sh", f"/tmp/{base}.out", f"/tmp/{base}.code"
+
+
+def _launch_temp_script(shell_bin: str | None, script: str, outfile: str, codefile: str) -> str:
+    """One trivial launch line: run the script, redirect output and exit code."""
+    runner = shell_bin or "bash"
+    return f"{runner} {script} > {outfile} 2>&1; echo $? > {codefile}"
+
+
+def _read_code_file(c, remote: str, codefile: str) -> int | None:
+    """Return the exit code if the code file exists, else None (not finished)."""
+    try:
+        st = c.file_stat(remote=remote, path=codefile, timeout=15.0)
+    except Exception:
+        return None
+    if not st.get("exists") or st.get("type") != "file":
+        return None
+    try:
+        res = c.file_read(remote=remote, path=codefile, timeout=15.0)
+    except Exception:
+        return None
+    try:
+        return int(_file_bytes(res).decode("utf-8", "replace").strip())
+    except Exception:
+        return None
+
+
+def _read_out_file(c, remote: str, outfile: str) -> str:
+    """Return the redirected output, or "" if not present/readable yet."""
+    try:
+        st = c.file_stat(remote=remote, path=outfile, timeout=15.0)
+    except Exception:
+        return ""
+    if not st.get("exists") or st.get("type") != "file":
+        return ""
+    try:
+        res = c.file_read(remote=remote, path=outfile, timeout=60.0)
+    except Exception:
+        return ""
+    return _file_bytes(res).decode("utf-8", "replace")
+
+
+def _wait_exec_done(c, remote: str, outfile: str, codefile: str, yield_ms: int):
+    """Poll for the exit-code file; return (output, exit_code, finished, wall)."""
+    started = time.time()
+    deadline = started + max(yield_ms, 0) / 1000.0
+    while True:
+        if time.time() >= deadline:
+            return _read_out_file(c, remote, outfile), None, False, time.time() - started
+        time.sleep(0.3)
+        code = _read_code_file(c, remote, codefile)
+        if code is not None:
+            return _read_out_file(c, remote, outfile), code, True, time.time() - started
+
+
+# ---------------------------------------------------------------------------
 # remote_exec_command
 # ---------------------------------------------------------------------------
 
@@ -265,7 +354,7 @@ def _command_with_exit_marker(cmd: str, marker: str, profile: str) -> str:
     return f"{cmd}; {marker_cmd}"
 
 
-def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
+def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
     cmd = args.get("cmd")
     if not isinstance(cmd, str) or not cmd.strip():
         raise ValueError("cmd is required")
@@ -321,6 +410,64 @@ def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     raise last_error
 
 
+def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict:
+    cmd = args.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        raise ValueError("cmd is required")
+    workdir = args.get("workdir") or None
+    shell_bin = args.get("shell") or None
+    max_tokens = int(args.get("max_output_tokens") or 10000)
+    yield_ms = max(250, min(30000, int(args.get("yield_time_ms") or 10000)))
+
+    c = _client()
+    max_retries = 2  # 3 total attempts
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        sid = _create_exec_session(remote, profile, shell_bin, workdir)
+        name = _sessions[sid]["name"]
+        script, outfile, codefile = _exec_temp_paths()
+        _sessions[sid].update(tmp_script=script, tmp_out=outfile, tmp_code=codefile)
+        try:
+            # 1) command verbatim -> temp script (no send_keys mangling).
+            c.file_write(
+                remote=remote,
+                path=script,
+                content_b64=base64.b64encode(cmd.encode("utf-8")).decode("ascii"),
+                timeout=60.0,
+            )
+            # 2) trivial launch line -> redirect output + exit code to files.
+            launch = _launch_temp_script(shell_bin, script, outfile, codefile)
+            c.send_keys(remote=remote, name=name, keys=[launch, "Enter"], flags=[], timeout=15.0)
+            # 3) poll the exit-code file, then read clean output + exit code.
+            out, exit_code, finished, wall = _wait_exec_done(c, remote, outfile, codefile, yield_ms)
+            out_t, original = _truncate_output(out, max_tokens)
+            return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
+        except bridge.BridgeError as e:
+            _close_exec_session(sid, c)
+            if e.kind in ("session_gone", "not_found") and attempt < max_retries:
+                last_error = e
+                print(f"aimux-mcp: exec session lost ({e.kind}), retrying ({attempt + 1}/{max_retries})...",
+                      file=sys.stderr)
+                continue
+            raise
+        except Exception:
+            _close_exec_session(sid, c)
+            raise
+
+    assert last_error is not None
+    raise last_error
+
+
+def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
+    # Default is the clean one-shot temp-script path. Interactive commands
+    # (REPL, pager, password prompt, heredoc — anything driven via
+    # remote_write_stdin) must opt into the live-PTY path with interactive=true.
+    if _is_windows_profile(profile) or args.get("interactive"):
+        return _remote_exec_command_pty(remote, profile, args)
+    return _remote_exec_command_tempfile(remote, profile, args)
+
+
 # ---------------------------------------------------------------------------
 # remote_write_stdin
 # ---------------------------------------------------------------------------
@@ -345,18 +492,21 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
     c = _client()
     try:
         if has_chars:
-            # The original exec command owns the outstanding marker. Do not
-            # enqueue another shell command here: an interactive child (pager,
-            # password prompt, raw stdin reader) could consume that marker as
-            # input. This tool is stdin, not command execution.
-            marker = sess.get("marker", "")
             keys = [chars, "Enter"] if append_enter else [chars]
             c.send_keys(remote=remote, name=name, keys=keys, flags=[], timeout=15.0)
+        if sess.get("tmp_code"):
+            # temp-file session: completion is signalled by the exit-code file;
+            # read clean output + exit code from the redirected temp files.
+            out, exit_code, finished, wall = _wait_exec_done(
+                c, remote, sess["tmp_out"], sess["tmp_code"], yield_ms
+            )
         else:
-            # empty poll: watch the session's outstanding marker (set by exec or a
-            # previous write) so we can still detect command completion.
+            # legacy PTY marker session (Windows exec): poll capture for the
+            # outstanding marker set by exec. An interactive child (pager,
+            # password prompt, raw stdin reader) must never consume the marker
+            # as stdin, so keep the marker out of the write path.
             marker = sess.get("marker", "")
-        out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, bool(marker))
+            out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, bool(marker))
     except bridge.BridgeError as e:
         if e.kind in ("session_gone", "not_found") and not has_chars:
             # Empty poll on a dead session: the remote shell exited (or was
@@ -681,11 +831,12 @@ def _apply_hunks(orig: str, hunks: list) -> str:
 TOOLS = [
     {
         "name": "remote_exec_command",
-        "description": "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+        "description": "Runs a shell command, returning clean output and an exit code. One-shot by default; pass interactive=true to keep a live PTY session for remote_write_stdin.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cmd": {"type": "string", "description": "Shell command to execute."},
+                "interactive": {"type": "boolean", "default": False, "description": "True keeps a live PTY session for remote_write_stdin (REPL, pager, password prompt, heredoc). False (default) runs one-shot via a temp script and returns clean output + exit code."},
                 "login": {"type": "boolean", "default": True, "description": "True runs the shell with -l/-i semantics; false disables them (uses --norc --noprofile). Defaults to true."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
                 "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},

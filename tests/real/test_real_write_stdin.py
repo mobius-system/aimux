@@ -16,6 +16,10 @@ from conftest import wait_for_output
 
 
 def _exec(mcp, cmd, **kw):
+    # These are interactive sessions driven by remote_write_stdin, so they must
+    # opt into the live-PTY path (interactive=true) rather than the default
+    # one-shot temp-script exec.
+    kw.setdefault("interactive", True)
     return mcp.call("remote_exec_command", cmd=cmd, yield_time_ms=kw.pop("yield_ms", 800), **kw)
 
 
