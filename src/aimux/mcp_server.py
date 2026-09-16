@@ -141,26 +141,43 @@ def _on_sigterm(signum, frame) -> None:
 
 
 def _request_parent_death_signal() -> None:
-    """Linux: ask the kernel to deliver SIGTERM to us when our parent dies, so
-    _on_sigterm runs and reaps. Closes the 'orphaned with stdin still open'
-    hole the EOF reap cannot reach. No-op on macOS/Windows (EOF + the SIGTERM
-    handler remain adequate there). Best-effort: a missing prctl/libc never
-    blocks startup."""
-    if sys.platform != "linux":
+    """Exit when the parent *process* dies, using process-level semantics.
+
+    We previously asked the kernel for a parent-death signal
+    (PR_SET_PDEATHSIG), but Linux delivers that signal when the *thread* that
+    forked us exits — not when the parent process exits (prctl(2): "the
+    parent-death signal [may be] sent while the parent process is still
+    running"). A multi-threaded client (tokio, Go, Java, ...) that spawns us
+    from a recycled worker thread then kills us while the client is still
+    alive (e.g. tokio's blocking pool reaps idle threads after ~10s). Poll
+    os.getppid() instead: when the parent dies we are reparented (ppid becomes
+    1 or a subreaper), a genuine process-level event. Best-effort; the stdin
+    EOF reap remains the primary exit path, so a failed poll never leaks the
+    process beyond that.
+    """
+    if sys.platform == "win32":
+        # No reliable getppid semantics; stdin EOF still covers the common
+        # case (a dead parent closes the pipe write end).
         return
-    try:
-        import ctypes
-        # CDLL(None) resolves against the main program (which links libc),
-        # robust across glibc (.so.6) and musl (libc.musl-*.so.1).
-        libc = ctypes.CDLL(None, use_errno=True)
-        PR_SET_PDEATHSIG = 1
-        SIGTERM = 15
-        libc.prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0)
-        # TOCTOU guard: parent may have died between fork and prctl.
-        if os.getppid() == 1:
-            os._exit(127)
-    except Exception as e:
-        print(f"aimux-mcp: PR_SET_PDEATHSIG unavailable: {e}", file=sys.stderr)
+    import threading
+
+    parent = os.getppid()
+    if parent == 1:
+        return  # already orphaned at spawn; nothing to watch
+
+    def _watch() -> None:
+        while True:
+            time.sleep(2.0)
+            try:
+                if os.getppid() != parent:
+                    break
+            except OSError:
+                break
+        # Parent (process) is gone: reap tracked sessions and exit, mirroring
+        # the SIGTERM handler's cleanup without relying on a signal.
+        _on_sigterm(signal.SIGTERM, None)
+
+    threading.Thread(target=_watch, name="aimux-parent-watch", daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
