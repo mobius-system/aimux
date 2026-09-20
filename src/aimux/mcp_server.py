@@ -65,6 +65,10 @@ _reap_client = None
 
 _EXEC_SHELL = os.environ.get("AIMUX_MCP_SHELL") or os.environ.get("SHELL") or "/bin/bash"
 
+# Ceiling for a single yield_time_ms (clamped so one tool call can't pin the
+# single-threaded MCP server for an unbounded time).
+_MAX_YIELD_MS = 300_000  # 5 minutes
+
 
 def _create_exec_session(remote: str, profile: str, cmd: str, cwd: str | None) -> int:
     global _session_counter
@@ -387,7 +391,7 @@ def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
     else:
         shell_cmd = None
     max_tokens = int(args.get("max_output_tokens") or 10000)
-    yield_ms = max(250, min(30000, int(args.get("yield_time_ms") or 10000)))
+    yield_ms = max(250, min(_MAX_YIELD_MS, int(args.get("yield_time_ms") or 10000)))
 
     c = _client()
     max_retries = 2  # 3 total attempts
@@ -434,7 +438,7 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
     workdir = args.get("workdir") or None
     shell_bin = args.get("shell") or None
     max_tokens = int(args.get("max_output_tokens") or 10000)
-    yield_ms = max(250, min(30000, int(args.get("yield_time_ms") or 10000)))
+    yield_ms = max(250, min(_MAX_YIELD_MS, int(args.get("yield_time_ms") or 10000)))
 
     c = _client()
     max_retries = 2  # 3 total attempts
@@ -503,7 +507,7 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
     append_enter = _append_enter_for_stdin(chars, args.get("append_enter"))
     max_tokens = int(args.get("max_output_tokens") or 10000)
     default_yield = 250 if has_chars else 5000
-    yield_ms = max(0, min(30000, int(args.get("yield_time_ms") or default_yield)))
+    yield_ms = max(0, min(_MAX_YIELD_MS, int(args.get("yield_time_ms") or default_yield)))
 
     name = sess["name"]
     c = _client()
@@ -893,7 +897,7 @@ TOOLS = [
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
                 "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
                 "workdir": {"type": "string", "description": "Working directory for the command. Defaults to the turn cwd."},
-                "yield_time_ms": {"type": "number", "default": 10000, "description": "Wait before yielding output. Defaults to 10000 ms; effective range 250-30000 ms."},
+                "yield_time_ms": {"type": "number", "default": 10000, "description": "Wait before yielding output. Defaults to 10000 ms; effective range 250-300000 ms."},
             },
             "required": ["cmd"],
         },
@@ -908,7 +912,7 @@ TOOLS = [
                 "append_enter": {"type": "boolean", "description": "Append Enter after chars. Defaults to true for command lines; common pager/control keys (q, Ctrl-C, Ctrl-D, Escape) are sent raw."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget. Defaults to 10000."},
                 "session_id": {"type": "number", "description": "Identifier of the running unified exec session."},
-                "yield_time_ms": {"type": "number", "description": "Wait before yielding output. Non-empty writes default to 250 ms; empty polls wait 5000+ ms."},
+                "yield_time_ms": {"type": "number", "description": "Wait before yielding output. Non-empty writes default to 250 ms; empty polls wait 5000+ ms; capped at 300000 ms (5 min)."},
             },
             "required": ["session_id"],
         },
