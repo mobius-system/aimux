@@ -120,7 +120,44 @@ and WebSocket upgrades are forwarded to `http://127.0.0.1:3000` from the
 bridge server's network namespace. Use `--remote-scheme=https` for an HTTPS
 target.
 
-5. Upload and download files.
+5. Reach a port on *another bridge client's* loopback.
+
+`port forward` (above) dials the target from the **broker's** network. When the
+service instead lives on a reverse-connected machine behind NAT, the target
+client has to do the dialling — and it will only do so for ports it explicitly
+allowed.
+
+```bash
+# client A: declare which local ports other clients may reach (default: none)
+aimux reverse connect http://SERVER:8765 \
+  --identifier=a-box --token=<token> \
+  --allow-http-ports=8000,8001
+
+# client B: listen locally on 9000 and tunnel to a-box's 127.0.0.1:8000
+aimux local-http-port-reroute \
+  --local-port=9000 \
+  --remote-client-id=a-box \
+  --remote-client-http-port=8000 \
+  --url=http://SERVER:8765 --token=<token>
+```
+
+Now `http://127.0.0.1:9000` on B reaches `http://127.0.0.1:8000` on A. The
+tunnel moves raw bytes, so ordinary HTTP, streaming SSE responses, and
+WebSocket upgrades all work — and, as with `port forward`, nothing is parsed or
+rewritten in between.
+
+The command is symmetric: run it on A too (naming B) to get the reverse
+direction. Ports are checked twice — the broker refuses a port the target
+never allowed, and the target re-checks the allowlist itself before dialling —
+so a client that never passes `--allow-http-ports` cannot be connected to at
+all. Targets are always dialled on `127.0.0.1`; there is no `--remote-host`, so
+a tunnel can never become a jump host onto the rest of A's network.
+
+Because the traffic is tunnelled rather than proxied, B's listener sees the
+bytes exactly as A's service emitted them: absolute URLs, cookies, and `Host`
+headers all refer to A's loopback address, not to B's.
+
+6. Upload and download files.
 
 ### File transfer for bridge remotes
 

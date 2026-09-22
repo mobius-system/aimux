@@ -89,7 +89,22 @@ Use `--gitignore` on upload when ignored files should be skipped:
 aimux send-files local-8824 /tmp/upload ~/aimux-tests --gitignore
 ```
 
-4. Clean up.
+4. Reach a port on another bridge client's loopback.
+
+A reverse client can only be connected to for the ports it explicitly allowed,
+and the tunnel is byte-transparent (HTTP, SSE, and WebSocket all pass through):
+
+```bash
+# on client A
+aimux reverse connect http://SERVER:8765 --identifier=a-box --token=<token> \
+  --allow-http-ports=8000
+
+# on client B: local 9000 -> a-box's 127.0.0.1:8000
+aimux local-http-port-reroute --local-port=9000 --remote-client-id=a-box \
+  --remote-client-http-port=8000 --url=http://SERVER:8765 --token=<token>
+```
+
+5. Clean up.
 
 ```bash
 aimux kill "local-8824/testsession"

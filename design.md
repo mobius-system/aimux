@@ -179,6 +179,7 @@ aimux remote hardware               探测主机硬件（GPU 数量/型号、CPU
 
 aimux bridge deploy                 启动 SSE/HTTP bridge broker
 aimux reverse connect               反向连接本机到 bridge broker
+aimux local-http-port-reroute       把本机端口隧道到另一个 bridge client 的端口
 ```
 
 存在性检查：直接用 `aimux ls --json` 解析，或 `aimux ls --json | jq -e '.[] | select(.id=="...")'`。aimux 不再单独提供 `has` 子命令——`ls` 已经覆盖此用途。
@@ -1029,7 +1030,8 @@ $ aimux new --remote=worker-2 --name=task-1
 | 命令 | 作用 | 可被 agent 调用 |
 |---|---|---|
 | `aimux bridge deploy --port=<p>` | 在服务器侧启动 HTTP/SSE broker，监听 reverse client | ✅ |
-| `aimux reverse connect <url> --identifier=<name> --token=<token>` | 在 client 侧反向连接 broker，并注册 bridge remote | ✅ |
+| `aimux reverse connect <url> --identifier=<name> --token=<token> [--allow-http-ports=<p,...>]` | 在 client 侧反向连接 broker，并注册 bridge remote；`--allow-http-ports` 声明本机哪些端口允许被其他 client 连接（缺省为空 = 谁都连不上） | ✅ |
+| `aimux local-http-port-reroute --local-port=<p> --remote-client-id=<name> --remote-client-http-port=<q>` | 本地监听 `<p>`，字节级隧道到 `<name>` 的 `127.0.0.1:<q>`；HTTP / SSE / WebSocket 全部透传 | ✅ |
 
 被有意删除的命令（不暴露）：`run`、`rename`、`respawn`、`has`、`new-window`、`list-windows`、`select-window`、`rename-window`、`kill-window`、`split-window`、`list-panes`、`select-pane`、`kill-pane`、`kill-server`、`hosts`（被 `remote ls` 取代）、`prune`、`set-option`、`history`、`log`、`config`、`doctor`。
 

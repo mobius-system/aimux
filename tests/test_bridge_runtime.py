@@ -289,6 +289,7 @@ def test_broker_state_registers_bridge_remote(monkeypatch):
             "profiles": [{"name": "cmd", "available": True}],
             "last_seen": state.list_remotes()[0]["last_seen"],
             "client_version": "",
+            "allow_http_ports": [],
             "server_version": __version__,
             "version_mismatch": False,
         }

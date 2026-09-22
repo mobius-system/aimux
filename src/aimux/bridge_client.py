@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -29,6 +30,7 @@ from typing import Any, Protocol
 from loguru import logger
 
 from . import __version__
+from . import port_tunnel
 from .bridge import BridgeError, validate_identifier, version_mismatch_message
 from .transfer import (
     DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE,
@@ -765,12 +767,25 @@ def build_adapters(silent_shell: bool = False, silent_shell_v2: bool = False) ->
 
 
 class ReverseClientRuntime:
-    def __init__(self, identifier: str, default_profile: str | None = None, silent_shell: bool = False, silent_shell_v2: bool = False):
+    def __init__(
+        self,
+        identifier: str,
+        default_profile: str | None = None,
+        silent_shell: bool = False,
+        silent_shell_v2: bool = False,
+        allow_http_ports: tuple[int, ...] = (),
+    ):
         self.identifier = identifier
         self.client_id = str(uuid.uuid4())
         self.adapters, detected_default = build_adapters(silent_shell=silent_shell, silent_shell_v2=silent_shell_v2)
         self.default_profile = default_profile or detected_default
         self.sessions: dict[str, ClientSession] = {}
+        # Local ports other clients may reach. Empty means this client cannot
+        # be connected to at all — the safe default.
+        self.allow_http_ports = frozenset(allow_http_ports)
+
+    def http_port_allowed(self, port: int) -> bool:
+        return port in self.allow_http_ports
 
     def registration_payload(self, *, replace: bool) -> dict[str, Any]:
         return {
@@ -781,6 +796,7 @@ class ReverseClientRuntime:
             "profiles": [adapter.profile_info() for adapter in self.adapters.values()],
             "version": __version__,
             "client_id": self.client_id,
+            "allow_http_ports": sorted(self.allow_http_ports),
         }
 
     def handle(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1113,6 +1129,12 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
     if message_type == "file.open_write":
         _handle_open_write(runtime, base, token, request_id, payload)
         return
+    # A port tunnel lives as long as the connection it carries, so it also runs
+    # off the control loop — otherwise one open browser tab would block every
+    # other command this client serves.
+    if message_type == "http_port.open":
+        _handle_http_port_open(runtime, base, token, request_id, payload)
+        return
     if _is_logged_bridge_command(message_type):
         logger.info(
             "bridge client received command identifier={} request_id={} type={} details={}",
@@ -1304,6 +1326,143 @@ def _handle_open_write(runtime: ReverseClientRuntime, base: str, token: str, req
     ).start()
 
 
+def _handle_http_port_open(runtime: ReverseClientRuntime, base: str, token: str, request_id: str, payload: dict[str, Any]) -> None:
+    """Handle ``http_port.open``: dial the requested local port, then relay.
+
+    The dial and the relay both belong off the control loop, so the whole
+    handshake runs on a dedicated thread.
+    """
+    try:
+        port = int(payload.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    session_id = str(payload.get("session_id") or "")
+    threading.Thread(
+        target=_run_http_port_tunnel_guarded,
+        args=(runtime, base, token, request_id, session_id, port),
+        daemon=True,
+    ).start()
+
+
+def _run_http_port_tunnel_guarded(
+    runtime: ReverseClientRuntime,
+    base: str,
+    token: str,
+    request_id: str,
+    session_id: str,
+    port: int,
+) -> None:
+    """Report an unexpected crash back to the broker.
+
+    The handshake runs on its own thread, so without this a bug here would
+    surface only as a 30s timeout on the far side — with no hint as to why.
+    """
+    try:
+        _run_http_port_tunnel(runtime, base, token, request_id, session_id, port)
+    except Exception as exc:  # pragma: no cover - defensive path
+        logger.exception(
+            "bridge client http port tunnel crashed identifier={} session={} port={}",
+            runtime.identifier,
+            session_id,
+            port,
+        )
+        _post_json(
+            f"{base}/client/result",
+            token,
+            {"id": request_id, "ok": False, "error": {"kind": "client_error", "message": str(exc), "code": 1}},
+        )
+
+
+def _run_http_port_tunnel(
+    runtime: ReverseClientRuntime,
+    base: str,
+    token: str,
+    request_id: str,
+    session_id: str,
+    port: int,
+) -> None:
+    """Dial ``127.0.0.1:<port>`` and pump it through the broker's tunnel.
+
+    Only loopback is ever dialled: the port owner decides *which* ports may be
+    reached, and never *what* they resolve to, so a tunnel can't be turned into
+    a jump host onto the rest of the network.
+    """
+    if not runtime.http_port_allowed(port):
+        logger.warning(
+            "bridge client refused http port tunnel identifier={} session={} port={} allow_http_ports={}",
+            runtime.identifier,
+            session_id,
+            port,
+            sorted(runtime.allow_http_ports) or "none",
+        )
+        _post_json(
+            f"{base}/client/result",
+            token,
+            {
+                "id": request_id,
+                "ok": False,
+                "error": {
+                    "kind": "port_not_allowed",
+                    "message": f"port {port} is not in this client's --allow-http-ports",
+                    "code": 1,
+                },
+            },
+        )
+        return
+
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=port_tunnel.TUNNEL_DIAL_TIMEOUT)
+        sock.settimeout(None)
+    except OSError as exc:
+        _post_json(
+            f"{base}/client/result",
+            token,
+            {
+                "id": request_id,
+                "ok": False,
+                "error": {
+                    "kind": "port_unreachable",
+                    "message": f"127.0.0.1:{port} is not reachable on this machine: {exc}",
+                    "code": 2,
+                },
+            },
+        )
+        return
+
+    # Report success only after the local dial worked, so the reroute side can
+    # tell "nothing listening there" apart from "the tunnel stalled" without
+    # waiting out a timeout.
+    _post_json(
+        f"{base}/client/result",
+        token,
+        {"id": request_id, "ok": True, "payload": {"session_id": session_id}},
+    )
+    logger.info(
+        "bridge client opened http port tunnel identifier={} session={} port={}",
+        runtime.identifier,
+        session_id,
+        port,
+    )
+    try:
+        port_tunnel.relay_socket_over_bridge(
+            base=base,
+            token=token,
+            session_id=session_id,
+            sock=sock,
+            prefix="/client",
+        )
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        logger.info(
+            "bridge client closed http port tunnel identifier={} session={}",
+            runtime.identifier,
+            session_id,
+        )
+
+
 def _serve_event_stream(
     response,
     *,
@@ -1422,6 +1581,7 @@ def connect(
     reconnect: bool = True,
     silent_shell: bool = False,
     silent_shell_v2: bool = False,
+    allow_http_ports: tuple[int, ...] = (),
     reconnect_intervals: tuple[float, ...] | None = None,
     register_retry_intervals: tuple[float, ...] | None = None,
     sleep=time.sleep,
@@ -1435,6 +1595,7 @@ def connect(
         default_profile=default_profile,
         silent_shell=silent_shell,
         silent_shell_v2=silent_shell_v2,
+        allow_http_ports=allow_http_ports,
     )
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
@@ -1465,10 +1626,11 @@ def connect(
                 if client_mismatch:
                     logger.warning("bridge client {} — {}", identifier, client_mismatch)
                 logger.info(
-                    "connected bridge remote {!r}; profiles={}; default={}",
+                    "connected bridge remote {!r}; profiles={}; default={}; allow_http_ports={}",
                     identifier,
                     ",".join(runtime.adapters),
                     runtime.default_profile,
+                    sorted(runtime.allow_http_ports) or "none",
                 )
                 logged_registration = True
             else:

@@ -1,6 +1,7 @@
 """HTTP/SSE broker for aimux bridge remotes."""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
@@ -14,12 +15,13 @@ import uuid
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Iterator
 
 from loguru import logger
 
 from . import __version__
 from . import port_forward
+from . import port_tunnel
 from . import ssh as ssh_mod
 from .bridge import (
     BridgeError,
@@ -43,6 +45,27 @@ BRIDGE_SERVER_HEARTBEAT_LOG_INTERVAL = 180.0
 STREAM_CHUNK_SIZE = 1024 * 1024
 STREAM_OPEN_TIMEOUT = 60.0  # remote must open its data connection within this
 STREAM_IDLE_TIMEOUT = 60.0  # max gap between chunks before we give up
+
+# Client-to-client HTTP port tunnels. Each session is two independent byte
+# pipes (one per direction) between two reverse clients, so the broker never
+# holds more than TUNNEL_QUEUE_DEPTH chunks per direction in memory.
+HTTP_TUNNEL_CHUNK_SIZE = port_tunnel.TUNNEL_CHUNK_SIZE
+HTTP_TUNNEL_QUEUE_DEPTH = port_tunnel.TUNNEL_QUEUE_DEPTH
+HTTP_TUNNEL_OPEN_TIMEOUT = 15.0
+HTTP_TUNNEL_IDLE_TIMEOUT = port_tunnel.TUNNEL_IDLE_TIMEOUT
+# Abandoned sessions (a client accepted locally but never opened its streams)
+# are swept opportunistically whenever a new tunnel is created.
+HTTP_TUNNEL_ABANDON_AFTER = 120.0
+# How often an idle tunnel stream rechecks its exit conditions. Data never
+# waits on this: the queue hands it over the moment it arrives.
+TUNNEL_SSE_POLL = 0.2
+# Comment frames keep intermediaries (nginx proxy_read_timeout and friends)
+# from killing a tunnel that is legitimately idle.
+TUNNEL_SSE_KEEPALIVE = 15.0
+# A declared chunk size is attacker-controlled, so it is clamped before the
+# read rather than trusted.
+_MAX_TUNNEL_CHUNK_SIZE = 1024 * 1024
+_MAX_CHUNK_LINE = 16 * 1024
 
 # TCP keepalive tuning so the broker detects half-open reverse clients
 # (Windows sleep / VPN switch / network drop) within tens of seconds instead
@@ -86,6 +109,64 @@ def _apply_tcp_keepalive(sock) -> None:
             pass
 
 
+def parse_allow_http_ports(value: Any) -> frozenset[int]:
+    """Normalize a client's ``--allow-http-ports`` declaration.
+
+    Anything malformed is ignored rather than rejected: an unparseable
+    allowlist must fail closed (no port reachable), never open.
+    """
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return frozenset()
+    ports: set[int] = set()
+    for item in value:
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535:
+            ports.add(port)
+    return frozenset(ports)
+
+
+def _iter_chunked(rfile: Any) -> Iterator[bytes]:
+    """Yield the payloads of a chunked request body.
+
+    ``BaseHTTPRequestHandler`` does not decode chunked bodies for us, so the
+    framing is parsed here. A truncated body simply ends the stream — the
+    caller treats that as EOF, which is what a vanished client means.
+    """
+    while True:
+        line = rfile.readline(_MAX_CHUNK_LINE)
+        if not line:
+            return
+        size_text = line.split(b";", 1)[0].strip()
+        if not size_text:
+            continue
+        try:
+            size = int(size_text, 16)
+        except ValueError:
+            raise BridgeError("invalid chunked request body", kind="bad_request")
+        if size == 0:
+            while True:  # consume trailers up to the blank line
+                trailer = rfile.readline(_MAX_CHUNK_LINE)
+                if not trailer or trailer in (b"\r\n", b"\n"):
+                    return
+        if size > _MAX_TUNNEL_CHUNK_SIZE:
+            # The size line is attacker-controlled; without this a bogus value
+            # turns into a huge read.
+            raise BridgeError("chunked request body chunk is too large", kind="bad_request")
+        payload = rfile.read(size)
+        if len(payload) != size:
+            return
+        terminator = rfile.read(1)
+        if terminator == b"\r":
+            rfile.read(1)  # the LF
+        elif terminator != b"\n":  # bare LF is tolerated, anything else is corrupt
+            return
+        if payload:
+            yield payload
+
+
 @dataclass
 class PendingRequest:
     event: threading.Event = field(default_factory=threading.Event)
@@ -105,6 +186,65 @@ class ClientInfo:
     client_version: str = ""
     client_id: str = ""
     queue: queue.Queue[dict[str, Any] | None] | None = None
+    # Local ports this client allows *other* clients to reach. Empty means the
+    # client cannot be connected to at all — the safe default.
+    allow_http_ports: frozenset[int] = frozenset()
+
+
+@dataclass
+class TunnelPipe:
+    """One direction of a tunnel.
+
+    Payload rides a bounded queue, so a slow reader throttles the producer
+    instead of growing the broker's heap. The end-of-stream and abandoned
+    signals are deliberately *out-of-band* events rather than queue sentinels:
+    a sentinel would have to be forced into a full queue, and the only way to
+    make room would be to drop a payload chunk — which truncates the byte
+    stream silently.
+    """
+
+    chunks: queue.Queue[bytes] = field(default_factory=lambda: queue.Queue(maxsize=HTTP_TUNNEL_QUEUE_DEPTH))
+    producer_done: threading.Event = field(default_factory=threading.Event)
+    abandoned: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
+class HttpPortTunnel:
+    """One client-to-client byte pipe pair, keyed by session id.
+
+    ``up`` carries bytes from the reroute side to the target owner (its POST
+    body in, its SSE stream out); ``down`` carries the response bytes back.
+    """
+
+    session_id: str
+    remote: str
+    port: int
+    created_at: str
+    up: TunnelPipe = field(default_factory=TunnelPipe)
+    down: TunnelPipe = field(default_factory=TunnelPipe)
+    up_finished: bool = False
+    down_finished: bool = False
+    last_activity: float = field(default_factory=time.monotonic)
+    streams_open: int = 0
+
+    def pipe(self, direction: str) -> TunnelPipe:
+        return self.up if direction == "up" else self.down
+
+
+def _put_with_backpressure(pipe: TunnelPipe, chunk: bytes) -> bool:
+    """Enqueue a chunk, waiting while the reader falls behind.
+
+    Returns ``False`` if the tunnel was abandoned while we waited: the reader
+    is gone, so nothing will ever drain this direction and the caller must stop
+    rather than block forever holding a handler thread.
+    """
+    while not pipe.abandoned.is_set():
+        try:
+            pipe.chunks.put(chunk, timeout=TUNNEL_SSE_POLL)
+            return True
+        except queue.Full:
+            continue
+    return False
 
 
 class BridgeBrokerState:
@@ -118,6 +258,8 @@ class BridgeBrokerState:
         # remote's GET /client/data; result_q (write only) carries the remote's
         # write outcome so it never races the data chunks on data_q.
         self._streams: dict[str, tuple[queue.Queue, threading.Event | None, queue.Queue | None]] = {}
+        # session_id -> HttpPortTunnel. See create_http_port_tunnel.
+        self.http_tunnels: dict[str, HttpPortTunnel] = {}
         self.lock = threading.RLock()
 
     def register_client(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -131,6 +273,7 @@ class BridgeBrokerState:
         profiles = payload.get("profiles") if isinstance(payload.get("profiles"), list) else []
         client_version = str(payload.get("version") or "")
         client_id = str(payload.get("client_id") or "")
+        allow_http_ports = parse_allow_http_ports(payload.get("allow_http_ports"))
         mismatch = version_mismatch_message(client_version, __version__)
         if mismatch:
             logger.warning("bridge client {} registered with {}", name, mismatch)
@@ -144,6 +287,7 @@ class BridgeBrokerState:
                 except queue.Full:
                     pass
                 self._fail_pending_locked(name, reason="client replaced")
+                self.close_http_tunnels_for_remote(name, reason="client replaced")
             same_client_process = bool(existing and existing.client_id and client_id and existing.client_id == client_id)
             self.clients[name] = ClientInfo(
                 name=name,
@@ -154,6 +298,7 @@ class BridgeBrokerState:
                 last_seen=utc_now(),
                 client_version=client_version,
                 client_id=client_id,
+                allow_http_ports=allow_http_ports,
             )
             stale_keys: list[tuple[str, str]] = []
             if not same_client_process:
@@ -165,13 +310,14 @@ class BridgeBrokerState:
                 for key in stale_keys:
                     self.sessions.pop(key, None)
         logger.info(
-            "bridge client registered name={!r} platform={} default_profile={} profiles={} replace={} version={}",
+            "bridge client registered name={!r} platform={} default_profile={} profiles={} replace={} version={} allow_http_ports={}",
             name,
             platform,
             default_profile,
             [p.get("name") for p in profiles if isinstance(p, dict)],
             replace,
             client_version or "unknown",
+            sorted(allow_http_ports) or "none",
         )
         if stale_keys:
             logger.info(
@@ -207,6 +353,10 @@ class BridgeBrokerState:
                 client.queue = None
                 client.last_seen = utc_now()
                 failed = self._fail_pending_locked(name, reason="event stream disconnected")
+                # A reverse client that drops takes its reachable ports with it;
+                # ending the tunnels here lets the reroute side notice promptly
+                # instead of waiting out its idle timeout.
+                self.close_http_tunnels_for_remote(name, reason="target client disconnected")
                 logger.info("bridge client event stream disconnected name={!r}", name)
                 if failed:
                     logger.warning(
@@ -236,6 +386,7 @@ class BridgeBrokerState:
                         "profiles": client.profiles,
                         "last_seen": client.last_seen,
                         "client_version": client.client_version,
+                        "allow_http_ports": sorted(client.allow_http_ports),
                         "server_version": __version__,
                         "version_mismatch": bool(version_mismatch_message(client.client_version, __version__)),
                     }
@@ -523,6 +674,159 @@ class BridgeBrokerState:
         with self.lock:
             self._streams.pop(request_id, None)
 
+    # -- client-to-client http port tunnels -----------------------------------
+
+    def create_http_port_tunnel(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """Open a byte pipe pair from the caller to ``remote_client``'s port.
+
+        The allowlist is enforced here as well as on the target client, so an
+        unauthorized port is refused without waking the far side at all.
+        """
+        remote = str(payload.get("remote_client") or "")
+        if not remote:
+            raise BridgeError("remote_client is required", kind="bad_request")
+        try:
+            port = int(payload.get("port") or 0)
+        except (TypeError, ValueError):
+            raise BridgeError("port must be an integer", kind="bad_request")
+        if not 1 <= port <= 65535:
+            raise BridgeError("port must be between 1 and 65535", kind="bad_request")
+
+        with self.lock:
+            self._sweep_http_tunnels_locked()
+            client = self.clients.get(remote)
+            if client is None:
+                raise BridgeError(f"bridge remote {remote!r} not found", kind="not_found")
+            if not client.connected or client.queue is None:
+                raise BridgeError(f"bridge remote {remote!r} is disconnected", kind="remote_disconnected", exit_code=2)
+            if port not in client.allow_http_ports:
+                allowed = ", ".join(str(p) for p in sorted(client.allow_http_ports))
+                detail = f"allowed ports: {allowed}" if allowed else "it declared no --allow-http-ports"
+                raise BridgeError(
+                    f"remote {remote!r} does not allow connections to port {port} ({detail})",
+                    kind="port_not_allowed",
+                )
+            session_id = str(uuid.uuid4())
+            tunnel = HttpPortTunnel(session_id=session_id, remote=remote, port=port, created_at=utc_now())
+            self.http_tunnels[session_id] = tunnel
+
+        try:
+            self.submit(remote, "http_port.open", {"port": port, "session_id": session_id}, timeout)
+        except BridgeError:
+            self.close_http_tunnel(session_id, reason="target refused or failed to open the tunnel")
+            raise
+        logger.info(
+            "bridge broker opened http port tunnel session={} remote={!r} port={}",
+            session_id,
+            remote,
+            port,
+        )
+        return {
+            "session": {
+                "id": session_id,
+                "remote_client": remote,
+                "port": port,
+                "created_at": tunnel.created_at,
+            }
+        }
+
+    def get_http_tunnel(self, session_id: str) -> HttpPortTunnel | None:
+        with self.lock:
+            return self.http_tunnels.get(session_id)
+
+    def list_http_tunnels(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return [
+                {
+                    "id": tunnel.session_id,
+                    "remote_client": tunnel.remote,
+                    "port": tunnel.port,
+                    "created_at": tunnel.created_at,
+                    "streams_open": tunnel.streams_open,
+                }
+                for tunnel in sorted(self.http_tunnels.values(), key=lambda item: item.created_at or "")
+            ]
+
+    def note_tunnel_activity(self, session_id: str) -> None:
+        with self.lock:
+            tunnel = self.http_tunnels.get(session_id)
+            if tunnel is not None:
+                tunnel.last_activity = time.monotonic()
+
+    def finish_tunnel_direction(self, session_id: str, direction: str) -> None:
+        """Mark one direction's producer as done so its reader can see EOF.
+
+        A tunnel is torn down only once *both* directions have finished, so the
+        surviving half can still drain what the peer already sent.
+        """
+        with self.lock:
+            tunnel = self.http_tunnels.get(session_id)
+            if tunnel is None:
+                return
+            tunnel.pipe(direction).producer_done.set()
+            if direction == "up":
+                tunnel.up_finished = True
+            else:
+                tunnel.down_finished = True
+            both_done = tunnel.up_finished and tunnel.down_finished
+        if both_done:
+            self.close_http_tunnel(session_id, reason="both directions finished")
+
+    def close_http_tunnel(self, session_id: str, *, reason: str = "") -> None:
+        """Tear a session down and wake everyone blocked on it.
+
+        Setting ``abandoned`` is what unblocks a producer stuck on a full
+        queue; without it that handler thread would wait for a reader that will
+        never come back.
+        """
+        with self.lock:
+            tunnel = self.http_tunnels.pop(session_id, None)
+            if tunnel is not None:
+                for pipe in (tunnel.up, tunnel.down):
+                    pipe.producer_done.set()
+                    pipe.abandoned.set()
+        if tunnel is not None:
+            logger.info(
+                "bridge broker closed http port tunnel session={} remote={!r} port={} reason={}",
+                session_id,
+                tunnel.remote,
+                tunnel.port,
+                reason or "closed",
+            )
+
+    def close_http_tunnels_for_remote(self, remote: str, *, reason: str) -> int:
+        with self.lock:
+            session_ids = [sid for sid, tunnel in self.http_tunnels.items() if tunnel.remote == remote]
+        for session_id in session_ids:
+            self.close_http_tunnel(session_id, reason=reason)
+        return len(session_ids)
+
+    def _sweep_http_tunnels_locked(self) -> None:
+        """Reclaim sessions nobody ever attached streams to.
+
+        Called under the lock from create_http_port_tunnel — a cheap sweep that
+        keeps abandoned handshakes (local connection accepted, far side never
+        followed through) from accumulating forever.
+        """
+        now = time.monotonic()
+        stale = [
+            session_id
+            for session_id, tunnel in self.http_tunnels.items()
+            if tunnel.streams_open == 0 and now - tunnel.last_activity > HTTP_TUNNEL_ABANDON_AFTER
+        ]
+        for session_id in stale:
+            tunnel = self.http_tunnels.pop(session_id, None)
+            if tunnel is not None:
+                for pipe in (tunnel.up, tunnel.down):
+                    pipe.producer_done.set()
+                    pipe.abandoned.set()
+                logger.warning(
+                    "bridge broker swept abandoned http port tunnel session={} remote={!r} port={}",
+                    session_id,
+                    tunnel.remote,
+                    tunnel.port,
+                )
+
 
 def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -552,6 +856,22 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/sessions":
                     self._require_auth()
                     self._json(HTTPStatus.OK, {"sessions": state.list_sessions()})
+                    return
+                if parsed.path == "/api/http-ports":
+                    self._require_auth()
+                    self._json(HTTPStatus.OK, {"sessions": state.list_http_tunnels()})
+                    return
+                if parsed.path in ("/api/http-ports/stream", "/client/http-ports/stream"):
+                    self._require_auth()
+                    query = urllib.parse.parse_qs(parsed.query)
+                    session_id = (query.get("id") or [""])[0]
+                    direction = (query.get("direction") or [""])[0]
+                    # The /api family serves the reroute side (it reads the
+                    # target's bytes), the /client family the port owner.
+                    expected = "down" if parsed.path.startswith("/api/") else "up"
+                    if direction != expected:
+                        raise BridgeError(f"direction must be {expected!r} for {parsed.path}", kind="bad_request")
+                    self._http_tunnel_sse(session_id, direction)
                     return
                 if parsed.path == port_forward.FORWARD_PATH:
                     self._require_auth()
@@ -586,6 +906,18 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     request_id = (query.get("id") or [""])[0]
                     self._data_upload(request_id)
                     return
+                if parsed.path in ("/api/http-ports/stream", "/client/http-ports/stream"):
+                    # Raw byte body: route before _read_json, which would
+                    # otherwise consume the stream as a JSON payload.
+                    self._require_auth()
+                    query = urllib.parse.parse_qs(parsed.query)
+                    session_id = (query.get("id") or [""])[0]
+                    direction = (query.get("direction") or [""])[0]
+                    expected = "up" if parsed.path.startswith("/api/") else "down"
+                    if direction != expected:
+                        raise BridgeError(f"direction must be {expected!r} for {parsed.path}", kind="bad_request")
+                    self._http_tunnel_body(session_id, direction)
+                    return
                 parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/")]
                 if len(parts) == 5 and parts[:2] == ["api", "remotes"] and parts[3] == "files" and parts[4] == "write-stream":
                     self._require_auth()
@@ -608,6 +940,11 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     self._require_auth()
                     timeout = float(payload.pop("timeout", 30) or 30)
                     self._json(HTTPStatus.OK, state.create_session(payload, timeout))
+                    return
+                if parsed.path == "/api/http-ports/open":
+                    self._require_auth()
+                    timeout = float(payload.pop("timeout", HTTP_TUNNEL_OPEN_TIMEOUT) or HTTP_TUNNEL_OPEN_TIMEOUT)
+                    self._json(HTTPStatus.OK, state.create_http_port_tunnel(payload, timeout))
                     return
 
                 parts = [urllib.parse.unquote(p) for p in parsed.path.strip("/").split("/")]
@@ -893,6 +1230,140 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     )
             self._json(HTTPStatus.OK, {"ok": True, "size": length})
 
+        # -- client-to-client http port tunnels -------------------------------
+
+        def _http_tunnel_sse(self, session_id: str, direction: str) -> None:
+            """Relay one tunnel direction to a client as SSE frames.
+
+            SSE is a text protocol, so binary payloads ride base64-encoded. The
+            stream ends with an explicit ``{"eof": true}`` frame, which the peer
+            turns into a TCP half-close on the socket it is holding.
+            """
+            tunnel = state.get_http_tunnel(session_id)
+            if tunnel is None:
+                raise BridgeError(f"unknown http port tunnel {session_id!r}", kind="not_found")
+            pipe = tunnel.pipe(direction)
+            with state.lock:
+                tunnel.streams_open += 1
+            self.send_response(HTTPStatus.OK.value)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self._aimux_response_started = True
+            saw_eof = False
+            last_keepalive = time.monotonic()
+            try:
+                self.wfile.write(b": connected\n\n")
+                self.wfile.flush()
+                while True:
+                    try:
+                        chunk = pipe.chunks.get(timeout=TUNNEL_SSE_POLL)
+                    except queue.Empty:
+                        if pipe.producer_done.is_set():
+                            self._write_tunnel_frame({"eof": True})
+                            saw_eof = True
+                            break
+                        now = time.monotonic()
+                        if pipe.abandoned.is_set():
+                            break
+                        if now - tunnel.last_activity > HTTP_TUNNEL_IDLE_TIMEOUT:
+                            # Idle is session-wide, not per-direction: a stream
+                            # that only ever flows one way must not be killed
+                            # for the other half's silence.
+                            self._write_tunnel_frame(
+                                {
+                                    "error": {
+                                        "kind": "timeout",
+                                        "message": "tunnel idle for too long",
+                                        "code": 124,
+                                    }
+                                }
+                            )
+                            break
+                        if now - last_keepalive >= TUNNEL_SSE_KEEPALIVE:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
+                            last_keepalive = now
+                        continue
+                    self._write_tunnel_frame(
+                        {"b64": base64.b64encode(chunk).decode("ascii")}
+                    )
+                    last_keepalive = time.monotonic()
+                    state.note_tunnel_activity(session_id)
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            finally:
+                with state.lock:
+                    tunnel.streams_open = max(0, tunnel.streams_open - 1)
+                # The body has no length and is not chunked, so closing is the
+                # only honest way to end it. Skipping this leaves the peer's
+                # reader blocked on a socket that never closes.
+                self.close_connection = True
+                if not saw_eof:
+                    # The reader went away without the peer's EOF, so nobody is
+                    # left to drain this pipe. End the session rather than let
+                    # the producer block on a full queue forever.
+                    state.close_http_tunnel(session_id, reason=f"{direction} downlink ended")
+
+        def _write_tunnel_frame(self, payload: dict[str, Any]) -> None:
+            frame = "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            self.wfile.write(frame.encode("utf-8"))
+            self.wfile.flush()
+
+        def _iter_body_chunks(self) -> Iterator[bytes]:
+            """Yield this request's body as it arrives, in either framing style.
+
+            The aimux halves always send chunked (the length is unknown up
+            front), but Content-Length is accepted so the endpoint stays usable
+            from curl and from tests.
+            """
+            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                yield from _iter_chunked(self.rfile)
+                return
+            remaining = int(self.headers.get("Content-Length") or 0)
+            while remaining > 0:
+                chunk = self.rfile.read(min(HTTP_TUNNEL_CHUNK_SIZE, remaining))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+                yield chunk
+
+        def _http_tunnel_body(self, session_id: str, direction: str) -> None:
+            """Relay a client's raw request body into a tunnel queue.
+
+            Each chunk goes straight onto a bounded queue, so a slow reader
+            stops this read and applies TCP backpressure to the producer.
+            """
+            tunnel = state.get_http_tunnel(session_id)
+            if tunnel is None:
+                raise BridgeError(f"unknown http port tunnel {session_id!r}", kind="not_found")
+            pipe = tunnel.pipe(direction)
+            with state.lock:
+                tunnel.streams_open += 1
+            abandoned = False
+            try:
+                for chunk in self._iter_body_chunks():
+                    if not _put_with_backpressure(pipe, chunk):
+                        abandoned = True
+                        break
+                    state.note_tunnel_activity(session_id)
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            finally:
+                with state.lock:
+                    tunnel.streams_open = max(0, tunnel.streams_open - 1)
+                # Always signal the reader, even on an abrupt disconnect — from
+                # its side the byte stream simply ended, which is the truth.
+                state.finish_tunnel_direction(session_id, direction)
+            try:
+                self._json(HTTPStatus.OK, {"ok": True, "abandoned": abandoned})
+            except (BrokenPipeError, ConnectionError, OSError):
+                # A browser closing its tab is the normal way this ends, so the
+                # caller is often gone by the time we answer. Nothing to report.
+                self.close_connection = True
+
         def _bridge_error(self, e: BridgeError) -> None:
             status = HTTPStatus.BAD_REQUEST
             if e.exit_code == 2:
@@ -905,7 +1376,16 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                 status = HTTPStatus.NOT_FOUND
             elif e.kind == "name_conflict" or e.kind == "already_exists":
                 status = HTTPStatus.CONFLICT
-            self._json(status, {"error": {"kind": e.kind, "message": e.message, "code": e.exit_code}})
+            elif e.kind == "port_not_allowed":
+                status = HTTPStatus.FORBIDDEN
+            try:
+                self._json(status, {"error": {"kind": e.kind, "message": e.message, "code": e.exit_code}})
+            except (BrokenPipeError, ConnectionError, OSError):
+                # The caller hung up before we could answer — e.g. it timed out
+                # while this request waited on a slow remote. The error has
+                # nowhere to go, so close quietly instead of raising out of the
+                # handler thread.
+                self.close_connection = True
 
     return Handler
 

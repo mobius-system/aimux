@@ -74,11 +74,19 @@
       "profiles": [
         {"name": "cmd", "visible": true, "capture": "screen-buffer", "ansi": false, "available": true}
       ],
-      "last_seen": "2026-06-16T..."
+      "last_seen": "2026-06-16T...",
+      "client_version": "0.1.36",
+      "allow_http_ports": [8000, 8001],
+      "server_version": "0.1.36",
+      "version_mismatch": false
     }
   ]
 }
 ```
+
+- `allow_http_ports` — local ports this client permits other clients to reach
+  (§2.6). Empty array means the client cannot be connected to at all. Show it
+  in `remote ls`-style output: it is the whole security story for the tunnel.
 
 #### `GET /api/sessions`
 - 响应：
@@ -119,10 +127,14 @@
   "default_profile": "cmd",
   "profiles": [
     {"name": "cmd", "visible": true, "capture": "screen-buffer", "ansi": false, "available": true}
-  ]
+  ],
+  "allow_http_ports": [8000, 8001]
 }
 ```
 - 响应：`200 {"ok": true}`
+- `allow_http_ports`（可选，数组）：本客户端允许**其他客户端**连接的本机 loopback 端口。
+  缺省 / 缺失 / 非法值一律视为**空**（谁都连不上）——白名单必须 fail closed。
+  老 server 忽略该字段即可；老 client 不传该字段时，新 server 必须把它当作空集。
 - `client_id` 是客户端进程级稳定 ID；同一进程重连时保持不变，server 用它区分“同进程网络重连”（保留 session 记录）和“客户端进程重启”（清理 stale session 记录）。旧客户端可不传，server 必须兼容。
 - 冲突语义：
   - `replace=false` 且同名已连接 → `409 {"error": {"kind": "name_conflict", ...}}`
@@ -315,6 +327,108 @@ endpoint 完成目标握手后进入双向流转发。
 }
 ```
 
+### 2.6 客户端到客户端 HTTP 端口隧道
+
+让**一个客户端**通过 broker 访问**另一个客户端的 loopback 端口**。
+
+和 §2.3 的 `/api/forward` 的区别很关键：`/api/forward` 是 **broker 自己拨号**
+（目标在 broker 的网络视角里可见）；隧道是**目标客户端自己拨号**，所以目标可
+以藏在 NAT 后面——这正是 reverse connect 的意义。broker 不解析任何 HTTP。
+
+隧道按**字节**转发，不做任何协议解析，因此普通 HTTP、流式 SSE、WebSocket
+Upgrade 全都自动可用。
+
+#### 建会话：`POST /api/http-ports/open`
+
+```json
+{"remote_client": "a-box", "port": 8000, "timeout": 15}
+```
+
+- 响应：`200 {"session": {"id": "<uuid>", "remote_client": "a-box", "port": 8000, "created_at": "..."}}`
+- broker 必须**先**校验 `port ∈ remote_client.allow_http_ports`，不通过直接
+  `403 {"kind": "port_not_allowed"}`，**不要**惊动目标客户端。
+- 校验通过后，broker 在目标客户端的控制 SSE 上推
+  `{"type": "http_port.open", "payload": {"port": 8000, "session_id": "<uuid>"}}`，
+  并按 `timeout` 等它的 `POST /client/result`。
+- 目标客户端必须**自己再校验一次**白名单（broker 可能被攻破），不通过回
+  `port_not_allowed`；拨号失败回 `port_unreachable`。
+- 目标客户端**只能拨 `127.0.0.1`**。协议里没有"目标主机"字段，别自作主张加。
+
+#### 数据面：每条 TCP 连接一个会话，两侧各两条 HTTP 连接
+
+方向按**载荷本身**命名，而不是按谁在问：
+
+- `up` = 浏览器发出的字节（reroute 侧 → 目标）
+- `down` = 目标回应的字节（目标 → reroute 侧）
+
+| 方向 | 方法 | 端点 | 编码 |
+|---|---|---|---|
+| reroute 读 | `GET` | `/api/http-ports/stream?id=<sid>&direction=down` | SSE，`data:` 为 base64 JSON |
+| reroute 写 | `POST` | `/api/http-ports/stream?id=<sid>&direction=up` | chunked 裸字节 |
+| 目标 读 | `GET` | `/client/http-ports/stream?id=<sid>&direction=up` | SSE，`data:` 为 base64 JSON |
+| 目标 写 | `POST` | `/client/http-ports/stream?id=<sid>&direction=down` | chunked 裸字节 |
+
+两侧因此**读写方向相反**：reroute 侧读 `down`、写 `up`；目标侧读 `up`、写
+`down`。`direction` 与端点族不匹配时必须 `400 bad_request`，绝不能返回一个
+静默的空流。
+
+**下行（SSE）帧格式**——`data:` 行是一个 JSON 对象：
+
+```
+data: {"b64": "aGVsbG8="}
+
+data: {"eof": true}
+
+data: {"error": {"kind": "remote_disconnected", "message": "...", "code": 2}}
+```
+
+- 二进制必须 base64（SSE 是文本协议）。上行用 POST body，本来就是二进制，
+  **不要**再 base64，那是纯开销。
+- `{"eof": true}` 表示对端这一半结束了。
+- `{"error": ...}` 表示流因故障中断（如空闲超时），用 §3 的 kind。
+- 响应头必须带 `X-Accel-Buffering: no`，否则反代会缓冲，流式当场失效。
+- **空闲时每 15s 发一个注释帧 `: keepalive`**，否则 nginx 的
+  `proxy_read_timeout` 之类的反代会掐掉一条只是暂时没数据的隧道。
+- **流结束时必须给响应一个了断**：SSE 响应既没有 `Content-Length` 也不是
+  chunked，唯一的终止方式就是关闭连接。结束前发完 `eof` / `error` 帧后，
+  必须把连接关掉（Python 实现里是 `self.close_connection = True`）。
+  只退出 handler 而不关闭，会让对端 reader 在一个永远不关的 socket 上挂死，
+  同时泄漏一个 broker 线程、一个客户端 relay 线程和一个 fd。
+
+**上行（POST）**：请求体用 `Transfer-Encoding: chunked`，内容就是裸字节。
+请求体读完 = 该侧 EOF。单个 chunk 的声明长度不受信任，必须设上限（参考实现
+用 1 MiB），否则一个伪造的超大长度会变成一次巨型读取。
+
+#### 半关闭
+
+不需要任何自定义关闭消息，TCP 的半关闭由 HTTP 的流结束语义承载：
+
+- 某一侧的 **POST body 读完** = 该侧的 socket 收到 EOF
+- broker 关掉对侧的 **SSE 并发出 `{"eof": true}`** = 把 EOF 传过去
+
+两侧都结束时回收会话。broker 的转发队列**必须有界**：队列满时读线程阻塞，
+停止读源 socket，从而把背压一路顶回最初的生产者。用无界队列会在快生产/慢
+消费时把 broker 撑爆。
+
+两个容易踩的坑，实现时务必避开：
+
+1. **不要把 EOF 做成队列里的哨兵值**。哨兵要挤进一个已经满的队列，就只能丢
+   掉一条真实数据——`32 x 64 KiB` 以上的传输会被静默截断，而且没有任何一方
+   会察觉。EOF 用带外信号（事件 / 条件变量）表达。
+2. **生产者阻塞在满队列上时，必须能被打断**。对端 reader 消失后，没人再来
+   消费；若生产者只会永远阻塞，就永久泄漏一个 handler 线程加一个 socket。
+   关闭会话时必须唤醒它（参考实现给每个方向一个 `abandoned` 事件）。
+
+**空闲超时是按会话算的，不是按方向算的**：只单向流动的流（WebSocket 收多
+发少、SSE 长连接）不能因为另一个方向安静就被掐掉。超时应在触发时给对方发
+`{"error": {"kind": "timeout"}}` 并关闭连接。
+
+#### 相关端点
+
+- `GET /api/http-ports` → `{"sessions": [{"id", "remote_client", "port", "created_at", "streams_open"}]}`
+- 目标客户端断线时，broker 必须关掉它名下所有隧道，好让 reroute 侧立刻察觉，
+  而不是干等到空闲超时。
+
 ---
 
 ## 3. 错误响应模型
@@ -344,6 +458,8 @@ endpoint 完成目标握手后进入双向流转发。
 | `timeout` | 504 | 124 | 客户端响应超时 |
 | `too_large` | 400 | 1 | 文件超限 |
 | `client_error` | 500 | 1 | 客户端崩了 |
+| `port_not_allowed` | 403 | 1 | 目标端口不在 `--allow-http-ports` 里（§2.6） |
+| `port_unreachable` | 502 | 2 | 目标客户端拨不通自己的 `127.0.0.1:<port>`（§2.6） |
 
 `code` 字段会作为 CLI 的退出码透传，所以必须准确。
 
@@ -412,6 +528,18 @@ CLI 用同一个 `aimux remote ls` 同时显示 SSH 和 bridge 远程。冲突�
 7. `aimux get-files X /local/dir /remote/path` → 字节精确
 8. `aimux kill X/Z`
 9. SIGTERM broker → runtime.json 被删除
+
+端口隧道（§2.6）另需跑通：
+
+10. 目标客户端带 `--allow-http-ports=<P>` 注册 → `/api/remotes` 里能看到 `allow_http_ports: [P]`
+11. `POST /api/http-ports/open` 指向 `P` → 目标收到 `http_port.open` 并拨号成功
+12. 四端点接通后，普通 HTTP 请求字节精确往返
+13. **流式**：目标返回 `text/event-stream` 时，分块应**逐块**到达，而不是在响应结束时一次性吐出
+14. WebSocket Upgrade 握手返回 `101` 且回显字节精确
+15. 未在 `--allow-http-ports` 里的端口 → `403 port_not_allowed`，且目标**没有**收到任何事件
+16. 端口允许但无服务监听 → `502 port_unreachable`
+17. 一侧关闭连接 → 对侧收到 `{"eof": true}` 并在本地 socket 上表现为半关闭
+18. 目标客户端断开 SSE → 其名下所有隧道被关闭
 
 ---
 

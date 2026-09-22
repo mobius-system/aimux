@@ -19,6 +19,7 @@ from . import bridge
 from . import bridge_client
 from . import bridge_server
 from . import port_forward
+from . import port_tunnel
 from . import session as session_mod
 from . import ssh as ssh_mod
 from . import tmux
@@ -1163,7 +1164,18 @@ def cmd_reverse_connect(
             help="Windows only: run bridge shells with CREATE_NO_WINDOW and pipes (no console flash).",
         ),
     ] = False,
+    allow_http_ports: Annotated[
+        Optional[str],
+        typer.Option(
+            "--allow-http-ports",
+            help="Comma-separated local ports other bridge clients may reach, e.g. 8000,8001. Default: none, so this client cannot be connected to.",
+        ),
+    ] = None,
 ):
+    try:
+        allowed_ports = port_tunnel.parse_port_list(allow_http_ports)
+    except bridge.BridgeError as e:
+        _exit_bridge_error(e)
     try:
         bridge_client.connect(
             url,
@@ -1173,6 +1185,7 @@ def cmd_reverse_connect(
             replace=replace,
             silent_shell=silent_shell,
             silent_shell_v2=silent_shell_v2,
+            allow_http_ports=allowed_ports,
         )
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
@@ -1217,6 +1230,68 @@ def cmd_port_forward(
         _exit_bridge_error(e)
     except OSError as e:
         err(f"error: failed to start port forward: {e}")
+        raise typer.Exit(EXIT_USER_ERROR)
+    except KeyboardInterrupt:
+        raise typer.Exit(EXIT_OK)
+
+
+# ---------- local http port reroute ----------
+
+@app.command(
+    "local-http-port-reroute",
+    help="Listen on a local port and tunnel it to another bridge client's allowed HTTP port.",
+)
+def cmd_local_http_port_reroute(
+    local_port: Annotated[int, typer.Option("--local-port", help="Local port to listen on.")],
+    remote_client_id: Annotated[
+        str,
+        typer.Option("--remote-client-id", help="Bridge identifier of the client that owns the target port."),
+    ],
+    remote_client_http_port: Annotated[
+        int,
+        typer.Option("--remote-client-http-port", help="Port to reach on that client's loopback interface."),
+    ],
+    url: Annotated[
+        Optional[str],
+        typer.Option("--url", help="Bridge broker URL. Defaults to the local broker recorded in runtime.json."),
+    ] = None,
+    token: Annotated[
+        Optional[str],
+        typer.Option("--token", help="Bridge token. Defaults to the local broker recorded in runtime.json."),
+    ] = None,
+    local_host: Annotated[str, typer.Option("--local-host", help="Local listen address.")] = "127.0.0.1",
+):
+    if not 0 <= local_port <= 65535:
+        err("error: --local-port must be between 0 and 65535")
+        raise typer.Exit(EXIT_USER_ERROR)
+    if not 1 <= remote_client_http_port <= 65535:
+        err("error: --remote-client-http-port must be between 1 and 65535")
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    base_url, bridge_token = url, token
+    if not base_url or not bridge_token:
+        # Connecting to a broker on this machine is the common case, so fall
+        # back to the running broker's runtime.json instead of demanding --url.
+        runtime = bridge.read_runtime()
+        if runtime is None:
+            err("error: no local bridge broker found; pass --url and --token")
+            raise typer.Exit(EXIT_USER_ERROR)
+        base_url = base_url or runtime.url
+        bridge_token = bridge_token or runtime.token
+
+    try:
+        port_tunnel.serve_local_http_reroute(
+            local_host=local_host,
+            local_port=local_port,
+            base_url=base_url,
+            token=bridge_token,
+            remote_client=remote_client_id,
+            remote_port=remote_client_http_port,
+        )
+    except bridge.BridgeError as e:
+        _exit_bridge_error(e)
+    except OSError as e:
+        err(f"error: failed to start local http port reroute: {e}")
         raise typer.Exit(EXIT_USER_ERROR)
     except KeyboardInterrupt:
         raise typer.Exit(EXIT_OK)
