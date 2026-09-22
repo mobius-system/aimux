@@ -138,7 +138,7 @@ aimux local-http-port-reroute \
   --local-port=9000 \
   --remote-client-id=a-box \
   --remote-client-http-port=8000 \
-  --url=http://SERVER:8765 --token=<token>
+  --bridge-url=http://SERVER:8765 --token=<token>
 ```
 
 Now `http://127.0.0.1:9000` on B reaches `http://127.0.0.1:8000` on A. The
@@ -156,6 +156,12 @@ a tunnel can never become a jump host onto the rest of A's network.
 Because the traffic is tunnelled rather than proxied, B's listener sees the
 bytes exactly as A's service emitted them: absolute URLs, cookies, and `Host`
 headers all refer to A's loopback address, not to B's.
+
+The listener binds `127.0.0.1` by default. Pass `--share-to-non-localhost` to
+bind `0.0.0.0` and let other machines reach the tunnel through B as well —
+note that the listener carries no authentication of its own, so anyone who can
+reach that port reaches the tunnelled service. `--local-host <addr>` picks a
+specific interface instead.
 
 6. Upload and download files.
 

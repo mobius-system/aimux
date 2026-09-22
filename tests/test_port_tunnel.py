@@ -688,7 +688,7 @@ def test_local_http_port_reroute_prefers_explicit_url_and_token(monkeypatch):
         app,
         ["local-http-port-reroute", "--local-port", "9000",
          "--remote-client-id", "a-box", "--remote-client-http-port", "8000",
-         "--url", "https://broker/aimux", "--token", "tok"],
+         "--bridge-url", "https://broker/aimux", "--token", "tok"],
     )
 
     assert result.exit_code == 0
@@ -828,3 +828,110 @@ def test_idle_tunnel_is_closed_rather_than_left_hanging(tcp_tunnel_env, monkeypa
         local.close()
 
     assert _wait_until(lambda: broker.state.list_http_tunnels() == [])
+
+
+
+def _capture_reroute(monkeypatch) -> dict:
+    """Capture the config handed to serve_local_http_reroute, with a broker stub."""
+    captured: dict = {}
+    runtime = bridge.BridgeRuntime(
+        url="http://127.0.0.1:8765", token="t", pid=1, host="127.0.0.1", port=8765, created_at="now"
+    )
+    monkeypatch.setattr(cli.bridge, "read_runtime", lambda: runtime)
+    monkeypatch.setattr(port_tunnel, "serve_local_http_reroute", lambda **kwargs: captured.update(kwargs))
+    return captured
+
+
+def _invoke_reroute(*extra: str):
+    return CliRunner().invoke(
+        app,
+        ["local-http-port-reroute", "--local-port", "9000",
+         "--remote-client-id", "a-box", "--remote-client-http-port", "8000", *extra],
+    )
+
+# ---------------------------------------------------------------------------
+# --share-to-non-localhost
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_is_loopback_host_accepts_loopback_spellings(host):
+    assert port_tunnel.is_loopback_host(host) is True
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.5", "eth0.local", "build-box"])
+def test_is_loopback_host_treats_everything_else_as_exposed(host):
+    # An unrecognised name must warn rather than stay silent.
+    assert port_tunnel.is_loopback_host(host) is False
+
+
+def test_reroute_defaults_to_loopback(monkeypatch):
+    captured = _capture_reroute(monkeypatch)
+    result = _invoke_reroute()
+
+    assert result.exit_code == 0
+    assert captured["local_host"] == "127.0.0.1"
+
+
+def test_share_to_non_localhost_binds_all_interfaces(monkeypatch):
+    captured = _capture_reroute(monkeypatch)
+    result = _invoke_reroute("--share-to-non-localhost")
+
+    assert result.exit_code == 0
+    assert captured["local_host"] == "0.0.0.0"
+
+
+def test_share_to_non_localhost_conflicts_with_an_explicit_local_host(monkeypatch):
+    _capture_reroute(monkeypatch)
+    result = _invoke_reroute("--share-to-non-localhost", "--local-host", "192.168.1.5")
+
+    assert result.exit_code == EXIT_USER_ERROR
+    assert "conflicts with --local-host" in _output(result)
+
+
+def test_explicit_local_host_still_works(monkeypatch):
+    captured = _capture_reroute(monkeypatch)
+    result = _invoke_reroute("--local-host", "192.168.1.5")
+
+    assert result.exit_code == 0
+    assert captured["local_host"] == "192.168.1.5"
+
+
+def _run_reroute_server(monkeypatch, *, local_host: str) -> list[str]:
+    """Start the reroute listener once without blocking, returning its warnings."""
+    from loguru import logger as _logger
+
+    runtime = bridge.BridgeRuntime(
+        url="http://127.0.0.1:8765", token="t", pid=1, host="127.0.0.1", port=8765, created_at="now"
+    )
+    monkeypatch.setattr(port_tunnel, "verify_remote_allows", lambda config, timeout=None: None)
+    monkeypatch.setattr(port_tunnel._RerouteServer, "serve_forever", lambda self: None)
+
+    messages: list[str] = []
+    sink = _logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    try:
+        port_tunnel.serve_local_http_reroute(
+            local_host=local_host,
+            local_port=0,
+            base_url=runtime.url,
+            token="t",
+            remote_client="a-box",
+            remote_port=8000,
+        )
+    finally:
+        _logger.remove(sink)
+    return messages
+
+
+def test_non_loopback_bind_warns_about_exposure(monkeypatch):
+    """Binding beyond loopback removes the only thing between the network and
+    the tunnelled service, so it must not happen silently."""
+    messages = _run_reroute_server(monkeypatch, local_host="0.0.0.0")
+
+    assert any("reachable from other machines" in message for message in messages)
+
+
+def test_loopback_bind_does_not_warn(monkeypatch):
+    messages = _run_reroute_server(monkeypatch, local_host="127.0.0.1")
+
+    assert not any("reachable from other machines" in message for message in messages)

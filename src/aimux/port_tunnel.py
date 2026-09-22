@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import ipaddress
 import json
 import socket
 import socketserver
@@ -174,6 +175,20 @@ class ChunkedPost:
             self._conn.getresponse().read()
         except Exception:  # pragma: no cover - the peer may already be gone
             pass
+
+
+def is_loopback_host(host: str) -> bool:
+    """Whether binding ``host`` keeps the listener off the network.
+
+    Anything unrecognised counts as non-loopback: the warning it triggers is
+    cheap, and missing it on a typo'd interface name would not be.
+    """
+    if host in {"localhost", ""}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _shutdown_write(sock: socket.socket) -> None:
@@ -452,6 +467,15 @@ def serve_local_http_reroute(
     verify_remote_allows(config)
     server = _RerouteServer((local_host, local_port), config)
     actual_port = int(server.server_address[1])
+    if not is_loopback_host(local_host):
+        # The listener carries no authentication of its own: whatever can reach
+        # the port reaches the tunnelled service. Say so loudly, once.
+        logger.warning(
+            "http port reroute is listening on {}:{} — reachable from other machines, "
+            "and anyone who can reach it gets the tunnelled service without authentication",
+            local_host,
+            actual_port,
+        )
     logger.info(
         "aimux local http port reroute listening on {}:{} -> {}:{} via {}",
         local_host,

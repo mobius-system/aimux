@@ -1031,7 +1031,7 @@ $ aimux new --remote=worker-2 --name=task-1
 |---|---|---|
 | `aimux bridge deploy --port=<p>` | 在服务器侧启动 HTTP/SSE broker，监听 reverse client | ✅ |
 | `aimux reverse connect <url> --identifier=<name> --token=<token> [--allow-http-ports=<p,...>]` | 在 client 侧反向连接 broker，并注册 bridge remote；`--allow-http-ports` 声明本机哪些端口允许被其他 client 连接（缺省为空 = 谁都连不上） | ✅ |
-| `aimux local-http-port-reroute --local-port=<p> --remote-client-id=<name> --remote-client-http-port=<q>` | 本地监听 `<p>`，字节级隧道到 `<name>` 的 `127.0.0.1:<q>`；HTTP / SSE / WebSocket 全部透传 | ✅ |
+| `aimux local-http-port-reroute --local-port=<p> --remote-client-id=<name> --remote-client-http-port=<q> [--share-to-non-localhost\|--local-host=<addr>]` | 本地监听 `<p>`，字节级隧道到 `<name>` 的 `127.0.0.1:<q>`；HTTP / SSE / WebSocket 全部透传。默认只绑 `127.0.0.1`（`--share-to-non-localhost` 绑 `0.0.0.0` 供同网段共用，该监听无鉴权） | ✅ |
 
 被有意删除的命令（不暴露）：`run`、`rename`、`respawn`、`has`、`new-window`、`list-windows`、`select-window`、`rename-window`、`kill-window`、`split-window`、`list-panes`、`select-pane`、`kill-pane`、`kill-server`、`hosts`（被 `remote ls` 取代）、`prune`、`set-option`、`history`、`log`、`config`、`doctor`。
 

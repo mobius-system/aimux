@@ -101,7 +101,7 @@ aimux reverse connect http://SERVER:8765 --identifier=a-box --token=<token> \
 
 # on client B: local 9000 -> a-box's 127.0.0.1:8000
 aimux local-http-port-reroute --local-port=9000 --remote-client-id=a-box \
-  --remote-client-http-port=8000 --url=http://SERVER:8765 --token=<token>
+  --remote-client-http-port=8000 --bridge-url=http://SERVER:8765 --token=<token>
 ```
 
 5. Clean up.

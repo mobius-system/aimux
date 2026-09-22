@@ -1253,13 +1253,26 @@ def cmd_local_http_port_reroute(
     ],
     url: Annotated[
         Optional[str],
-        typer.Option("--url", help="Bridge broker URL. Defaults to the local broker recorded in runtime.json."),
+        typer.Option("--bridge-url", help="Bridge broker URL. Defaults to the local broker recorded in runtime.json."),
     ] = None,
     token: Annotated[
         Optional[str],
         typer.Option("--token", help="Bridge token. Defaults to the local broker recorded in runtime.json."),
     ] = None,
-    local_host: Annotated[str, typer.Option("--local-host", help="Local listen address.")] = "127.0.0.1",
+    local_host: Annotated[
+        Optional[str],
+        typer.Option("--local-host", help="Local listen address (default 127.0.0.1)."),
+    ] = None,
+    share_to_non_localhost: Annotated[
+        bool,
+        typer.Option(
+            "--share-to-non-localhost",
+            help=(
+                "Bind 0.0.0.0 so other machines on the network can use this port too. "
+                "Anyone who can reach this host then gets unauthenticated access to the tunnelled service."
+            ),
+        ),
+    ] = False,
 ):
     if not 0 <= local_port <= 65535:
         err("error: --local-port must be between 0 and 65535")
@@ -1267,6 +1280,10 @@ def cmd_local_http_port_reroute(
     if not 1 <= remote_client_http_port <= 65535:
         err("error: --remote-client-http-port must be between 1 and 65535")
         raise typer.Exit(EXIT_USER_ERROR)
+    if share_to_non_localhost and local_host:
+        err("error: --share-to-non-localhost conflicts with --local-host; use one or the other")
+        raise typer.Exit(EXIT_USER_ERROR)
+    listen_host = local_host or ("0.0.0.0" if share_to_non_localhost else "127.0.0.1")
 
     base_url, bridge_token = url, token
     if not base_url or not bridge_token:
@@ -1281,7 +1298,7 @@ def cmd_local_http_port_reroute(
 
     try:
         port_tunnel.serve_local_http_reroute(
-            local_host=local_host,
+            local_host=listen_host,
             local_port=local_port,
             base_url=base_url,
             token=bridge_token,
