@@ -45,6 +45,8 @@ _STREAM_EOF = object()
 BRIDGE_CLIENT_HEARTBEAT_INTERVAL = 180.0
 WATCHDOG_INTERVAL = 5.0
 WATCHDOG_TIMEOUT = 30.0
+# How long the graceful stop gets before the watchdog exits unconditionally.
+WATCHDOG_EXIT_GRACE = 5.0
 RUNTIME_WRITE_LOCK = threading.Lock()
 # Streaming file uploads are read/sent in 1 MiB chunks so the reverse client
 # never holds a whole file in memory while it uploads over its own outbound
@@ -1673,8 +1675,20 @@ def connect(
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
     logged_registration = False
+    # One event for "leave now", set by either the caller or the watchdog. The
+    # event stream loop watches this too — a healthy stream never ends on its
+    # own, so a stop that only the reconnect loop can see would never be acted
+    # on while the bridge is up.
     watchdog_stop = threading.Event()
     runtime_file = Path(runtime_path) if runtime_path else None
+
+    def mirror_external_stop() -> None:
+        assert stop_event is not None
+        stop_event.wait()
+        watchdog_stop.set()
+
+    if stop_event is not None:
+        threading.Thread(target=mirror_external_stop, name="aimux-stop-mirror", daemon=True).start()
 
     def runtime_update(**changes: Any) -> None:
         if runtime_file is None:
@@ -1722,6 +1736,17 @@ def connect(
                 logger.info("watchdog expired path={} age={:.1f}s, stopping AIMUX", path, age)
                 runtime_update(realtime_healthy_display=False)
                 watchdog_stop.set()
+                # Setting the event lets the main loop unwind cleanly, but it
+                # may be parked somewhere that never watches it — a register
+                # backoff while the broker is unreachable, for instance. A
+                # watchdog that depends on where the process happens to be is
+                # not a watchdog, so leave anyway if the graceful path stalls.
+                time.sleep(WATCHDOG_EXIT_GRACE)
+                logger.warning(
+                    "watchdog stop did not take effect within {:g}s; exiting",
+                    WATCHDOG_EXIT_GRACE,
+                )
+                os._exit(0)
                 return
 
     watchdog_thread = threading.Thread(target=watchdog_loop, name="aimux-watchdog", daemon=True)
@@ -1771,7 +1796,7 @@ def connect(
                         runtime=runtime,
                         base=base,
                         token=token,
-                        stop_event=stop_event,
+                        stop_event=watchdog_stop,
                         poll_interval=stream_poll_interval,
                         heartbeat_interval=heartbeat_interval,
                     )
