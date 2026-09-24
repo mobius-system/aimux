@@ -1084,6 +1084,36 @@ def _open_events(url: str, token: str, identifier: str):
     return urllib.request.urlopen(req, timeout=None)
 
 
+def _unblock_response(response: Any) -> None:
+    """Wake the event-stream reader so the response can be closed promptly.
+
+    ``io.BufferedReader.close()`` takes the same buffer lock the reader thread
+    holds while it is blocked in ``recv``. Closing a quiet stream therefore
+    waits for the next frame to arrive — with a 15s heartbeat that is up to a
+    15s stall on Ctrl+C, and it looks intermittent because it depends on where
+    in the heartbeat cycle the interrupt lands.
+
+    Shutting the socket down makes that ``recv`` return immediately, so the
+    reader releases the lock and the close finishes at once. The descriptor is
+    duplicated first: shutting down a socket that CPython still owns would
+    otherwise disturb the object we are about to close.
+    """
+    try:
+        fd = response.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        duplicate = socket.socket(fileno=os.dup(fd))
+    except OSError:
+        return
+    try:
+        duplicate.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    finally:
+        duplicate.close()
+
+
 def _iter_sse(response) -> Any:
     data_lines: list[str] = []
     for raw in response:
@@ -1706,16 +1736,23 @@ def connect(
             else:
                 logger.info("bridge remote {!r} re-registered before reconnecting event stream", identifier)
             with _open_events(base, token, identifier) as response:
-                runtime_update(realtime_healthy_display=True, last_healthy_heartbeat=int(time.time() * 1000), need_external_restart=False)
-                _serve_event_stream(
-                    response,
-                    runtime=runtime,
-                    base=base,
-                    token=token,
-                    stop_event=stop_event,
-                    poll_interval=stream_poll_interval,
-                    heartbeat_interval=heartbeat_interval,
-                )
+                try:
+                    runtime_update(realtime_healthy_display=True, last_healthy_heartbeat=int(time.time() * 1000), need_external_restart=False)
+                    _serve_event_stream(
+                        response,
+                        runtime=runtime,
+                        base=base,
+                        token=token,
+                        stop_event=stop_event,
+                        poll_interval=stream_poll_interval,
+                        heartbeat_interval=heartbeat_interval,
+                    )
+                finally:
+                    # Shut the socket down before the context manager closes it:
+                    # closing a buffered response takes the same lock the reader
+                    # holds while blocked in recv, so a quiet stream would stall
+                    # the shutdown until the next frame — up to a full heartbeat.
+                    _unblock_response(response)
             disconnect_error = OSError("bridge server closed the event stream")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             disconnect_error = e
