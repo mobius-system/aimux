@@ -1084,6 +1084,28 @@ def _open_events(url: str, token: str, identifier: str):
     return urllib.request.urlopen(req, timeout=None)
 
 
+def _time_since_last_feed(path: Path, timeout: float) -> float:
+    """Seconds since the owning TUI/Electron last fed this watchdog.
+
+    The owner rewrites ``last_feed_watchdog`` (epoch milliseconds) every few
+    seconds, and that field is the *only* liveness signal. The file's mtime
+    deliberately does not count: the daemon writes the same file for its own
+    runtime state — on start, on every reconnect, on disconnect — so a daemon
+    whose owner had died would keep refreshing the mtime and feed its own
+    watchdog, never noticing that nobody is left.
+
+    A file we cannot read, or one with no usable feed recorded, is treated as
+    expired: the watchdog exists to catch exactly the case where the signal is
+    missing, so guessing in the other direction would defeat it.
+    """
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        fed_at_ms = float(state["last_feed_watchdog"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return timeout + 1
+    return time.time() - fed_at_ms / 1000.0
+
+
 def _unblock_response(response: Any) -> None:
     """Wake the event-stream reader so the response can be closed promptly.
 
@@ -1685,11 +1707,17 @@ def connect(
         except OSError as exc:
             logger.warning("watchdog unavailable path={} error={}", path, exc)
             return
+        if runtime_file is None:
+            # Nothing will ever write last_feed_watchdog, so this is a countdown,
+            # not a watchdog. Say so rather than exiting silently later.
+            logger.warning(
+                "watchdog path={} was given without --runtime: no feed can be recorded, "
+                "so AIMUX will exit after {:g}s",
+                path,
+                watchdog_timeout,
+            )
         while not watchdog_stop.wait(WATCHDOG_INTERVAL):
-            try:
-                age = time.time() - path.stat().st_mtime
-            except OSError:
-                age = watchdog_timeout + 1
+            age = _time_since_last_feed(path, watchdog_timeout)
             if age > watchdog_timeout:
                 logger.info("watchdog expired path={} age={:.1f}s, stopping AIMUX", path, age)
                 runtime_update(realtime_healthy_display=False)
