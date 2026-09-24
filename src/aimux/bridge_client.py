@@ -43,6 +43,9 @@ from .transfer import (
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _STREAM_EOF = object()
 BRIDGE_CLIENT_HEARTBEAT_INTERVAL = 180.0
+WATCHDOG_INTERVAL = 5.0
+WATCHDOG_TIMEOUT = 30.0
+RUNTIME_WRITE_LOCK = threading.Lock()
 # Streaming file uploads are read/sent in 1 MiB chunks so the reverse client
 # never holds a whole file in memory while it uploads over its own outbound
 # data connection.
@@ -1184,6 +1187,25 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
     _post_json(f"{base}/client/result", token, response_payload)
 
 
+def _data_plane_target(base: str) -> tuple[http.client.HTTPConnection, str]:
+    """Open a connection for the client's own data endpoints, with the base path.
+
+    The broker URL may carry a path prefix — ``https://host/aimux_bridge`` is a
+    documented form, and it is how the Mobius gateway exposes the broker. The
+    data endpoints live *under* that prefix, so dropping it (as building
+    ``/client/data`` by hand does) sends the request somewhere that is not the
+    broker at all. Returns the connection and the prefix to prepend.
+    """
+    parsed = urllib.parse.urlsplit(base)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if parsed.scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=None)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=None)
+    return conn, parsed.path.rstrip("/")
+
+
 def _stream_file_upload(base: str, token: str, request_id: str, path: Path, runtime: ReverseClientRuntime) -> None:
     """Stream a local file up to the broker over the remote's own outbound data
     connection (``POST /client/data``) in 1 MiB chunks. Runs on a dedicated
@@ -1191,15 +1213,9 @@ def _stream_file_upload(base: str, token: str, request_id: str, path: Path, runt
     ``/client/result`` so the broker's read-stream handler can surface it."""
     conn: http.client.HTTPConnection | None = None
     try:
-        parsed = urllib.parse.urlsplit(base)
-        host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        if parsed.scheme == "https":
-            conn = http.client.HTTPSConnection(host, port, timeout=None)
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=None)
+        conn, base_path = _data_plane_target(base)
         size = path.stat().st_size
-        conn.putrequest("POST", f"/client/data?id={urllib.parse.quote(request_id)}")
+        conn.putrequest("POST", f"{base_path}/client/data?id={urllib.parse.quote(request_id)}")
         conn.putheader("Authorization", f"Bearer {token}")
         conn.putheader("Content-Type", "application/octet-stream")
         conn.putheader("Content-Length", str(size))
@@ -1211,7 +1227,15 @@ def _stream_file_upload(base: str, token: str, request_id: str, path: Path, runt
                     break
                 conn.send(chunk)
         response = conn.getresponse()
-        response.read()
+        body = response.read()
+        if response.status != 200:
+            # Without this check any non-broker reply (a gateway 404, say) looks
+            # like a successful upload, and the far side waits out its timeout
+            # instead of reporting what actually went wrong.
+            raise BridgeError(
+                f"data stream error {response.status}: {body.decode('utf-8', errors='replace')}",
+                kind="remote_disconnected",
+            )
         logger.info(
             "bridge client streamed file identifier={} request_id={} size={}",
             runtime.identifier,
@@ -1261,14 +1285,8 @@ def _stream_file_download(base: str, token: str, request_id: str, path: Path, ru
     arrives. Reports the write result via ``/client/result`` when done."""
     conn: http.client.HTTPConnection | None = None
     try:
-        parsed = urllib.parse.urlsplit(base)
-        host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        if parsed.scheme == "https":
-            conn = http.client.HTTPSConnection(host, port, timeout=None)
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=None)
-        conn.putrequest("GET", f"/client/data?id={urllib.parse.quote(request_id)}")
+        conn, base_path = _data_plane_target(base)
+        conn.putrequest("GET", f"{base_path}/client/data?id={urllib.parse.quote(request_id)}")
         conn.putheader("Authorization", f"Bearer {token}")
         conn.putheader("Accept", "application/octet-stream")
         conn.endheaders()
@@ -1588,6 +1606,9 @@ def connect(
     stop_event: threading.Event | None = None,
     stream_poll_interval: float = 0.2,
     heartbeat_interval: float = BRIDGE_CLIENT_HEARTBEAT_INTERVAL,
+    watchdog_path: str | os.PathLike[str] | None = None,
+    watchdog_timeout: float = WATCHDOG_TIMEOUT,
+    runtime_path: str | os.PathLike[str] | None = None,
 ) -> None:
     validate_identifier(identifier)
     runtime = ReverseClientRuntime(
@@ -1600,10 +1621,59 @@ def connect(
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
     logged_registration = False
+    watchdog_stop = threading.Event()
+    runtime_file = Path(runtime_path) if runtime_path else None
+
+    def runtime_update(**changes: Any) -> None:
+        if runtime_file is None:
+            return
+        with RUNTIME_WRITE_LOCK:
+            try:
+                runtime_file.parent.mkdir(parents=True, exist_ok=True)
+                state: dict[str, Any] = {}
+                if runtime_file.exists():
+                    try:
+                        state = json.loads(runtime_file.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        state = {}
+                state.update(changes)
+                tmp = runtime_file.with_name(runtime_file.name + f".tmp-{os.getpid()}")
+                tmp.write_text(json.dumps(state, separators=(",", ":"), ensure_ascii=True), encoding="utf-8")
+                os.replace(tmp, runtime_file)
+            except OSError as exc:
+                logger.warning("runtime state write failed path={} error={}", runtime_file, exc)
+
+    runtime_update(pid=os.getpid(), launched_at=int(time.time() * 1000), last_feed_watchdog=int(time.time() * 1000), realtime_healthy_display=False, need_external_restart=False)
+
+    def watchdog_loop() -> None:
+        path = Path(watchdog_path) if watchdog_path else None
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.touch(exist_ok=True)
+        except OSError as exc:
+            logger.warning("watchdog unavailable path={} error={}", path, exc)
+            return
+        while not watchdog_stop.wait(WATCHDOG_INTERVAL):
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                age = watchdog_timeout + 1
+            if age > watchdog_timeout:
+                logger.info("watchdog expired path={} age={:.1f}s, stopping AIMUX", path, age)
+                runtime_update(realtime_healthy_display=False)
+                watchdog_stop.set()
+                return
+
+    watchdog_thread = threading.Thread(target=watchdog_loop, name="aimux-watchdog", daemon=True)
+    watchdog_thread.start()
 
     intervals = reconnect_intervals if reconnect_intervals is not None else RECONNECT_INTERVALS
     attempt = 0
     while True:
+        if watchdog_stop.is_set():
+            return
         disconnect_error: Exception | None
         try:
             register_response = _register_with_retry(
@@ -1636,6 +1706,7 @@ def connect(
             else:
                 logger.info("bridge remote {!r} re-registered before reconnecting event stream", identifier)
             with _open_events(base, token, identifier) as response:
+                runtime_update(realtime_healthy_display=True, last_healthy_heartbeat=int(time.time() * 1000), need_external_restart=False)
                 _serve_event_stream(
                     response,
                     runtime=runtime,
@@ -1648,6 +1719,7 @@ def connect(
             disconnect_error = OSError("bridge server closed the event stream")
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             disconnect_error = e
+            runtime_update(realtime_healthy_display=False)
 
         if not reconnect:
             raise BridgeError(
@@ -1655,6 +1727,8 @@ def connect(
                 kind="remote_disconnected",
                 exit_code=2,
             )
+        if watchdog_stop.is_set():
+            return
         if attempt >= len(intervals):
             raise BridgeError(
                 f"bridge connection lost after {len(intervals)} retries: {disconnect_error}",

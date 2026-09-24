@@ -1171,6 +1171,9 @@ def cmd_reverse_connect(
             help="Comma-separated local ports other bridge clients may reach, e.g. 8000,8001. Default: none, so this client cannot be connected to.",
         ),
     ] = None,
+    watchdog: Annotated[Optional[str], typer.Option("--watchdog", help="Path to a TUI/Electron keepalive file; exit when it is stale.")] = None,
+    watchdog_timeout: Annotated[float, typer.Option("--watchdog-timeout", help="Seconds without keepalive before AIMUX exits.")] = 30.0,
+    runtime: Annotated[Optional[str], typer.Option("--runtime", help="Path to AIMUX runtime JSON state.")] = None,
 ):
     try:
         allowed_ports = port_tunnel.parse_port_list(allow_http_ports)
@@ -1186,6 +1189,9 @@ def cmd_reverse_connect(
             silent_shell=silent_shell,
             silent_shell_v2=silent_shell_v2,
             allow_http_ports=allowed_ports,
+            watchdog_path=watchdog,
+            watchdog_timeout=watchdog_timeout,
+            runtime_path=runtime,
         )
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
