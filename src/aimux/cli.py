@@ -1411,6 +1411,21 @@ def _read_remote_bytes(remote: str, path: str) -> bytes:
         raise typer.Exit(EXIT_USER_ERROR)
 
 
+def _entry_name(entry: dict) -> str:
+    """Display name for a `file list` row.
+
+    Bridge remotes report only ``path`` (plus type/size/sha256) while the SSH
+    path may also carry ``name``, so fall back to the basename. Split on both
+    separators: the reverse client can be a Windows box, where ``path`` uses
+    backslashes that ``Path.name`` would keep.
+    """
+    name = str(entry.get("name") or "")
+    if name:
+        return name
+    raw = str(entry.get("path") or "")
+    return raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or raw
+
+
 @file_app.command("list", help="List a remote directory.")
 def cmd_file_list(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
@@ -1441,7 +1456,7 @@ def cmd_file_list(
     for e in entries:
         kind = str(e.get("type") or "?")[:1]
         size = e.get("size")
-        rows.append([kind, str(size) if size else "-", str(e.get("name") or "")])
+        rows.append([kind, str(size) if size else "-", _entry_name(e)])
     emit_table(["T", "SIZE", "NAME"], rows)
 
 

@@ -935,3 +935,60 @@ def test_cli_send_files_falls_through_to_ssh_error_when_no_bridge(monkeypatch, t
 
     assert result.exit_code == EXIT_USER_ERROR
     assert "not found in ~/.ssh/config or bridge registry" in result.output
+
+
+# ---------------------------------------------------------------------------
+# file.list robustness
+# ---------------------------------------------------------------------------
+
+
+def test_file_list_survives_an_unreadable_file(tmp_path):
+    """One unreadable file must not fail the whole listing.
+
+    The digest was computed unconditionally, so listing a directory that
+    contains anything root-owned (``/etc/.pwd.lock`` and friends) errored out
+    instead of listing what it could.
+    """
+    from aimux.bridge_client import _sha256_file
+
+    runtime = _runtime()
+    readable = tmp_path / "ok.txt"
+    readable.write_text("hi")
+    locked = tmp_path / "locked.txt"
+    locked.write_text("secret")
+    locked.chmod(0o000)
+
+    try:
+        result = runtime.handle("file.list", {"path": str(tmp_path), "recursive": False})
+    finally:
+        locked.chmod(0o600)
+
+    by_name = {Path(e["path"]).name: e for e in result["entries"]}
+    assert set(by_name) == {"ok.txt", "locked.txt"}
+    assert by_name["ok.txt"]["sha256"] == _sha256_file(readable)
+    assert "sha256" not in by_name["locked.txt"], "an unreadable file has no digest to report"
+
+
+def test_file_list_still_digests_when_everything_is_readable(tmp_path):
+    runtime = _runtime()
+    (tmp_path / "a.txt").write_text("a")
+
+    result = runtime.handle("file.list", {"path": str(tmp_path), "recursive": False})
+
+    assert [e["sha256"] for e in result["entries"]][0]
+
+
+def test_file_list_entry_names_fall_back_to_the_path():
+    """Bridge entries carry no `name`; the CLI must derive one.
+
+    Regression: `aimux file list <bridge-remote>` printed a blank NAME column
+    because the renderer read a field only the SSH path provides.
+    """
+    from aimux.cli import _entry_name
+
+    assert _entry_name({"path": "/tmp/smoke/a.txt"}) == "a.txt"
+    assert _entry_name({"path": "/tmp/smoke/", "type": "dir"}) == "smoke"
+    # A Windows reverse client reports backslash paths.
+    assert _entry_name({"path": r"C:\Users\dev\a.txt"}) == "a.txt"
+    # An explicit name still wins when one is present.
+    assert _entry_name({"path": "/tmp/x", "name": "given"}) == "given"

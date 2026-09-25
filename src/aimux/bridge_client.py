@@ -967,13 +967,7 @@ class ReverseClientRuntime:
         if not path.exists():
             raise BridgeError(f"path does not exist: {path}", kind="not_found")
         if path.is_file():
-            entries = [{
-                "path": str(path),
-                "type": "file",
-                "size": path.stat().st_size,
-                "sha256": _sha256_file(path),
-            }]
-            return {"entries": entries}
+            return {"entries": [self._file_entry(path)]}
         if not path.is_dir():
             raise BridgeError(f"not a directory: {path}", kind="bad_request")
         recursive = bool(payload.get("recursive", True))
@@ -987,15 +981,30 @@ class ReverseClientRuntime:
                 entries.append({"path": str(child), "type": "symlink", "size": 0})
                 continue
             if child.is_file():
-                entries.append({
-                    "path": str(child),
-                    "type": "file",
-                    "size": child.stat().st_size,
-                    "sha256": _sha256_file(child),
-                })
+                entries.append(self._file_entry(child))
             elif child.is_dir():
                 entries.append({"path": str(child), "type": "dir", "size": 0})
         return {"entries": entries}
+
+    @staticmethod
+    def _file_entry(path: Path) -> dict[str, Any]:
+        """One ``file list`` entry, with a best-effort digest.
+
+        Without this a single unreadable file (``/etc/.pwd.lock``, anything
+        under a root-owned directory) failed the entire listing. The digest is
+        optional: sync-dir falls back to reading the file when it is absent,
+        which is the right place for that cost to land.
+        """
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        entry: dict[str, Any] = {"path": str(path), "type": "file", "size": size}
+        try:
+            entry["sha256"] = _sha256_file(path)
+        except OSError:
+            pass
+        return entry
 
     def _file_archive(self, payload: dict[str, Any]) -> dict[str, Any]:
         path = self._file_path(payload)
