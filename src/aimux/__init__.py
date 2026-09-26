@@ -1,2 +1,2 @@
 """aimux — AI-agent-friendly tmux wrapper."""
-__version__ = "0.3.57"
+__version__ = "0.3.58"
