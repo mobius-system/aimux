@@ -480,16 +480,34 @@ def build_send_files_plan(
     return SendFilesPlan(sources, remote_path, tuple(entries), _sort_remote_dirs(dirs), skipped)
 
 
+def _prepare_local_destination(local_dir: str | Path) -> Path:
+    """Resolve the local directory a download lands in, creating it if needed.
+
+    Anything that makes that impossible — a file where the directory should be,
+    a parent we cannot search, a read-only tree — is reported as a transfer
+    error. Letting the OSError escape turned a mistyped argument into a raw
+    Python traceback.
+    """
+    destination = Path(local_dir).expanduser()
+    # ``exists()`` is False when a parent is unsearchable, so this only catches
+    # what we can actually see; the mkdir guard below covers the rest.
+    if destination.exists() and not destination.is_dir():
+        raise TransferError(f"local destination is not a directory: {destination}")
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise TransferError(
+            f"cannot use local destination {destination}: {exc.strerror or exc}"
+        ) from exc
+    return destination.resolve()
+
+
 def build_get_files_plan(remote_paths: Iterable[str], local_dir: str | Path) -> GetFilesPlan:
     remotes = tuple(remote_paths)
     if not remotes:
         raise TransferError("get_files requires at least one remote path")
 
-    destination = Path(local_dir).expanduser()
-    if destination.exists() and not destination.is_dir():
-        raise TransferError(f"local destination is not a directory: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
-    destination = destination.resolve()
+    destination = _prepare_local_destination(local_dir)
     _validate_sftp_path(str(destination))
 
     entries: list[DownloadEntry] = []
@@ -796,10 +814,7 @@ def bridge_get_files(
     remotes = tuple(remote_paths)
     if not remotes:
         raise TransferError("get_files requires at least one remote path")
-    destination = Path(local_dir).expanduser().resolve()
-    if destination.exists() and not destination.is_dir():
-        raise TransferError(f"local destination is not a directory: {destination}")
-    destination.mkdir(parents=True, exist_ok=True)
+    destination = _prepare_local_destination(local_dir)
     validate_transfer_path(str(destination))
 
     entries: list[DownloadEntry] = []

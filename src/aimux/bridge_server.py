@@ -1076,20 +1076,8 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
             if stream is None:
                 raise BridgeError(f"unknown data stream {request_id!r}", kind="not_found")
             q = stream[0]
-            length = int(self.headers.get("Content-Length") or 0)
-            remaining = length if length > 0 else None
             try:
-                while True:
-                    if remaining is not None and remaining <= 0:
-                        break
-                    read_size = STREAM_CHUNK_SIZE
-                    if remaining is not None:
-                        read_size = min(read_size, remaining)
-                    chunk = self.rfile.read(read_size)
-                    if not chunk:
-                        break
-                    if remaining is not None:
-                        remaining -= len(chunk)
+                for chunk in self._data_body_chunks():
                     q.put(chunk)
                 q.put(None)
             except (BrokenPipeError, ConnectionError, OSError) as exc:
@@ -1097,6 +1085,32 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
             finally:
                 state.close_stream(request_id)
             self._json(HTTPStatus.OK, {"ok": True})
+
+        def _data_body_chunks(self) -> Iterator[bytes]:
+            """Yield the upload body, honouring whichever framing it arrives in.
+
+            A proxy between the remote and the broker may drop Content-Length
+            and let Node re-frame the body as chunked. Reading those bytes raw
+            mixes the framing into the payload *and* never reaches a clean end,
+            so the stream stalls until the idle timeout and arrives truncated.
+            """
+            if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+                yield from _iter_chunked(self.rfile)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            remaining = length if length > 0 else None
+            while True:
+                if remaining is not None and remaining <= 0:
+                    return
+                read_size = STREAM_CHUNK_SIZE
+                if remaining is not None:
+                    read_size = min(read_size, remaining)
+                chunk = self.rfile.read(read_size)
+                if not chunk:
+                    return
+                if remaining is not None:
+                    remaining -= len(chunk)
+                yield chunk
 
         def _read_stream(self, remote: str, payload: dict[str, Any]) -> None:
             """Stream a file read back to the CLI as application/octet-stream.

@@ -79,11 +79,17 @@ file_app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
     help=(
-        "Fine-grained file operations (list/stat/read/write/mkdir/delete/rename) "
-        "on an SSH or bridge remote. Auto-dispatches by remote name."
+        "The file API — fine-grained operations on an SSH or bridge remote "
+        "(list/stat/read/write/mkdir/delete/rename). Every other file command is a "
+        "shortcut over these: send-files = mkdir + write, get-files = stat + read, "
+        "sync-dir = list + read/write + archive. Auto-dispatches by remote name."
     ),
 )
-app.add_typer(file_app, name="file")
+# Hidden: the file API is the layer the visible commands are built on, not a
+# surface we ask users to learn. It stays invocable for the SSH/bridge
+# dispatch and for debugging, but send-files / get-files / sync-dir are the
+# documented way in.
+app.add_typer(file_app, name="file", hidden=True)
 
 mcp_app = typer.Typer(
     add_completion=False,
@@ -404,7 +410,10 @@ def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> 
     raise typer.Exit(EXIT_USER_ERROR)
 
 
-@app.command("send-files", help="Upload multiple local files or directories to an SSH or bridge remote.")
+@app.command(
+    "send-files",
+    help="Shortcut over the file API: upload files or directories (mkdir + write).",
+)
 def cmd_send_files(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
     remote_path: Annotated[str, typer.Argument(help="Destination directory on the remote host.")],
@@ -450,7 +459,10 @@ def cmd_send_files(
 
 # ---------- get-files ----------
 
-@app.command("get-files", help="Download multiple remote files or directories from an SSH or bridge remote.")
+@app.command(
+    "get-files",
+    help="Shortcut over the file API: download files or directories (stat + read).",
+)
 def cmd_get_files(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
     local_dir: Annotated[str, typer.Argument(help="Local destination directory.")],
@@ -556,7 +568,10 @@ def _sync_dir_progress(phase: str, payload: dict[str, object]) -> None:
         print("sync-dir: done")
 
 
-@app.command("sync-dir", help="Differentially synchronize a local directory with a bridge remote directory.")
+@app.command(
+    "sync-dir",
+    help="Shortcut over the file API: differentially sync a directory (list + read/write + archive).",
+)
 def cmd_sync_dir(
     remote: Annotated[str, typer.Argument(help="Bridge remote name.")],
     remote_path: Annotated[str, typer.Argument(help="Remote directory path.")],
