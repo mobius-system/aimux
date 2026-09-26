@@ -327,6 +327,31 @@ endpoint 完成目标握手后进入双向流转发。
 }
 ```
 
+#### 流式数据面：`/client/data`（大文件不走上面这些）
+
+上面 `read` / `write` 把整个文件放进一条 JSON 消息（base64），只适合小文件。超过阈值时走独立的裸字节通道，
+由 **remote 自己发起到 broker**（反向连接的方向是 remote → broker，broker 无法主动连它）：
+
+| 方向 | 发起方 | 端点 |
+|---|---|---|
+| remote → broker（下载） | remote `POST` | `POST /client/data?id=<request_id>` |
+| broker → remote（上传） | remote `GET` | `GET /client/data?id=<request_id>` |
+
+- body / 响应体是**裸字节**：没有 base64，也没有 JSON 包装。
+- `request_id` 由 broker 在控制 SSE 的任务里下发（`file.open_read` / `file.open_write`），
+  remote 拿到后自己拨号；bulk 数据因此不占用控制通道。
+- **分片上传（v0.3.59 起）**：同一个 `id` 可以分多次 `POST`，用 `seq` 从 0 递增保序，
+  最后一片带 `final=1` 才结束这条流。分片大小由 broker 在任务 payload 里用 `slice_size` 告知，
+  remote 收到才分片；**老 remote 忽略该字段、只发一次 body，语义仍然合法**（收完即 EOF），
+  因此两个方向都能混用新旧实现。
+- broker 侧必须同时支持 `Transfer-Encoding: chunked` 与 `Content-Length`（中间代理会改写 framing）；
+  两者都没有时按**空 body** 处理——**不能**读到连接关闭为止，keep-alive 连接没有 EOF，会一直挂到超时。
+- 分片乱序到达时必须**拒绝**（而不是照样入队），否则文件会被静默拼错。
+
+为什么要有分片：中间的反向代理（nginx 默认 `proxy_request_buffering on`）会把整个请求体收完才转发。
+一个巨大的 POST 会让接收侧在整个上传期间一个字节都看不到——表现为"进度条出现前卡十几秒"，
+而且文件越大卡得越久；分片同时还避开了代理默认的请求体大小上限。
+
 ### 2.6 客户端到客户端 HTTP 端口隧道
 
 让**一个客户端**通过 broker 访问**另一个客户端的 loopback 端口**。
@@ -528,6 +553,13 @@ CLI 用同一个 `aimux remote ls` 同时显示 SSH 和 bridge 远程。冲突�
 7. `aimux get-files X /local/dir /remote/path` → 字节精确
 8. `aimux kill X/Z`
 9. SIGTERM broker → runtime.json 被删除
+
+流式数据面（§2.5 末）另需跑通：
+
+- 老 remote × 新 broker：单个不带 `seq` 的 `POST /client/data` → 字节精确，流在收完即结束
+- 新 remote × 老 broker：broker 不下发 `slice_size` → remote 发单次 body → 字节精确
+- 新 × 新：`slice_size` 分片上传 → 字节精确，且**首字节在几十毫秒内到达**（不是整个文件传完之后）
+- 乱序 `seq` → 400，且流未被污染
 
 端口隧道（§2.6）另需跑通：
 

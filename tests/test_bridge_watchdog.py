@@ -134,6 +134,9 @@ def _run_connect(monkeypatch, tmp_path, *, stream, stop_grace: float = 5.0):
     monkeypatch.setattr(bridge_client, "WATCHDOG_EXIT_GRACE", stop_grace)
     monkeypatch.setattr(bridge_client, "_post_json", lambda *a, **k: {})
     monkeypatch.setattr(bridge_client, "_open_events", lambda *a, **k: stream)
+    # A watchdog that fires after the test stopped waiting would otherwise
+    # exit the process and take the whole run down with it.
+    monkeypatch.setattr(bridge_client.os, "_exit", lambda code: None)
 
     runtime_file = tmp_path / "runtime.json"
     runtime_file.write_text(

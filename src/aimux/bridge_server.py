@@ -45,6 +45,13 @@ BRIDGE_SERVER_HEARTBEAT_LOG_INTERVAL = 180.0
 STREAM_CHUNK_SIZE = 1024 * 1024
 STREAM_OPEN_TIMEOUT = 60.0  # remote must open its data connection within this
 STREAM_IDLE_TIMEOUT = 60.0  # max gap between chunks before we give up
+# How much of a file a remote puts into one upload body. Small on purpose: a
+# proxy sitting in front of the broker (nginx, with request buffering on by
+# default) does not forward a request body until it has received all of it, so
+# one big POST leaves the receiving side staring at nothing for the entire
+# upload and then delivers it all at once. It also keeps every body under a
+# proxy's default body size cap.
+DATA_UPLOAD_SLICE_SIZE = 512 * 1024
 
 # Client-to-client HTTP port tunnels. Each session is two independent byte
 # pipes (one per direction) between two reverse clients, so the broker never
@@ -258,6 +265,10 @@ class BridgeBrokerState:
         # remote's GET /client/data; result_q (write only) carries the remote's
         # write outcome so it never races the data chunks on data_q.
         self._streams: dict[str, tuple[queue.Queue, threading.Event | None, queue.Queue | None]] = {}
+        # request_id -> number of the next upload slice expected on a read
+        # stream. Slices carry their number so a reordered upload fails loudly
+        # instead of silently splicing the file together wrong.
+        self.read_seq: dict[str, int] = {}
         # session_id -> HttpPortTunnel. See create_http_port_tunnel.
         self.http_tunnels: dict[str, HttpPortTunnel] = {}
         self.lock = threading.RLock()
@@ -625,7 +636,16 @@ class BridgeBrokerState:
             request_id = str(uuid.uuid4())
             q: queue.Queue = queue.Queue()
             self._streams[request_id] = (q, None, None)
-            client.queue.put({"id": request_id, "type": "file.open_read", "payload": {"path": path}})
+            self.read_seq[request_id] = 0
+            client.queue.put(
+                {
+                    "id": request_id,
+                    "type": "file.open_read",
+                    # Advertised so the remote chops its upload up. Clients
+                    # that predate this key ignore it and send one body.
+                    "payload": {"path": path, "slice_size": DATA_UPLOAD_SLICE_SIZE},
+                }
+            )
             logger.info(
                 "bridge broker opened read stream remote={!r} request_id={} path={!r}",
                 remote,
@@ -670,9 +690,19 @@ class BridgeBrokerState:
         with self.lock:
             return self._streams.get(request_id)
 
+    def claim_read_slice(self, request_id: str, seq: int) -> bool:
+        """Reserve upload slice ``seq`` of a read stream, if it is the next one."""
+        with self.lock:
+            expected = self.read_seq.get(request_id)
+            if expected is None or seq != expected:
+                return False
+            self.read_seq[request_id] = seq + 1
+            return True
+
     def close_stream(self, request_id: str) -> None:
         with self.lock:
             self._streams.pop(request_id, None)
+            self.read_seq.pop(request_id, None)
 
     # -- client-to-client http port tunnels -----------------------------------
 
@@ -904,7 +934,18 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     self._require_auth()
                     query = urllib.parse.parse_qs(parsed.query)
                     request_id = (query.get("id") or [""])[0]
-                    self._data_upload(request_id)
+                    raw_seq = (query.get("seq") or [""])[0]
+                    seq: int | None = None
+                    if raw_seq:
+                        try:
+                            seq = int(raw_seq)
+                        except ValueError:
+                            raise BridgeError("seq must be an integer", kind="bad_request")
+                    self._data_upload(
+                        request_id,
+                        seq=seq,
+                        final=(query.get("final") or ["1"])[0] != "0",
+                    )
                     return
                 if parsed.path in ("/api/http-ports/stream", "/client/http-ports/stream"):
                     # Raw byte body: route before _read_json, which would
@@ -1064,25 +1105,42 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
             finally:
                 state.disconnect_events(identifier, q)
 
-        def _data_upload(self, request_id: str) -> None:
+        def _data_upload(self, request_id: str, *, seq: int | None = None, final: bool = True) -> None:
             """Relay the remote's raw /client/data body into the waiting CLI stream.
 
             Reads the request body in 1 MiB chunks and pushes each onto the
             stream queue; ``None`` marks EOF, a ``dict`` marks a mid-stream
             failure. Runs in its own handler thread (ThreadingHTTPServer), so
             bulk data never stalls the control SSE handler for this remote.
+
+            A slicing client sends a file as consecutive bodies sharing one
+            stream: ``seq`` numbers them and only the final slice puts EOF on
+            the queue. ``seq=None`` is the single-shot form older clients send,
+            which still ends the stream in one go.
             """
             stream = state.get_stream(request_id)
             if stream is None:
                 raise BridgeError(f"unknown data stream {request_id!r}", kind="not_found")
+            if seq is not None and not state.claim_read_slice(request_id, seq):
+                # The bytes would land in the wrong place, so refuse rather
+                # than corrupt the file. The body goes unread, which would
+                # desync the next request on a kept-alive connection, so close.
+                self.close_connection = True
+                raise BridgeError(
+                    f"data slice {seq} is out of order for stream {request_id!r}",
+                    kind="bad_request",
+                )
             q = stream[0]
+            dead = False
             try:
                 for chunk in self._data_body_chunks():
                     q.put(chunk)
-                q.put(None)
+                if final:
+                    q.put(None)
             except (BrokenPipeError, ConnectionError, OSError) as exc:
+                dead = True
                 q.put({"error": {"kind": "remote_disconnected", "message": str(exc), "code": 2}})
-            finally:
+            if final or dead:
                 state.close_stream(request_id)
             self._json(HTTPStatus.OK, {"ok": True})
 
@@ -1097,19 +1155,16 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
             if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
                 yield from _iter_chunked(self.rfile)
                 return
-            length = int(self.headers.get("Content-Length") or 0)
-            remaining = length if length > 0 else None
-            while True:
-                if remaining is not None and remaining <= 0:
-                    return
-                read_size = STREAM_CHUNK_SIZE
-                if remaining is not None:
-                    read_size = min(read_size, remaining)
-                chunk = self.rfile.read(read_size)
+            # A declared length bounds the read; no declaration means no body,
+            # which is what a bodyless POST looks like. Reading to EOF instead
+            # would hang: the connection is kept alive and has no EOF to wait
+            # for, so the upload would sit there until the idle timeout.
+            remaining = int(self.headers.get("Content-Length") or 0)
+            while remaining > 0:
+                chunk = self.rfile.read(min(STREAM_CHUNK_SIZE, remaining))
                 if not chunk:
                     return
-                if remaining is not None:
-                    remaining -= len(chunk)
+                remaining -= len(chunk)
                 yield chunk
 
         def _read_stream(self, remote: str, payload: dict[str, Any]) -> None:

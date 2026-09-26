@@ -52,6 +52,15 @@ RUNTIME_WRITE_LOCK = threading.Lock()
 # never holds a whole file in memory while it uploads over its own outbound
 # data connection.
 STREAM_CHUNK_SIZE = 1024 * 1024
+# Upload slices (the size itself is the broker's to pick) are pipelined a few
+# deep, so sending never stalls on a round trip per slice, and the connection
+# is refreshed periodically to stay clear of a proxy's per-connection request
+# limit (nginx allows 1000 by default; some setups allow 100).
+SLICE_WINDOW = 4
+SLICE_RECONNECT_EVERY = 50
+# Slices left unacknowledged by a connection the proxy closed are re-sent; if
+# that keeps happening the proxy is not going to carry the upload at all.
+SLICE_RECONNECT_LIMIT = 3
 
 # Backoff schedule used when /client/register returns 409 Conflict (a stale
 # server-side record for the same identifier) or the broker is temporarily
@@ -1269,14 +1278,25 @@ def _data_plane_target(base: str) -> tuple[http.client.HTTPConnection, str]:
     return conn, parsed.path.rstrip("/")
 
 
-def _stream_file_upload(base: str, token: str, request_id: str, path: Path, runtime: ReverseClientRuntime) -> None:
-    """Stream a local file up to the broker over the remote's own outbound data
-    connection (``POST /client/data``) in 1 MiB chunks. Runs on a dedicated
-    thread so the control loop stays free. On failure, reports the error via
-    ``/client/result`` so the broker's read-stream handler can surface it."""
-    conn: http.client.HTTPConnection | None = None
+def _check_upload_response(conn: http.client.HTTPConnection) -> bool:
+    """Consume one upload response. Returns True when the connection is spent."""
+    response = conn.getresponse()
+    body = response.read()
+    if response.status != 200:
+        # Without this check any non-broker reply (a gateway 404, say) looks
+        # like a successful upload, and the far side waits out its timeout
+        # instead of reporting what actually went wrong.
+        raise BridgeError(
+            f"data stream error {response.status}: {body.decode('utf-8', errors='replace')}",
+            kind="remote_disconnected",
+        )
+    return bool(response.will_close)
+
+
+def _upload_one_body(base: str, token: str, request_id: str, path: Path) -> None:
+    """Send the whole file as a single ``POST /client/data`` body."""
+    conn, base_path = _data_plane_target(base)
     try:
-        conn, base_path = _data_plane_target(base)
         size = path.stat().st_size
         conn.putrequest("POST", f"{base_path}/client/data?id={urllib.parse.quote(request_id)}")
         conn.putheader("Authorization", f"Bearer {token}")
@@ -1289,16 +1309,225 @@ def _stream_file_upload(base: str, token: str, request_id: str, path: Path, runt
                 if not chunk:
                     break
                 conn.send(chunk)
-        response = conn.getresponse()
-        body = response.read()
-        if response.status != 200:
-            # Without this check any non-broker reply (a gateway 404, say) looks
-            # like a successful upload, and the far side waits out its timeout
-            # instead of reporting what actually went wrong.
+        _check_upload_response(conn)
+    finally:
+        conn.close()
+
+
+class _SliceChannel:
+    """Data-plane connection that keeps several upload slices in flight.
+
+    ``http.client`` refuses to write another request before the previous
+    response has been read, which would cost a round trip for every slice of
+    the file -- on a slow link that is a large fraction of the transfer. So
+    requests are framed and written here by hand, and responses are parsed the
+    same way, leaving the connection free to carry the next slice immediately.
+    """
+
+    def __init__(self, base: str, token: str, request_id: str) -> None:
+        self._base = base
+        self._token = token
+        self._request_id = request_id
+        self._conn: http.client.HTTPConnection | None = None
+        self._sock: socket.socket | None = None
+        self._buf = bytearray()
+        self._url = ""
+        self.sent = 0  # slices written on the current connection
+        self.in_flight = 0  # responses still to be read
+        self.spent = False  # the far side said it will close
+
+    def connect(self) -> None:
+        """(Re)open the data connection, draining nothing."""
+        self.close()
+        conn, base_path = _data_plane_target(self._base)
+        conn.connect()
+        assert conn.sock is not None  # connect() always leaves a live socket
+        self._conn = conn
+        self._sock = conn.sock
+        self._buf = bytearray()
+        self._url = f"{base_path}/client/data?id={urllib.parse.quote(self._request_id)}"
+        self.sent = 0
+        self.spent = False
+        # Anything still outstanding belonged to the connection being dropped;
+        # the caller re-sends those slices, and they count again from there.
+        self.in_flight = 0
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = None
+        self._sock = None
+
+    def send(self, seq: int, payload: bytes, final: bool) -> None:
+        assert self._sock is not None and self._conn is not None
+        host = self._conn.host
+        if self._conn.port not in (None, 80, 443):
+            host = f"{host}:{self._conn.port}"
+        head = (
+            f"POST {self._url}&seq={seq}&final={1 if final else 0} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Authorization: Bearer {self._token}\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        self._sock.sendall(head)
+        if payload:
+            self._sock.sendall(payload)
+        self.sent += 1
+        self.in_flight += 1
+
+    def _fill(self) -> None:
+        assert self._sock is not None
+        data = self._sock.recv(65536)
+        if not data:
+            raise BridgeError("data connection closed mid-transfer", kind="remote_disconnected")
+        self._buf.extend(data)
+
+    def _read_line(self) -> bytes:
+        while b"\r\n" not in self._buf:
+            self._fill()
+        line, _, rest = bytes(self._buf).partition(b"\r\n")
+        self._buf = bytearray(rest)
+        return line
+
+    def _read_exactly(self, size: int) -> bytes:
+        while len(self._buf) < size:
+            self._fill()
+        out = bytes(self._buf[:size])
+        del self._buf[:size]
+        return out
+
+    def _read_body(self, headers: dict[bytes, bytes]) -> bytes:
+        if headers.get(b"transfer-encoding", b"").lower() == b"chunked":
+            parts: list[bytes] = []
+            while True:
+                size = int(self._read_line().split(b";")[0] or b"0", 16)
+                if size == 0:
+                    self._read_line()
+                    break
+                parts.append(self._read_exactly(size))
+                self._read_exactly(2)
+            return b"".join(parts)
+        return self._read_exactly(int(headers.get(b"content-length") or 0))
+
+    def read_response(self) -> None:
+        """Consume the oldest outstanding response, oldest first."""
+        parts = self._read_line().split(b" ", 2)
+        status = int(parts[1]) if len(parts) > 2 else 0
+        headers: dict[bytes, bytes] = {}
+        while True:
+            line = self._read_line()
+            if not line:
+                break
+            name, _, value = line.partition(b":")
+            headers[name.strip().lower()] = value.strip()
+        body = self._read_body(headers)
+        self.in_flight -= 1
+        if headers.get(b"connection", b"").lower() == b"close":
+            self.spent = True
+        if status != 200:
             raise BridgeError(
-                f"data stream error {response.status}: {body.decode('utf-8', errors='replace')}",
+                f"data stream error {status}: {body.decode('utf-8', errors='replace')}",
                 kind="remote_disconnected",
             )
+
+
+def _upload_as_slices(base: str, token: str, request_id: str, path: Path, slice_size: int) -> None:
+    """Send the file as numbered slices over one kept-alive data connection.
+
+    A few slices are kept in flight and their responses are read a little
+    behind the writes, so the upload never idles waiting for a round trip.
+
+    A proxy may close a kept-alive connection once it has served enough
+    requests. Slices written behind the last response are then unaccounted
+    for, so a fresh connection re-sends them: the broker numbers the slices it
+    receives and refuses one that arrives out of turn, which turns any real
+    loss into an error instead of a quietly short file.
+    """
+    channel = _SliceChannel(base, token, request_id)
+    expected = path.stat().st_size
+    unacked: deque[tuple[int, bytes, bool]] = deque()
+    seq = 0
+    sent = 0
+    ended = False
+    recovered = 0
+
+    def pump(*, until_idle: bool) -> None:
+        """Read responses; restart the connection if the proxy ended it."""
+        nonlocal recovered
+        while channel.in_flight and (until_idle or channel.in_flight >= SLICE_WINDOW):
+            channel.read_response()
+            unacked.popleft()
+            if channel.spent and unacked:
+                recovered += 1
+                if recovered > SLICE_RECONNECT_LIMIT:
+                    raise BridgeError(
+                        "the proxy keeps closing the data connection mid-upload",
+                        kind="remote_disconnected",
+                    )
+                channel.connect()
+                for pending_seq, payload, is_final in unacked:
+                    channel.send(pending_seq, payload, is_final)
+
+    try:
+        channel.connect()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(slice_size)
+                if not chunk:
+                    break  # the file shrank under us; close it out below
+                sent += len(chunk)
+                # The last slice carries the end marker, so the size from stat
+                # closes a file that is an exact multiple of the slice size
+                # without spending a request on an empty tail slice.
+                final = sent >= expected
+                if channel.sent >= SLICE_RECONNECT_EVERY:
+                    # Stay clear of a proxy's per-connection request limit.
+                    pump(until_idle=True)
+                    channel.connect()
+                channel.send(seq, chunk, final)
+                unacked.append((seq, chunk, final))
+                seq += 1
+                pump(until_idle=False)
+                if final:
+                    ended = True
+                    break
+        if not ended:
+            channel.send(seq, b"", True)
+            unacked.append((seq, b"", True))
+        pump(until_idle=True)
+    finally:
+        channel.close()
+
+
+def _stream_file_upload(
+    base: str,
+    token: str,
+    request_id: str,
+    path: Path,
+    runtime: ReverseClientRuntime,
+    slice_size: int = 0,
+) -> None:
+    """Stream a local file up to the broker over the remote's own outbound data
+    connection (``POST /client/data``). Runs on a dedicated thread so the
+    control loop stays free. On failure, reports the error via
+    ``/client/result`` so the broker's read-stream handler can surface it.
+
+    ``slice_size`` is the broker's advertised slice size. When it is set the
+    file goes up as consecutive numbered bodies rather than one: a proxy in
+    front of the broker may hold a request body until it has received all of
+    it, which would leave the receiving side blind for the whole upload and
+    then hand it the file in one burst."""
+    try:
+        size = path.stat().st_size
+        if slice_size > 0:
+            _upload_as_slices(base, token, request_id, path, slice_size)
+        else:
+            _upload_one_body(base, token, request_id, path)
         logger.info(
             "bridge client streamed file identifier={} request_id={} size={}",
             runtime.identifier,
@@ -1312,12 +1541,6 @@ def _stream_file_upload(base: str, token: str, request_id: str, path: Path, runt
             token,
             {"id": request_id, "ok": False, "error": {"kind": "client_error", "message": str(exc), "code": 1}},
         )
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def _handle_open_read(runtime: ReverseClientRuntime, base: str, token: str, request_id: str, payload: dict[str, Any]) -> None:
@@ -1335,9 +1558,13 @@ def _handle_open_read(runtime: ReverseClientRuntime, base: str, token: str, requ
             {"id": request_id, "ok": False, "error": {"kind": exc.kind, "message": exc.message, "code": exc.exit_code}},
         )
         return
+    try:
+        slice_size = int(payload.get("slice_size") or 0)
+    except (TypeError, ValueError):
+        slice_size = 0
     threading.Thread(
         target=_stream_file_upload,
-        args=(base, token, request_id, path, runtime),
+        args=(base, token, request_id, path, runtime, slice_size),
         daemon=True,
     ).start()
 
