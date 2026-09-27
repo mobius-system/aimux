@@ -40,11 +40,47 @@ from .constants import (
 )
 from .output import emit_table, err, print_error_json, print_json
 
+# Top-level help is laid out in these panels; the order here is the order both
+# the panels and their rows appear in `aimux --help`. Every visible command
+# belongs to exactly one of them (see _apply_help_panels).
+HELP_PANELS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Device Operation Commands", ("remote", "bridge", "reverse", "mcp")),
+    (
+        "Session Operation Commands",
+        ("ls", "new", "attach", "kill", "capture", "wait-last-command-complete"),
+    ),
+    ("File Operation Commands", ("send-keys", "send-files", "get-files", "sync-dir")),
+    ("File Read/Edit Commands", ("read", "apply-patch")),
+    ("Advanced Port Operation Commands", ("local-http-port-reroute", "port")),
+)
+_PANEL_OF: dict[str, str] = {name: title for title, names in HELP_PANELS for name in names}
+# Position across all panels: panel order first, then the order within a panel.
+_PANEL_RANK: dict[str, int] = {
+    name: rank for rank, name in enumerate(n for _title, names in HELP_PANELS for n in names)
+}
+
+
+class _PaneledGroup(typer.core.TyperGroup):
+    """Renders top-level help as the panels declared in HELP_PANELS.
+
+    Typer opens a panel the first time it meets a command that names one and
+    lists rows in mapping order, so ordering the command mapping is what
+    orders the help.
+    """
+
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        self.commands = dict(
+            sorted(self.commands.items(), key=lambda item: _PANEL_RANK.get(item[0], len(_PANEL_RANK)))
+        )
+        super().format_help(ctx, formatter)
+
+
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
     help="aimux — AI-agent-friendly tmux wrapper.",
     context_settings={"help_option_names": ["-h", "--help"]},
+    cls=_PaneledGroup,
 )
 
 remote_app = typer.Typer(
@@ -1582,15 +1618,9 @@ def cmd_file_write(
 @app.command(
     "read",
     help=(
-        "Read a remote file and print a metadata header followed by numbered content.\n"
-        "Header: path, detected encoding (utf-8/utf-8-sig/utf-16/utf-32/latin-1/binary),\n"
-        "size in bytes with line range, and sha256. Content lines are prefixed 'N→'\n"
-        "(cat -n style) unless --no-lineno. Use --offset/--limit to page through long\n"
-        "files instead of dumping everything. --raw emits the original bytes only\n"
-        "(redirect to a file for a faithful copy); --json emits one machine-readable\n"
-        "object. Binary files report 'binary' and show a byte count instead of content\n"
-        "(--json adds content_b64). The path must be ABSOLUTE; relative paths are\n"
-        "rejected to avoid hitting the wrong tree."
+        "Read a remote file: metadata header (path, encoding, size, sha256), then content. "
+        "Paths must be absolute. --offset/--limit page through long files; --raw writes the "
+        "original bytes; --json emits one object."
     ),
 )
 def cmd_read(
@@ -1677,16 +1707,8 @@ def cmd_read(
         "  -old line\n"
         "  +new line\n"
         "  *** End Patch\n"
-        "Supported ops: *** Add File: / *** Update File: / *** Delete File:.\n"
-        "Paths must be ABSOLUTE — a relative path is rejected with 'patch path must be absolute'.\n"
-        "Inside each '@@ ...' hunk: a single leading space marks a context line (anchor — must\n"
-        "match the file byte-for-byte, including blank lines and indentation); '-' lines are\n"
-        "removed; '+' lines are inserted. A context mismatch raises 'patch context not found'.\n"
-        "Rules: (1) one edit site per @@ hunk — never bundle distant locations into one giant\n"
-        "hunk; (2) copy context lines verbatim from the file; (3) prefer a few small hunks.\n"
-        "Targets: omit --remote for local files (atomic tmp+rename on update); --remote picks\n"
-        "a bridge or SSH remote. --dry-run validates context without writing ('would ...').\n"
-        "Add File refuses to overwrite an existing file unless --force is given."
+        "Ops: *** Add File: / *** Update File: / *** Delete File:. Paths must be absolute; context "
+        "lines must match the file verbatim; one edit site per @@ hunk."
     ),
 )
 def cmd_apply_patch(
@@ -1915,3 +1937,20 @@ def cmd_mcp_serve(
         _exit_bridge_error(e)
     except KeyboardInterrupt:
         raise typer.Exit(EXIT_OK)
+
+
+# ---------- top-level help layout ----------
+
+def _apply_help_panels() -> None:
+    """File every registered top-level command into its HELP_PANELS panel.
+
+    Commands registered after this runs would land in the default panel, so it
+    is called at the bottom of the module, once every command exists.
+    """
+    for info in (*app.registered_commands, *app.registered_groups):
+        panel = _PANEL_OF.get(getattr(info, "name", "") or "")
+        if panel:
+            info.rich_help_panel = panel
+
+
+_apply_help_panels()
