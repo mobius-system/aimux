@@ -47,9 +47,9 @@ HELP_PANELS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Device Operation Commands", ("remote", "bridge", "reverse", "mcp")),
     (
         "Session Operation Commands",
-        ("ls", "new", "attach", "kill", "capture", "wait-last-command-complete"),
+        ("ls", "new", "attach", "send-keys", "kill", "capture", "wait-last-command-complete"),
     ),
-    ("File Operation Commands", ("send-keys", "send-files", "get-files", "sync-dir")),
+    ("File Operation Commands", ("send-files", "get-files", "sync-dir")),
     ("File Read/Edit Commands", ("read", "apply-patch")),
     ("Advanced Port Operation Commands", ("local-http-port-reroute", "port")),
 )
