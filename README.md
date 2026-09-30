@@ -30,21 +30,37 @@ aimux — AI-agent-friendly tmux wrapper.
 ─ Options
 --help  -h        Show this message and exit.
 
-─ Commands 
+─ Device Operation Commands
+remote                      Remote-host management (reads/appends ~/.ssh/config).
+bridge                      Bridge broker management.
+reverse                     Reverse-connect this machine to an aimux bridge broker.
+mcp                         Run a stdio MCP server exposing a bridge remote to external agents.
+
+─ Session Operation Commands
 ls                          List all aimux sessions.
 new                         Create a new session.
 attach                      Attach to a session. ⚠️  Human use only — agents should use send-keys + capture.
-send-keys                   Send keys to a session. Behaves exactly like 'tmux send-keys': supports -F/-H/-K/-l/-M/-R/-X/-N <count>. Pass 'Enter' as a key to submit a line.     
-send-files                  Upload multiple local files or directories to an SSH host using sftp.
-get-files                   Download multiple remote files or directories from an SSH host using sftp.
-sync-dir                    Differentially synchronize a local directory with a bridge remote directory.
-read                        Read a remote file and print a metadata header followed by numbered content.
-apply-patch                 Apply a patch to create, edit, or delete files (absolute paths only).
-capture                     Capture pane output (last N lines).
+send-keys                   Send keys to a session. Behaves exactly like 'tmux send-keys': supports -F/-H/-K/-l/-M/-R/-X/-N <count>. Pass 'Enter' as a key to submit a line.
 kill                        Destroy a single session. Does not accept wildcards or batch.
+capture                     Capture pane output (last N lines).
 wait-last-command-complete  Block until the pane's foreground process is back at a shell. Local sessions only.
-remote                      Remote-host management (reads/appends ~/.ssh/config).
+
+─ File Operation Commands
+send-files                  Shortcut over the file API: upload files or directories (mkdir + write).
+get-files                   Shortcut over the file API: download files or directories (stat + read).
+sync-dir                    Shortcut over the file API: differentially sync a directory (list + read/write + archive).
+
+─ File Read/Edit Commands
+read                        Read a remote file: metadata header (path, encoding, size, sha256), then content.
+apply-patch                 Apply a patch to create, edit, or delete files (stdin, or --file).
+
+─ Advanced Port Operation Commands
+local-http-port-reroute     Listen on a local port and tunnel it to another bridge client's allowed HTTP port.
+port                        Forward local HTTP traffic through an aimux bridge broker.
 ```
+
+Every command also carries worked examples: run `aimux <command> -h`.
+
 
 ## Example
 
@@ -192,6 +208,18 @@ Differences vs the SSH path:
 # aimux get-files REMOTE LOCAL_DIR REMOTE_PATH...
 aimux send-files local-8824 /tmp/upload /home/testdir/tests
 aimux get-files local-8824 /home/testdir/tests /tmp/upload
+```
+
+Both commands report every path on both sides as an absolute path — once before
+the transfer starts, once after it finishes:
+
+```text
+uploading 2 file(s) to local-8824:/tmp/upload
+  /home/testdir/tests/a.txt -> local-8824:/tmp/upload/tests/a.txt
+  /home/testdir/tests/sub/b.txt -> local-8824:/tmp/upload/tests/sub/b.txt
+uploaded 2 file(s) to local-8824:/tmp/upload
+  /home/testdir/tests/a.txt -> local-8824:/tmp/upload/tests/a.txt
+  /home/testdir/tests/sub/b.txt -> local-8824:/tmp/upload/tests/sub/b.txt
 ```
 
 Use `--gitignore` on upload when ignored files should be skipped:

@@ -8,7 +8,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from typing import Annotated
 
@@ -436,6 +436,56 @@ def cmd_send_keys(
 
 # ---------- file transfers ----------
 
+def _abs_local(path: Path) -> str:
+    """Absolute form of a local path, for the per-file transfer report.
+
+    The transfer plans already resolve their paths, so this is belt-and-braces:
+    a report that says "here is where it landed" must never print a relative
+    path, whatever the caller passed in.
+    """
+    return os.path.abspath(os.path.expanduser(str(path)))
+
+
+def _print_transfer_pairs(pairs: list[tuple[str, str]]) -> None:
+    """Print one `source -> destination` line per transferred path."""
+    for source, destination in pairs:
+        print(f"  {source} -> {destination}")
+
+
+def _upload_pairs(remote: str, files: Iterable[transfer.UploadEntry]) -> list[tuple[str, str]]:
+    """`local -> remote:...` rows for an upload, both sides absolute."""
+    return [(_abs_local(entry.local), f"{remote}:{entry.remote}") for entry in files]
+
+
+def _download_pairs(remote: str, entries: Iterable[transfer.DownloadEntry]) -> list[tuple[str, str]]:
+    """`remote:... -> local` rows for a download, both sides absolute."""
+    return [(f"{remote}:{entry.remote}", _abs_local(entry.local)) for entry in entries]
+
+
+def _announce_download(remote: str, remote_paths: Iterable[str], local_dir: str | Path) -> None:
+    """Report the remote sources and the local destination before the transfer.
+
+    Only the requested paths are known up front: a directory is walked on the
+    remote as it is fetched, so the exact per-file targets are reported at the
+    end instead.
+    """
+    print(f"downloading {len(list(remote_paths))} path(s) from {remote} to {_abs_local(local_dir)}")
+    for path in remote_paths:
+        print(f"  {remote}:{path}")
+
+
+def _announce_upload(remote: str, remote_path: str, plan: transfer.SendFilesPlan) -> None:
+    """Report sources and destinations before the bytes start moving.
+
+    Passed to the transfer helpers as `on_plan`, so the file list is printed
+    from the plan that the transfer itself will run — no second directory walk.
+    """
+    if not plan.has_work:
+        return
+    print(f"uploading {len(plan.files)} file(s) to {remote}:{remote_path}")
+    _print_transfer_pairs(_upload_pairs(remote, plan.files))
+
+
 def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> None:
     status = ssh_mod._classify(e.returncode, "\n".join([e.stderr, e.stdout]))
     err(f"error: sftp {action} to {remote!r} failed: {e}")
@@ -448,7 +498,15 @@ def _classify_and_exit_sftp(remote: str, action: str, e: transfer.SftpError) -> 
 
 @app.command(
     "send-files",
-    help="Shortcut over the file API: upload files or directories (mkdir + write).",
+    help=(
+        "Shortcut over the file API: upload files or directories (mkdir + write).\n\n"
+        "Examples:\n"
+        "  aimux send-files box /srv/app ./build              # one file or directory\n"
+        "  aimux send-files young_garden /tmp/out a.txt b.txt # several paths at once\n"
+        "  aimux send-files box /srv/app ./src --gitignore    # skip git-ignored files\n\n"
+        "A directory is uploaded under its own name. Both sides' absolute paths are "
+        "printed before and after the transfer."
+    ),
 )
 def cmd_send_files(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
@@ -465,6 +523,7 @@ def cmd_send_files(
             result = transfer.bridge_send_files(
                 bridge_client_ctl, remote, local_paths, remote_path, gitignore=gitignore,
                 progress=_stream_progress(),
+                on_plan=lambda plan: _announce_upload(remote, remote_path, plan),
             )
         except bridge.BridgeError as e:
             _exit_bridge_error(e)
@@ -472,6 +531,7 @@ def cmd_send_files(
             err(f"error: {e}")
             raise typer.Exit(EXIT_USER_ERROR)
         print(f"uploaded {result.uploaded_files} file(s) to bridge remote {remote}:{remote_path}")
+        _print_transfer_pairs(_upload_pairs(remote, result.plan.files))
         if result.skipped_files:
             print(f"skipped {result.skipped_files} gitignored file(s)")
         return
@@ -481,7 +541,10 @@ def cmd_send_files(
         raise typer.Exit(EXIT_USER_ERROR)
 
     try:
-        result = transfer.send_paths(remote, local_paths, remote_path, gitignore=gitignore)
+        result = transfer.send_paths(
+            remote, local_paths, remote_path, gitignore=gitignore,
+            on_plan=lambda plan: _announce_upload(remote, remote_path, plan),
+        )
     except transfer.SftpUploadError as e:
         _classify_and_exit_sftp(remote, "upload", e)
     except transfer.TransferError as e:
@@ -489,6 +552,7 @@ def cmd_send_files(
         raise typer.Exit(EXIT_USER_ERROR)
 
     print(f"uploaded {result.uploaded_files} file(s) to {remote}:{remote_path}")
+    _print_transfer_pairs(_upload_pairs(remote, result.plan.files))
     if result.skipped_files:
         print(f"skipped {result.skipped_files} gitignored file(s)")
 
@@ -497,7 +561,15 @@ def cmd_send_files(
 
 @app.command(
     "get-files",
-    help="Shortcut over the file API: download files or directories (stat + read).",
+    help=(
+        "Shortcut over the file API: download files or directories (stat + read).\n\n"
+        "Examples:\n"
+        "  aimux get-files box ./out /var/log/app.log              # one file\n"
+        "  aimux get-files box ./out /srv/app/conf                 # a directory, recursively\n"
+        "  aimux get-files young_garden ./out /home/user/dump.tar  # several paths at once\n\n"
+        "A directory is written under its own name, so <local-dir> holds the results. "
+        "Both sides' absolute paths are printed before and after the transfer."
+    ),
 )
 def cmd_get_files(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
@@ -506,6 +578,7 @@ def cmd_get_files(
 ):
     bridge_client_ctl, bridge_info = _bridge_remote(remote)
     if bridge_client_ctl is not None and bridge_info is not None:
+        _announce_download(remote, remote_paths, local_dir)
         try:
             result = transfer.bridge_get_files(bridge_client_ctl, remote, remote_paths, local_dir, progress=_stream_progress())
         except bridge.BridgeError as e:
@@ -514,12 +587,14 @@ def cmd_get_files(
             err(f"error: {e}")
             raise typer.Exit(EXIT_USER_ERROR)
         print(f"downloaded {result.downloaded_paths} path(s) from bridge remote {remote} to {result.plan.local_dir}")
+        _print_transfer_pairs(_download_pairs(remote, result.plan.entries))
         return
 
     if not ssh_mod.host_exists(remote):
         err(f"error: host {remote!r} not found in ~/.ssh/config or bridge registry")
         raise typer.Exit(EXIT_USER_ERROR)
 
+    _announce_download(remote, remote_paths, local_dir)
     try:
         result = transfer.get_paths(remote, remote_paths, local_dir)
     except transfer.SftpDownloadError as e:
@@ -529,6 +604,7 @@ def cmd_get_files(
         raise typer.Exit(EXIT_USER_ERROR)
 
     print(f"downloaded {result.downloaded_paths} path(s) from {remote} to {result.plan.local_dir}")
+    _print_transfer_pairs(_download_pairs(remote, result.plan.entries))
 
 
 # ---------- sync-dir ----------
@@ -606,7 +682,15 @@ def _sync_dir_progress(phase: str, payload: dict[str, object]) -> None:
 
 @app.command(
     "sync-dir",
-    help="Shortcut over the file API: differentially sync a directory (list + read/write + archive).",
+    help=(
+        "Shortcut over the file API: differentially sync a directory (list + read/write + archive).\n\n"
+        "Examples:\n"
+        "  aimux sync-dir box /srv/app ./src --to-remote     # local -> remote\n"
+        "  aimux sync-dir box /srv/app ./src --from-remote   # remote -> local\n"
+        "  aimux sync-dir box /srv/app ./src --to-remote --exclude '*.log' --exclude tmp/\n\n"
+        "Exactly one of --to-remote / --from-remote is required. Only changed files move, "
+        "and paths deleted on the source are deleted on the target."
+    ),
 )
 def cmd_sync_dir(
     remote: Annotated[str, typer.Argument(help="Bridge remote name.")],
@@ -1618,7 +1702,12 @@ def cmd_file_write(
 @app.command(
     "read",
     help=(
-        "Read a remote file: metadata header (path, encoding, size, sha256), then content. "
+        "Read a remote file: metadata header (path, encoding, size, sha256), then content.\n\n"
+        "Examples:\n"
+        "  aimux read box --path /etc/nginx/nginx.conf\n"
+        "  aimux read box --path /var/log/app.log --offset 1500 --limit 200\n"
+        "  aimux read box --path /srv/blob.bin --raw > blob.bin\n"
+        "  aimux read box --path /srv/app.py --json\n\n"
         "Paths must be absolute. --offset/--limit page through long files; --raw writes the "
         "original bytes; --json emits one object."
     ),
@@ -1699,14 +1788,18 @@ def cmd_read(
 @app.command(
     "apply-patch",
     help=(
-        "Apply a patch to create, edit, or delete files.\n"
-        "Patch shape (read from stdin, or a file via --file):\n"
+        "Apply a patch to create, edit, or delete files (stdin, or --file).\n\n"
+        "Patch shape:\n"
         "  *** Begin Patch\n"
         "  *** Update File: /abs/path/file.py\n"
         "  @@ context line\n"
         "  -old line\n"
         "  +new line\n"
-        "  *** End Patch\n"
+        "  *** End Patch\n\n"
+        "Examples:\n"
+        "  aimux apply-patch < fix.patch                  # local files\n"
+        "  aimux apply-patch --remote box < fix.patch     # files on a remote\n"
+        "  aimux apply-patch --dry-run --file fix.patch   # check context, write nothing\n\n"
         "Ops: *** Add File: / *** Update File: / *** Delete File:. Paths must be absolute; context "
         "lines must match the file verbatim; one edit site per @@ hunk."
     ),

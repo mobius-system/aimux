@@ -64,8 +64,32 @@ def _wait_for(predicate, *, timeout: float = 20.0, interval: float = 0.25):
     return False
 
 
+@pytest.fixture(autouse=True, scope="session")
+def isolated_bridge_runtime(tmp_path_factory):
+    """Point every broker runtime file at a temp path, never the real one.
+
+    ``aimux bridge deploy`` writes ``runtime.json`` where it is told to, and the
+    broker clears that file when it exits. Left at the default
+    (``~/.aimux/bridge/runtime.json``) that pair deletes the *production*
+    broker's discovery record whenever this suite runs on a host that already
+    has a live broker: the local CLI then reports every remote as missing and
+    mobius' ``/aimux_bridge`` proxy answers 503 to every reverse client
+    (observed 2026-09-30). The broker, the reverse client and the MCP server are
+    all subprocesses, so the env var is what keeps them off the real path.
+    """
+    previous = os.environ.get(bridge.RUNTIME_ENV)
+    os.environ[bridge.RUNTIME_ENV] = str(tmp_path_factory.mktemp("aimux-runtime") / "runtime.json")
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(bridge.RUNTIME_ENV, None)
+        else:
+            os.environ[bridge.RUNTIME_ENV] = previous
+
+
 @pytest.fixture(scope="session")
-def broker(tmp_path_factory):
+def broker(tmp_path_factory, isolated_bridge_runtime):
     """Start a real bridge broker on 127.0.0.1:PORT. Returns the control client."""
     # Stale runtime.json from a previous run would point at a dead broker; clear.
     try:

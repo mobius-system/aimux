@@ -1010,8 +1010,8 @@ $ aimux new --remote=worker-2 --name=task-1
 | `aimux new --name=<n> [--remote=<name>] [--profile=<p>] [--output-sync-to-file=<path>]` | 创建 session：不带 `--remote` 是本地，SSH remote 保持旧 API；bridge remote 必须带 `--profile`；`--output-sync-to-file` 只支持 tmux-backed session | ✅ |
 | `aimux attach <id>` | attach 到 tmux-backed session；bridge session 直接拒绝 | ❌ **仅限人类** |
 | `aimux send-keys <id> [tmux-flags] -- <keys...>` | 发送按键（**执行入口**）；行为与 `tmux send-keys` 完全一致，支持 `-F/-H/-K/-l/-M/-R/-X/-N` | ✅ |
-| `aimux send-files <remote> <remote-dir> <local>... [--gitignore]` | 用一次 sftp batch 上传多个本地文件或目录到 ssh-config host 的远端目录；目录会放在远端目录下自己的 basename 中 | ✅ |
-| `aimux get-files <remote> <local-dir> <remote-path>...` | 用一次 sftp batch 下载多个远端文件或目录到本地目录；下载目标名来自远端路径 basename | ✅ |
+| `aimux send-files <remote> <remote-dir> <local>... [--gitignore]` | 用一次 sftp batch 上传多个本地文件或目录到 ssh-config host 的远端目录；目录会放在远端目录下自己的 basename 中；**传输前后各打印一次两侧的绝对路径** | ✅ |
+| `aimux get-files <remote> <local-dir> <remote-path>...` | 用一次 sftp batch 下载多个远端文件或目录到本地目录；下载目标名来自远端路径 basename；**传输前后各打印一次两侧的绝对路径** | ✅ |
 | `aimux capture <id> --lines=<N>` | 抓取 pane 最后 N 行（必填） | ✅ |
 | `aimux kill <id>` | 销毁 session（**一次只允许 kill 一个**，不支持通配符/批量） | ✅ |
 | `aimux wait-last-command-complete <id> --timeout=<dur> [--print-lines=<N>]` | 阻塞等待命令完成（基于 `pane_current_command`，**仅本地 session**）；`--print-lines` 完成后顺带打印最后 N 行 | ✅ |

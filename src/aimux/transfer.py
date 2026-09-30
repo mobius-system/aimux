@@ -137,9 +137,16 @@ def send_paths(
     remote_path: str,
     *,
     gitignore: bool = False,
+    on_plan: Callable[[SendFilesPlan], None] | None = None,
 ) -> SendFilesResult:
-    """Upload multiple local paths into `host:remote_path` using one sftp batch."""
+    """Upload multiple local paths into `host:remote_path` using one sftp batch.
+
+    ``on_plan`` is called with the built plan before any byte moves, so a caller
+    can report the file list without walking the local tree a second time.
+    """
     plan = build_send_files_plan(local_paths, remote_path, gitignore=gitignore)
+    if on_plan is not None:
+        on_plan(plan)
     if plan.has_work:
         _run_sftp_batch(host, build_sftp_batch(plan), SftpUploadError)
     return SendFilesResult(
@@ -755,14 +762,18 @@ def bridge_send_files(
     gitignore: bool = False,
     max_file_size: int = DEFAULT_BRIDGE_MAX_FILE_SIZE,
     progress: "bridge_mod.ProgressCallback | None" = None,
+    on_plan: Callable[[SendFilesPlan], None] | None = None,
 ) -> SendFilesResult:
     """Upload local paths to a bridge remote via the file.write message family.
 
     Reuses the same planning logic as send_paths; the sftp batch is replaced by
     per-file base64-encoded writes through the broker. ``progress`` is called
     with ``(done_bytes, total_bytes)`` per chunk for the current streaming file.
+    ``on_plan`` is called with the built plan before any byte moves.
     """
     plan = build_send_files_plan(local_paths, remote_path, gitignore=gitignore)
+    if on_plan is not None:
+        on_plan(plan)
     if not plan.has_work:
         return SendFilesResult(
             plan=plan,

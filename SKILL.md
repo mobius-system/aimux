@@ -83,6 +83,10 @@ aimux send-files local-8824 /tmp/upload ~/aimux-tests
 aimux get-files local-8824 ~/aimux /tmp/upload
 ```
 
+Both commands list every path on both sides as an absolute path — once before
+the transfer starts and once after it finishes — so the output alone says where
+each file came from and where it landed.
+
 Use `--gitignore` on upload when ignored files should be skipped:
 
 ```bash
