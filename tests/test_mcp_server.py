@@ -738,7 +738,7 @@ def test_output_markers():
     assert mcp_server._decorate_output("", finished=False, timeout_ms=10000) == \
         "<aimux>command timeout after 10 seconds</aimux>"
     assert mcp_server._decorate_output("partial\n", finished=False, timeout_ms=250) == \
-        "partial\n<aimux>command timeout after 0.25 seconds</aimux>"
+        "partial\n<aimux>get some output, but command timeout after 0.25 seconds</aimux>"
     assert mcp_server._seconds_label(300000) == "300"
 
 
@@ -761,7 +761,7 @@ def test_exec_timeout_keeps_partial_output_and_appends_marker(monkeypatch):
     r = mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "sleep 99", "yield_time_ms": 1000})
 
     assert "session_id" in r and "exit_code" not in r
-    assert r["output"].endswith("<aimux>command timeout after 1 seconds</aimux>")
+    assert r["output"].endswith("<aimux>get some output, but command timeout after 1 seconds</aimux>")
     assert "partial line 1" in r["output"]  # partial output is never dropped
 
 
@@ -774,6 +774,6 @@ def test_timeout_marker_survives_truncation(monkeypatch):
     r = mcp_server._remote_exec_command(
         "r", "posix-pty", {"cmd": "sleep 99", "yield_time_ms": 1000, "max_output_tokens": 50})
 
-    assert r["output"].endswith("<aimux>command timeout after 1 seconds</aimux>")
+    assert r["output"].endswith("<aimux>get some output, but command timeout after 1 seconds</aimux>")
     assert "...[truncated]..." in r["output"]
     assert r["original_token_count"] > 50
