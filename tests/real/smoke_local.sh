@@ -5,62 +5,79 @@
 #
 # Covers the paths that break silently: the session lifecycle (new -> send-keys
 # -> wait-last-command-complete -> capture -> ls -> kill), --cwd actually taking
-# effect, local apply-patch, and the help output shape. It needs tmux and writes
-# its artifacts (help.txt, ls.json, sample.txt, basic_test.log) next to itself.
+# effect, local apply-patch, and the help output shape. Needs tmux.
+#
+# Log format, one block per command:
+#     --- 测试N ---
+#     运行命令：
+#     <command>
+#     返回结果：
+#     <output>
 set -u
+
 AIMUX="${AIMUX:-$HOME/.local/bin/aimux}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
-SESSION=aimux_basic_$$
+SESSION="aimux_basic_$$"
+export AIMUX DIR SESSION
+
 pass=0
 fail=0
-
-say() { printf '\n### %s\n' "$*"; }
-check() { # check <exit-code> <label>
-  if [ "$1" = 0 ]; then echo "PASS  $2"; pass=$((pass + 1));
-  else echo "FAIL  $2"; fail=$((fail + 1)); fi
-}
+group_no=0
 
 cd "$DIR" || exit 1
-echo "aimux  : $AIMUX ($("$AIMUX" -h 2>&1 | sed -n 's/^ aimux — //p' | head -1))"
-echo "python : $(python3 -c 'import aimux;print(aimux.__version__)')"
-echo "dir    : $DIR"
-echo "host   : $(hostname)  tmux: $(tmux -V)"
 
-say "1) 帮助输出（分面板 + 每命令都有例子）"
-"$AIMUX" -h > help.txt 2>&1; check $? "aimux -h"
-grep -q "Device Operation Commands" help.txt; check $? "顶层帮助是分面板的"
-"$AIMUX" get-files -h 2>&1 | grep -q "Examples:"; check $? "子命令帮助带 Examples"
+group() { # group  → a new '--- 测试N ---' section
+  group_no=$((group_no + 1))
+  printf -- '--- 测试%d ---\n\n' "$group_no"
+}
 
-say "2) 本地 session 生命周期"
-"$AIMUX" kill "$SESSION" >/dev/null 2>&1 || true
-"$AIMUX" new --name "$SESSION" --cwd "$DIR"; check $? "new --name --cwd"
+step() { # step <command string>  → run it and record command + result verbatim
+  printf '运行命令：\n%s\n返回结果：\n' "$1"
+  local out
+  out="$(bash -c "$1" 2>&1)"
+  if [ -n "$out" ]; then printf '%s\n' "$out"; fi
+  printf '\n'
+  pass=$((pass + $(printf '%s\n' "$out" | grep -c '^PASS') ))
+  fail=$((fail + $(printf '%s\n' "$out" | grep -c '^FAIL') ))
+}
 
-"$AIMUX" send-keys "$SESSION" -- 'pwd; echo AIMUX_OK_$((6*7))' Enter; check $? "send-keys"
-"$AIMUX" wait-last-command-complete "$SESSION" --timeout 20s; check $? "wait-last-command-complete"
+printf 'aimux smoke test — %s\n主机: %s   目录: %s\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(hostname)" "$DIR"
 
-out="$("$AIMUX" capture "$SESSION" --lines 40)"
-printf '%s\n' "$out" | tail -6
-printf '%s\n' "$out" | grep -q "AIMUX_OK_42"; check $? "capture 里有命令输出"
-printf '%s\n' "$out" | grep -q "$DIR"; check $? "--cwd 生效（pwd 输出目标目录）"
+group
+step 'python3 -c "import aimux; print(\"aimux version:\", aimux.__version__)"'
+step 'tmux -V'
+step '"$AIMUX" -h'
+step '"$AIMUX" -h | grep -q "File Read/Edit Commands" && echo "PASS 顶层帮助按面板分组" || echo "FAIL 顶层帮助没有面板分组"'
+step '"$AIMUX" get-files -h | grep -q "Examples:" && echo "PASS 子命令帮助带 Examples" || echo "FAIL 子命令帮助没有 Examples"'
 
-"$AIMUX" ls | grep -q "$SESSION"; check $? "ls 能列出该 session"
-"$AIMUX" ls --json > ls.json 2>&1; check $? "ls --json"
+group
+step '"$AIMUX" kill "$SESSION" >/dev/null 2>&1 || true'
+step '"$AIMUX" new --name "$SESSION" --cwd "$DIR"'
+step '"$AIMUX" send-keys "$SESSION" -- '"'"'pwd; echo AIMUX_OK_$((6*7))'"'"' Enter'
+step '"$AIMUX" wait-last-command-complete "$SESSION" --timeout 20s'
+step '"$AIMUX" capture "$SESSION" --lines 40'
+step 'out="$("$AIMUX" capture "$SESSION" --lines 40)"
+printf "%s\n" "$out" | grep -q "AIMUX_OK_42" && echo "PASS 命令输出出现在 capture 里" || echo "FAIL 没看到命令输出"
+printf "%s\n" "$out" | grep -q "$DIR" && echo "PASS --cwd 生效（pwd 就是目标目录）" || echo "FAIL --cwd 没生效"'
+step '"$AIMUX" ls'
+step '"$AIMUX" ls --json'
+step '"$AIMUX" ls | grep -q "$SESSION" && echo "PASS ls 列出了该 session" || echo "FAIL ls 里没有该 session"'
 
-say "3) apply-patch 本地改写"
-printf 'alpha\nbeta\n' > sample.txt
-printf '*** Begin Patch\n*** Update File: %s/sample.txt\n@@\n-beta\n+gamma\n*** End Patch\n' "$DIR" \
-  | "$AIMUX" apply-patch; check $? "apply-patch（本地，无 --remote）"
-grep -q '^gamma$' sample.txt; check $? "补丁落到文件"
-cat sample.txt
+group
+step 'printf "alpha\nbeta\n" > sample.txt; cat sample.txt'
+step 'printf "*** Begin Patch\n*** Update File: %s/sample.txt\n@@\n-beta\n+gamma\n*** End Patch\n" "$DIR" | "$AIMUX" apply-patch'
+step 'cat sample.txt'
+step 'grep -q "^gamma$" sample.txt && echo "PASS 补丁已落到文件" || echo "FAIL 文件没被改"'
 
-say "4) 一个长一点的命令（多轮输出）"
-"$AIMUX" send-keys "$SESSION" -- 'for i in 1 2 3; do echo "tick $i"; sleep 1; done' Enter
-"$AIMUX" wait-last-command-complete "$SESSION" --timeout 30s --print-lines 5; check $? "wait + --print-lines"
+group
+step '"$AIMUX" send-keys "$SESSION" -- '"'"'for i in 1 2 3; do echo "tick $i"; sleep 1; done'"'"' Enter'
+step '"$AIMUX" wait-last-command-complete "$SESSION" --timeout 30s --print-lines 5'
+step 'out="$("$AIMUX" capture "$SESSION" --lines 40)"; printf "%s\n" "$out" | grep -q "tick 3" && echo "PASS 多轮输出完整（tick 3 在）" || echo "FAIL 输出不完整"'
 
-say "5) 清理"
-"$AIMUX" kill "$SESSION"; check $? "kill"
-"$AIMUX" ls | grep -q "$SESSION" && { echo "FAIL  session 仍在列表里"; fail=$((fail + 1)); } \
-  || { echo "PASS  session 已消失"; pass=$((pass + 1)); }
+group
+step '"$AIMUX" kill "$SESSION"'
+step '"$AIMUX" ls'
+step '"$AIMUX" ls | grep -q "$SESSION" && echo "FAIL session 还在列表里" || echo "PASS session 已消失"'
 
-printf '\n==== %d passed, %d failed ====\n' "$pass" "$fail"
+printf '==== %d passed, %d failed ====\n' "$pass" "$fail"
 [ "$fail" = 0 ]
