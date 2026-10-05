@@ -110,8 +110,11 @@ def test_exec_marker_builder_posix():
 
 
 def test_exec_marker_builder_windows_cmd():
+    # Caret-escaped percents: '%%errorlevel%%' is batch-file syntax, and typed at
+    # an interactive prompt CALL collapses it to a literal '%0%', so the marker
+    # never carries the digits the drain loop matches on.
     cmd = mcp_server._command_with_exit_marker("dir", "__M__", "cmd")
-    assert cmd == "dir & call echo __M__%%errorlevel%%"
+    assert cmd == "dir & call echo __M__^%errorlevel^%"
 
 
 def test_exec_marker_builder_windows_powershell():

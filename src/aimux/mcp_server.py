@@ -1,7 +1,7 @@
 """aimux MCP server — expose one bridge remote as MCP tools over stdio.
 
 Codex-facing tools (6, aligned with codex native tool specs):
-  remote_exec_command  Run a command (one-shot temp-script by default; interactive=true keeps a live PTY); return clean output + exit code, or session_id.
+  remote_exec_command  Run a command (one-shot temp-script on every platform; interactive=true keeps a live PTY); return clean output + exit code, or session_id.
   remote_write_stdin   Write chars to an existing exec session, return output.
   remote_apply_patch   Apply a patch (FREEFORM input).
   remote_view_image    Return a remote image file as a data URL.
@@ -24,6 +24,7 @@ import signal
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
@@ -278,6 +279,51 @@ def _is_windows_profile(profile: str) -> bool:
     return "win" in p or p in {"cmd", "powershell", "pwsh"}
 
 
+# Windows temp lives under the remote user's profile: every Windows shell spells
+# the same directory its own way, and '~' is what the bridge client expands.
+_WIN_TEMP_DIR = "AppData/Local/Temp"
+
+# Set from the bridge registration in run_stdio(); '' when unknown (unit tests).
+_remote_platform = ""
+
+
+@dataclass(frozen=True)
+class _ExecPlan:
+    """One temp-script run: where the three files live, the script body to
+    upload, and the single line to type into the session to start it."""
+
+    script: str
+    out: str
+    code: str
+    body: str
+    launch: str
+
+
+def _shell_family(profile: str) -> str:
+    """Which family of shell the session runs: cmd / powershell / everything-else."""
+    p = (profile or "").lower()
+    if "powershell" in p or "pwsh" in p:
+        return "powershell"
+    if p == "cmd" or "win" in p:
+        return "cmd"
+    return "posix"
+
+
+def _remote_is_windows(profile: str) -> bool:
+    """Whether the bound remote is a Windows host (not whether the shell is)."""
+    if _remote_platform:
+        return _remote_platform.lower() == "windows"
+    p = (profile or "").lower()
+    return _is_windows_profile(profile) or "mingw" in p or "msys" in p
+
+
+def _decode_text(data: bytes) -> str:
+    """Decode remote file bytes, tolerating what Windows shells actually write."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", "replace")
+    return data.decode("utf-8-sig", "replace")  # utf-8-sig drops a BOM
+
+
 def _exec_temp_base() -> str:
     """Unique temp base name: incoming_command_<UTC timestamp>."""
     now = time.time()
@@ -286,16 +332,77 @@ def _exec_temp_base() -> str:
     return f"incoming_command_{ts}_{micros:06d}"
 
 
-def _exec_temp_paths() -> tuple[str, str, str]:
-    """Return (script, out, code) absolute paths under the remote temp dir."""
+def _exec_temp_paths(shell: str = "bash", *, windows: bool = False) -> tuple[str, str, str]:
+    """Return (script, out, code) paths for the temp-script run.
+
+    POSIX remotes use /tmp/<base>.{sh,out,code}. Windows remotes cannot: only the
+    MSYS shells have a /tmp, and the bridge client resolves it against the
+    current drive, so the MCP server and the shell would silently disagree about
+    which file they mean. They use ``~/AppData/Local/Temp`` instead — the same
+    directory in every Windows shell (%USERPROFILE%, $env:USERPROFILE, $HOME).
+    """
     base = _exec_temp_base()
-    return f"/tmp/{base}.sh", f"/tmp/{base}.out", f"/tmp/{base}.code"
+    if not windows:
+        return f"/tmp/{base}.sh", f"/tmp/{base}.out", f"/tmp/{base}.code"
+    ext = {"cmd": "cmd", "powershell": "ps1"}.get(shell, "sh")
+    root = f"~/{_WIN_TEMP_DIR}"
+    return f"{root}/{base}.{ext}", f"{root}/{base}.out", f"{root}/{base}.code"
 
 
-def _launch_temp_script(shell_bin: str | None, script: str, outfile: str, codefile: str) -> str:
-    """One trivial launch line: run the script, redirect output and exit code."""
-    runner = shell_bin or "bash"
-    return f"{runner} {script} > {outfile} 2>&1; echo $? > {codefile}"
+def _win_path(path: str) -> str:
+    """``~/AppData/Local/Temp/x`` → ``%USERPROFILE%\\AppData\\Local\\Temp\\x``."""
+    return path.replace("/", "\\").replace("~", "%USERPROFILE%", 1)
+
+
+def _exec_plan(*, cmd: str, profile: str, shell_bin: str | None, windows: bool) -> _ExecPlan:
+    """Where the temp files live, what the script says, and how to start it.
+
+    One mechanism everywhere: the command is uploaded verbatim to a temp script,
+    the launcher runs it with stdout+stderr redirected to a file, and the exit
+    code lands in a second file the caller polls. Which shell writes that code
+    file differs:
+
+    * POSIX / MSYS — the launcher's own trailing ``echo $?`` does it.
+    * cmd — the script does it. ``%errorlevel%`` only expands at parse time, so
+      it has to be evaluated *inside* the batch file, after the command line.
+    * PowerShell — the script does it, and captures output itself: a PS ``>``
+      writes UTF-16, which the reader (UTF-8) would turn into mojibake.
+    """
+    family = _shell_family(profile)
+    script, outfile, codefile = _exec_temp_paths(family, windows=windows)
+
+    if not windows:
+        runner = shell_bin or "bash"
+        return _ExecPlan(script, outfile, codefile, cmd,
+                         f"{runner} {script} > {outfile} 2>&1; echo $? > {codefile}")
+
+    if family == "cmd":
+        body = f"@echo off\r\n{cmd}\r\necho %errorlevel% > \"{_win_path(codefile)}\"\r\n"
+        return _ExecPlan(script, outfile, codefile, body,
+                         f"\"{_win_path(script)}\" > \"{_win_path(outfile)}\" 2>&1")
+
+    if family == "powershell":
+        body = (
+            f"$aimux_out = & {{ {cmd} }} 2>&1 | Out-String -Width 4096\r\n"
+            f"[IO.File]::WriteAllText(\"{_ps_path(outfile)}\", $aimux_out)\r\n"
+            f"$aimux_code = if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ $LASTEXITCODE }}\r\n"
+            f"[IO.File]::WriteAllText(\"{_ps_path(codefile)}\", \"$aimux_code\")\r\n"
+        )
+        return _ExecPlan(script, outfile, codefile, body,
+                         f"powershell -NoProfile -ExecutionPolicy Bypass -File \"{_ps_path(script)}\"")
+
+    # MSYS / Git-Bash on Windows: sh semantics, Windows-visible paths.
+    launch = f"bash \"$HOME/{_WIN_TEMP_DIR}/{_basename(script)}\" > \"$HOME/{_WIN_TEMP_DIR}/{_basename(outfile)}\" 2>&1; echo $? > \"$HOME/{_WIN_TEMP_DIR}/{_basename(codefile)}\""
+    return _ExecPlan(script, outfile, codefile, cmd, launch)
+
+
+def _basename(path: str) -> str:
+    return path.rsplit("/", 1)[-1]
+
+
+def _ps_path(path: str) -> str:
+    """PowerShell spelling of a Windows temp path (``$env:USERPROFILE\\...``)."""
+    return path.replace("/", "\\").replace("~", "$env:USERPROFILE", 1)
 
 
 def _read_code_file(c, remote: str, codefile: str) -> int | None:
@@ -310,10 +417,10 @@ def _read_code_file(c, remote: str, codefile: str) -> int | None:
         res = c.file_read(remote=remote, path=codefile, timeout=15.0)
     except Exception:
         return None
-    try:
-        return int(_file_bytes(res).decode("utf-8", "replace").strip())
-    except Exception:
-        return None
+    # Be liberal: BOMs, CRLF and a stray echo prefix all show up in practice, and
+    # anything unparsable here means "still running" for the caller.
+    match = re.search(r"-?\d+", _decode_text(_file_bytes(res)))
+    return int(match.group()) if match else None
 
 
 def _read_out_file(c, remote: str, outfile: str) -> str:
@@ -328,7 +435,7 @@ def _read_out_file(c, remote: str, outfile: str) -> str:
         res = c.file_read(remote=remote, path=outfile, timeout=60.0)
     except Exception:
         return ""
-    return _file_bytes(res).decode("utf-8", "replace")
+    return _decode_text(_file_bytes(res))
 
 
 def _wait_exec_done(c, remote: str, outfile: str, codefile: str, yield_ms: int):
@@ -370,8 +477,13 @@ def _command_with_exit_marker(cmd: str, marker: str, profile: str) -> str:
     if "powershell" in sh or "pwsh" in sh:
         return f"& {{ {cmd} }}; {marker_cmd}"
     if sh == "cmd" or "win" in sh:
-        # CALL triggers a second percent-expansion pass after ``cmd`` exits.
-        return f"{cmd} & call echo {marker}%%errorlevel%%"
+        # CALL triggers a second percent-expansion pass after ``cmd`` exits, so
+        # ``%errorlevel%`` is read *after* the command rather than before it. The
+        # braces must be caret-escaped: ``%%errorlevel%%`` is the batch-file
+        # spelling and, typed at an interactive prompt, CALL turns it into a
+        # literal ``%0%`` — a marker that never matches the digits the reader
+        # looks for. See ``_exec_plan`` for the one-shot path.
+        return f"{cmd} & call echo {marker}^%errorlevel^%"
     return f"{cmd}; {marker_cmd}"
 
 
@@ -441,27 +553,27 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
     yield_ms = max(250, min(_MAX_YIELD_MS, int(args.get("yield_time_ms") or 10000)))
 
     c = _client()
+    windows = _remote_is_windows(profile)
     max_retries = 2  # 3 total attempts
     last_error: Exception | None = None
 
     for attempt in range(max_retries + 1):
         sid = _create_exec_session(remote, profile, shell_bin, workdir)
         name = _sessions[sid]["name"]
-        script, outfile, codefile = _exec_temp_paths()
-        _sessions[sid].update(tmp_script=script, tmp_out=outfile, tmp_code=codefile)
+        plan = _exec_plan(cmd=cmd, profile=profile, shell_bin=shell_bin, windows=windows)
+        _sessions[sid].update(tmp_script=plan.script, tmp_out=plan.out, tmp_code=plan.code)
         try:
             # 1) command verbatim -> temp script (no send_keys mangling).
             c.file_write(
                 remote=remote,
-                path=script,
-                content_b64=base64.b64encode(cmd.encode("utf-8")).decode("ascii"),
+                path=plan.script,
+                content_b64=base64.b64encode(plan.body.encode("utf-8")).decode("ascii"),
                 timeout=60.0,
             )
             # 2) trivial launch line -> redirect output + exit code to files.
-            launch = _launch_temp_script(shell_bin, script, outfile, codefile)
-            c.send_keys(remote=remote, name=name, keys=[launch, "Enter"], flags=[], timeout=15.0)
+            c.send_keys(remote=remote, name=name, keys=[plan.launch, "Enter"], flags=[], timeout=15.0)
             # 3) poll the exit-code file, then read clean output + exit code.
-            out, exit_code, finished, wall = _wait_exec_done(c, remote, outfile, codefile, yield_ms)
+            out, exit_code, finished, wall = _wait_exec_done(c, remote, plan.out, plan.code, yield_ms)
             out_t, original = _truncate_output(out, max_tokens)
             return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
         except bridge.BridgeError as e:
@@ -481,10 +593,13 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
 
 
 def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
-    # Default is the clean one-shot temp-script path. Interactive commands
-    # (REPL, pager, password prompt, heredoc — anything driven via
-    # remote_write_stdin) must opt into the live-PTY path with interactive=true.
-    if _is_windows_profile(profile) or args.get("interactive"):
+    # Default is the clean one-shot temp-script path on every platform.
+    # Interactive commands (REPL, pager, password prompt, heredoc — anything
+    # driven via remote_write_stdin) must opt into the live-PTY path with
+    # interactive=true. Windows used to be forced down that path because cmd
+    # could not report its exit code; the temp script now writes it to a file
+    # there too, so a Windows remote gets the same clean output as any other.
+    if args.get("interactive"):
         return _remote_exec_command_pty(remote, profile, args)
     return _remote_exec_command_tempfile(remote, profile, args)
 
@@ -887,12 +1002,12 @@ def _apply_hunks(orig: str, hunks: list) -> str:
 TOOLS = [
     {
         "name": "remote_exec_command",
-        "description": "Runs a shell command, returning clean output and an exit code. One-shot by default; pass interactive=true to keep a live PTY session for remote_write_stdin.",
+        "description": "Runs a shell command, returning clean output and an exit code. One-shot by default: the command is uploaded to a temp script and its output and exit code are read back from files, on every platform. On a Windows cmd remote that script is a .cmd file, so write for-loop variables with a doubled percent (for /l %%i in (1,1,3) do ...). Pass interactive=true to keep a live PTY session for remote_write_stdin.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "cmd": {"type": "string", "description": "Shell command to execute."},
-                "interactive": {"type": "boolean", "default": False, "description": "True keeps a live PTY session for remote_write_stdin (REPL, pager, password prompt, heredoc). False (default) runs one-shot via a temp script and returns clean output + exit code."},
+                "interactive": {"type": "boolean", "default": False, "description": "True keeps a live PTY session for remote_write_stdin (REPL, pager, password prompt, heredoc). False (default) runs one-shot via a temp script and returns clean output + exit code — including on Windows, where cmd uses a .cmd temp script."},
                 "login": {"type": "boolean", "default": True, "description": "True runs the shell with -l/-i semantics; false disables them (uses --norc --noprofile). Defaults to true."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
                 "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
@@ -1046,8 +1161,9 @@ def run_stdio(*, remote: str, profile: str | None = None) -> None:
         print(f"aimux-mcp: remote {remote!r} has no default_profile; pass --profile", file=sys.stderr)
         sys.exit(2)
 
-    global _reap_client
+    global _reap_client, _remote_platform
     _reap_client = ctl
+    _remote_platform = str(info.get("platform") or "")
     _request_parent_death_signal()
     signal.signal(signal.SIGTERM, _on_sigterm)
 

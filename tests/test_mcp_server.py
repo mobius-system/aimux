@@ -205,7 +205,10 @@ def test_exec_marker_is_chained_after_command_not_sent_as_followup_stdin():
     assert powershell == "& { Read-Host }; echo __AIMUX_EXIT_ab12__$LASTEXITCODE"
 
     cmd = mcp_server._command_with_exit_marker("type nul", "__AIMUX_EXIT_ab12__", "cmd")
-    assert cmd == "type nul & call echo __AIMUX_EXIT_ab12__%%errorlevel%%"
+    # Caret-escaped: '%%errorlevel%%' is the batch-file spelling and, typed at an
+    # interactive prompt, CALL turns it into a literal '%0%' — a marker whose
+    # digits never arrive, so the session never looked finished.
+    assert cmd == "type nul & call echo __AIMUX_EXIT_ab12__^%errorlevel^%"
 
 
 def test_apply_patch_end_to_end(fake):
@@ -418,21 +421,21 @@ def test_exec_tempfile_still_running_returns_session_id(monkeypatch):
     assert r["session_id"] in mcp_server._sessions  # retained for later poll
 
 
-def test_exec_windows_profile_still_uses_marker_path(monkeypatch):
-    # Windows keeps the PTY + exit-marker path for now: the command is sent via
-    # send_keys with an echo-marker suffix, NOT via a temp script.
-    c = ExecClient()
+def test_exec_windows_profile_uses_temp_script_not_marker(monkeypatch):
+    # Windows no longer goes through the PTY + exit-marker path: cmd could not
+    # report its exit code at an interactive prompt, so those execs never
+    # finished. It uses the same temp-script mechanism as every other platform.
+    c = WindowsExecClient()
     monkeypatch.setattr(mcp_server, "_client", lambda: c)
     mcp_server._sessions.clear()
-    c.captures = [{"content": ""}]
 
-    mcp_server._remote_exec_command("r", "cmd", {"cmd": "dir", "yield_time_ms": 250})
+    r = mcp_server._remote_exec_command("r", "cmd", {"cmd": "dir", "yield_time_ms": 250})
 
-    assert c.sent
-    keys = c.sent[0]["keys"]
-    assert len(keys) == 2 and keys[1] == "Enter"
-    assert "echo __AIMUX_EXIT_" in keys[0]  # marker suffix, not a temp-file launch
-    assert not keys[0].startswith("bash /tmp/incoming_command_")
+    assert "exit_code" in r
+    keys = c.sent[0]
+    assert keys[1] == "Enter"
+    assert "echo __AIMUX_EXIT_" not in keys[0]  # no marker suffix
+    assert keys[0].startswith('"%USERPROFILE%\\AppData\\Local\\Temp\\')
 
 
 def test_exec_interactive_true_uses_pty_path(monkeypatch):
@@ -476,3 +479,136 @@ def test_apply_hunks_skips_whitespace_diag_on_huge_file(monkeypatch):
     with pytest.raises(ValueError) as exc:
         mcp_server._apply_hunks(orig, hunks)
     assert str(exc.value) == "patch context not found"
+
+
+# ---- temp-file exec (Windows) ----
+#
+# Windows used to be routed to the live-PTY path, where completion was detected
+# by scraping an exit marker out of the terminal. At an interactive cmd prompt
+# the marker's ``%%errorlevel%%`` expanded to a literal ``%0%``, so the reader
+# never saw the digits it matches on and every cmd exec hung forever on
+# session_id. All platforms now use the temp-script path.
+
+
+def _win_norm(path: str) -> str:
+    """``%USERPROFILE%\\AppData\\...`` → ``~/AppData/...`` (the client's view)."""
+    return path.replace("\\", "/").replace("%USERPROFILE%", "~")
+
+
+class WindowsExecClient(ExecTempClient):
+    """Fake Windows client: honours the cmd launcher and its %USERPROFILE% paths."""
+
+    def send_keys(self, *, remote, name, keys, flags, timeout=30.0):
+        self.sent.append(list(keys))
+        launch = str(keys[0])
+        m = re.match(r'^"([^"]+)" > "([^"]+)" 2>&1$', launch)
+        assert m, f"unexpected windows launch line: {launch!r}"
+        script, out = (_win_norm(m.group(1)), _win_norm(m.group(2)))
+        # The launcher speaks %USERPROFILE% while the MCP wrote the script through
+        # '~' — the mapping only holds if both name the same remote file.
+        assert script in self.files, f"launcher pointed at a script that was never written: {script}"
+        self.files[out] = b"winbox\\user\r\n"  # the batch file's stdout
+        self.files[out[:-4] + ".code"] = b"3\r\n"  # its 'echo %errorlevel%' line
+        return {"ok": True}
+
+
+def test_exec_plan_posix_unchanged():
+    plan = mcp_server._exec_plan(cmd="echo hi", profile="posix-pty", shell_bin=None, windows=False)
+    assert plan.script.startswith("/tmp/incoming_command_") and plan.script.endswith(".sh")
+    assert plan.body == "echo hi"
+    assert plan.launch == f"bash {plan.script} > {plan.out} 2>&1; echo $? > {plan.code}"
+
+
+def test_exec_plan_windows_cmd_writes_exit_code_inside_the_batch_file():
+    plan = mcp_server._exec_plan(cmd="whoami", profile="cmd", shell_bin=None, windows=True)
+    assert plan.script.startswith("~/AppData/Local/Temp/") and plan.script.endswith(".cmd")
+    assert plan.body.startswith("@echo off\r\nwhoami\r\n")
+    assert f'echo %errorlevel% > "{mcp_server._win_path(plan.code)}"' in plan.body
+    assert plan.launch == f'"{mcp_server._win_path(plan.script)}" > "{mcp_server._win_path(plan.out)}" 2>&1'
+
+
+def test_exec_plan_windows_powershell_captures_output_itself():
+    plan = mcp_server._exec_plan(cmd="Get-Date", profile="powershell", shell_bin=None, windows=True)
+    assert plan.script.endswith(".ps1")
+    # A PS '>' writes UTF-16, so the script must write the files with .NET.
+    assert "[IO.File]::WriteAllText(" in plan.body
+    assert "$LASTEXITCODE" in plan.body
+    assert plan.launch.startswith("powershell -NoProfile -ExecutionPolicy Bypass -File ")
+
+
+def test_exec_plan_windows_mingw_uses_home_paths():
+    plan = mcp_server._exec_plan(cmd="ls", profile="mingw64", shell_bin=None, windows=True)
+    assert plan.script.startswith("~/AppData/Local/Temp/") and plan.script.endswith(".sh")
+    # Git Bash cannot read the bridge client's '~' spelling, and $HOME inside
+    # double quotes is the one form that expands there.
+    assert plan.launch.startswith('bash "$HOME/AppData/Local/Temp/')
+    assert plan.body == "ls"
+
+
+def test_exec_temp_paths_windows_extensions():
+    s, o, c = mcp_server._exec_temp_paths("cmd", windows=True)
+    assert s.endswith(".cmd") and o.endswith(".out") and c.endswith(".code")
+    assert s[:-4] == o[:-4] == c[:-5]
+    assert s.startswith("~/AppData/Local/Temp/")
+
+
+def test_windows_exec_runs_cleans_up_and_reports_exit_code(monkeypatch):
+    c = WindowsExecClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command("r", "cmd", {"cmd": "whoami", "yield_time_ms": 1000})
+
+    assert r["exit_code"] == 3
+    assert r["output"] == "winbox\\user\r\n"  # the command's output, nothing else
+    assert c.killed and c.files == {}  # session + all three temp files reaped
+
+
+def test_windows_exec_reports_platform_even_for_posix_family_profile(monkeypatch):
+    """A MSYS profile on a Windows host still needs Windows temp paths."""
+    monkeypatch.setattr(mcp_server, "_remote_platform", "windows")
+    c = WindowsExecClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+    plan_cmds = []
+
+    real_plan = mcp_server._exec_plan
+
+    def spy(**kw):
+        plan_cmds.append(kw)
+        return real_plan(**kw)
+
+    monkeypatch.setattr(mcp_server, "_exec_plan", spy)
+    mcp_server._remote_exec_command("r", "cmd", {"cmd": "whoami", "yield_time_ms": 1000})
+    assert plan_cmds and plan_cmds[0]["windows"] is True
+
+
+def test_remote_is_windows_falls_back_to_profile_names():
+    mcp_server._remote_platform = ""
+    assert mcp_server._remote_is_windows("cmd")
+    assert mcp_server._remote_is_windows("powershell")
+    assert mcp_server._remote_is_windows("mingw64")
+    assert not mcp_server._remote_is_windows("posix-pty")
+
+
+def test_decode_text_tolerates_windows_shell_encodings():
+    assert mcp_server._decode_text("hi".encode("utf-8")) == "hi"
+    assert mcp_server._decode_text("﻿hi".encode("utf-8")) == "hi"          # UTF-8 BOM
+    assert mcp_server._decode_text("hi".encode("utf-16")) == "hi"              # UTF-16 BOM
+    assert mcp_server._decode_text("保留".encode("utf-8")) == "保留"
+
+
+def test_read_code_file_ignores_noise_around_the_number(monkeypatch):
+    class C:
+        def __init__(self, data):
+            self.data = data
+
+        def file_stat(self, **kw):
+            return {"exists": True, "type": "file", "size": len(self.data)}
+
+        def file_read(self, **kw):
+            return {"content_b64": base64.b64encode(self.data).decode()}
+
+    for raw, expected in ((b"0\r\n", 0), ("﻿7".encode("utf-8"), 7),
+                          ("8".encode("utf-16"), 8), (b"exit=13 ok", 13), (b"", None)):
+        assert mcp_server._read_code_file(C(raw), "r", "/tmp/x.code") == expected
