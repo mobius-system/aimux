@@ -9,7 +9,7 @@
 #
 # Log format, one block per command:
 #     --- 测试N ---
-#     运行命令：
+#     运行命令（机器：xxx）：
 #     <command, with $AIMUX/$DIR/$SESSION expanded to their real values>
 #     返回结果：
 #     <output>
@@ -19,6 +19,8 @@
 set -u
 
 AIMUX="${AIMUX:-$HOME/.local/bin/aimux}"
+# 这台机器的名字（默认取 hostname，可用 AIMUX_SMOKE_MACHINE 覆盖成你习惯的别名）
+MACHINE="${AIMUX_SMOKE_MACHINE:-$(hostname)}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SESSION="aimux_basic_$$"
 
@@ -44,7 +46,7 @@ expand() { # expand <command string>  → substitute this script's own variables
 step() { # step <command string>  → print it expanded, run it, record the result
   local cmd out
   cmd="$(expand "$1")"
-  printf '运行命令：\n%s\n返回结果：\n' "$cmd"
+  printf '运行命令（机器：%s）：\n%s\n返回结果：\n' "$MACHINE" "$cmd"
   out="$(bash -c "$cmd" 2>&1)"
   if [ -n "$out" ]; then printf '%s\n' "$out"; fi
   printf '\n'
