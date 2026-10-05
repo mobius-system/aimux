@@ -8,7 +8,7 @@
 # effect, local apply-patch, and the help output shape. Needs tmux.
 #
 # Log format, one block per command:
-#     --- 测试N ---
+#     --- 测试N（测试内容） ---
 #     运行命令（机器：xxx）：
 #     <command, with $AIMUX/$DIR/$SESSION expanded to their real values>
 #     返回结果：
@@ -30,9 +30,9 @@ group_no=0
 
 cd "$DIR" || exit 1
 
-group() { # group  → a new '--- 测试N ---' section
+group() { # group <title>  → a new '--- 测试N（title） ---' section
   group_no=$((group_no + 1))
-  printf -- '--- 测试%d ---\n\n' "$group_no"
+  printf -- '--- 测试%d（%s） ---\n\n' "$group_no" "$1"
 }
 
 expand() { # expand <command string>  → substitute this script's own variables
@@ -57,14 +57,14 @@ step() { # step <command string>  → print it expanded, run it, record the resu
 printf 'aimux smoke test — %s\n主机: %s   目录: %s\n\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(hostname)" "$DIR"
 
-group
+group 环境与版本
 step 'python3 -c "import aimux; print(\"aimux version:\", aimux.__version__)"'
 step 'tmux -V'
 step '$AIMUX -h'
 step '$AIMUX -h | grep -q "File Read/Edit Commands" && echo "PASS 顶层帮助按面板分组" || echo "FAIL 顶层帮助没有面板分组"'
 step '$AIMUX get-files -h | grep -q "Examples:" && echo "PASS 子命令帮助带 Examples" || echo "FAIL 子命令帮助没有 Examples"'
 
-group
+group 本地会话生命周期
 step '$AIMUX kill $SESSION >/dev/null 2>&1 || true'
 step '$AIMUX new --name $SESSION --cwd $DIR'
 step '$AIMUX send-keys $SESSION -- '"'"'pwd; echo AIMUX_OK_42'"'"' Enter'
@@ -76,18 +76,18 @@ step '$AIMUX ls'
 step '$AIMUX ls --json'
 step '$AIMUX ls | grep -q "$SESSION" && echo "PASS ls 列出了该 session" || echo "FAIL ls 里没有该 session"'
 
-group
+group '本地 apply-patch'
 step 'printf "alpha\nbeta\n" > sample.txt; cat sample.txt'
 step 'printf "*** Begin Patch\n*** Update File: $DIR/sample.txt\n@@\n-beta\n+gamma\n*** End Patch\n" | $AIMUX apply-patch'
 step 'cat sample.txt'
 step 'grep -qx gamma sample.txt && echo "PASS 补丁已落到文件" || echo "FAIL 文件没被改"'
 
-group
+group '多轮输出 + wait --print-lines'
 step '$AIMUX send-keys $SESSION -- '"'"'echo tick 1; sleep 1; echo tick 2; sleep 1; echo tick 3'"'"' Enter'
 step '$AIMUX wait-last-command-complete $SESSION --timeout 30s --print-lines 5'
 step '$AIMUX capture $SESSION --lines 40 | grep -q "tick 3" && echo "PASS 多轮输出完整（tick 3 在）" || echo "FAIL 输出不完整"'
 
-group
+group 清理
 step '$AIMUX kill $SESSION'
 step '$AIMUX ls'
 step '$AIMUX ls | grep -q "$SESSION" && echo "FAIL session 还在列表里" || echo "PASS session 已消失"'

@@ -8,7 +8,7 @@
 # and the local aimux can reach the broker. Needs a POSIX profile on the remote.
 #
 # 日志格式，每条命令一块，并标注它是在哪台机器上执行的：
-#     --- 测试N ---
+#     --- 测试N（测试内容） ---
 #
 #     运行命令（机器：<机器>）：
 #     <命令，变量全部展开>
@@ -31,7 +31,7 @@ pass=0
 fail=0
 group_no=0
 
-group() { group_no=$((group_no + 1)); printf -- '--- 测试%d ---\n\n' "$group_no"; }
+group() { group_no=$((group_no + 1)); printf -- '--- 测试%d（%s） ---\n\n' "$group_no" "$1"; }
 
 record() { # record <machine> <command-as-shown> <output>
   printf '运行命令（机器：%s）：\n%s\n返回结果：\n' "$1" "$2"
@@ -60,11 +60,11 @@ remote_step() { # remote_step <remote command shown in log>  → 在 REMOTE 的�
 printf 'aimux bridge smoke test — %s\n驱动端(DRIVER): %s   远端(REMOTE): %s:%s\n\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DRIVER" "$REMOTE" "$RDIR"
 
-group
+group 'bridge client 注册状态'
 step "$AIMUX remote ls | grep -E \"HOST|$REMOTE\""
 step "$AIMUX remote ls | grep -q \"$REMOTE.*connected\" && echo \"PASS $REMOTE 已注册且 connected\" || echo \"FAIL $REMOTE 未连接\""
 
-group
+group 远端会话生命周期
 step "$AIMUX kill $REMOTE/$SESSION >/dev/null 2>&1 || true"
 step "$AIMUX new --remote $REMOTE --profile $PROFILE --name $SESSION --cwd $RDIR"
 remote_step 'pwd; echo BRIDGE_OK_42'
@@ -72,7 +72,7 @@ step "$AIMUX capture $REMOTE/$SESSION --lines 40 | grep -q 'BRIDGE_OK_42' && ech
 step "$AIMUX capture $REMOTE/$SESSION --lines 40 | grep -q '$RDIR' && echo \"PASS 远端会话 cwd = $RDIR\" || echo \"FAIL cwd 不对\""
 step "$AIMUX ls | grep -E 'LOCATION|$SESSION'"
 
-group
+group 日志回传与清理
 step "$AIMUX send-files $REMOTE $RDIR $LOG"
 step "$AIMUX kill $REMOTE/$SESSION"
 step "$AIMUX ls | grep -q '$SESSION' && echo \"FAIL 会话还在\" || echo \"PASS 会话已销毁\""
