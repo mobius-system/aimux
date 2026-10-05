@@ -4,6 +4,7 @@ import re
 
 import pytest
 
+from aimux import bridge
 from aimux import mcp_server
 
 
@@ -612,3 +613,85 @@ def test_read_code_file_ignores_noise_around_the_number(monkeypatch):
     for raw, expected in ((b"0\r\n", 0), ("﻿7".encode("utf-8"), 7),
                           ("8".encode("utf-16"), 8), (b"exit=13 ok", 13), (b"", None)):
         assert mcp_server._read_code_file(C(raw), "r", "/tmp/x.code") == expected
+
+
+# ---- dead-session detection + temp-file cleanup on reap ----
+
+
+class DeadSessionClient(ExecTempClient):
+    """Session disappears mid-exec: no code file ever lands, capture says gone."""
+
+    def __init__(self):
+        super().__init__()
+        self.captures: list[str] = []
+
+    def send_keys(self, **kw):  # the launch never lands: session died first
+        self.sent.append(list(kw.get("keys") or []))
+        return {"ok": True}
+
+    def capture(self, **kw):
+        self.captures.append(str(kw.get("name")))
+        raise bridge.BridgeError("session not found", kind="session_gone")
+
+
+def test_wait_exec_done_detects_a_session_that_vanished(monkeypatch):
+    # A killed session leaves its temp files behind, so the code file never
+    # appears: without a liveness probe this loops until the yield expires and
+    # then reports "still running" for a session nobody can ever finish.
+    c = DeadSessionClient()
+    out, exit_code, finished, wall, dead = mcp_server._wait_exec_done(
+        c, "r", "/tmp/x.out", "/tmp/x.code", 3000, name="mcp-exec-abc", probe_every=0.4
+    )
+    assert (finished, dead, exit_code) == (True, True, -1)
+    assert c.captures, "the wait must probe the session, not only the files"
+
+
+def test_session_is_gone_only_believes_session_errors():
+    class C:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def capture(self, **kw):
+            if self.exc:
+                raise self.exc
+            return {"content": "x"}
+
+    assert mcp_server._session_is_gone(C(bridge.BridgeError("g", kind="session_gone")), "r", "n") is True
+    assert mcp_server._session_is_gone(C(bridge.BridgeError("g", kind="not_found")), "r", "n") is True
+    # A transport hiccup is not proof of death — keep waiting.
+    assert mcp_server._session_is_gone(C(RuntimeError("boom")), "r", "n") is False
+    assert mcp_server._session_is_gone(C(bridge.BridgeError("other", kind="bad_request")), "r", "n") is False
+    assert mcp_server._session_is_gone(C(None), "r", "n") is False
+
+
+def test_exec_reports_dead_session_and_cleans_up(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_EXEC_PROBE_EVERY_S", 0.4)
+    c = DeadSessionClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "sleep 900", "yield_time_ms": 3000})
+
+    assert r["exit_code"] == -1
+    assert r["note"] == "session ended (shell exited)"
+    assert "session_id" not in r
+    assert c.killed and c.files == {}  # session + all three temp files cleaned up
+
+
+def test_reap_deletes_temp_files_of_unfinished_sessions(monkeypatch):
+    # Bug: reaping only killed the session, leaving the script/out/code files on
+    # the remote (and on Windows, in the user's AppData\Local\Temp) forever.
+    c = ExecTempClient()
+    mcp_server._sessions.clear()
+    mcp_server._sessions[1] = {
+        "remote": "r", "name": "mcp-exec-reap", "profile": "cmd",
+        "tmp_script": "/tmp/x.cmd", "tmp_out": "/tmp/x.out", "tmp_code": "/tmp/x.code",
+    }
+    for p in ("/tmp/x.cmd", "/tmp/x.out", "/tmp/x.code"):
+        c.files[p] = b"x"
+
+    assert mcp_server._reap_all_sessions(c, timeout=5.0) == 1
+
+    assert c.killed == [{"remote": "r", "name": "mcp-exec-reap", "timeout": 5.0}]
+    assert c.files == {}
+    assert mcp_server._sessions == {}

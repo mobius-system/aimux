@@ -66,6 +66,15 @@ _reap_client = None
 
 _EXEC_SHELL = os.environ.get("AIMUX_MCP_SHELL") or os.environ.get("SHELL") or "/bin/bash"
 
+# Result note for a session that vanished mid-wait (killed from outside, or the
+# remote shell exited). exit_code is -1 because there is no code to report.
+_DEAD_NOTE = "session ended (shell exited)"
+
+# How often a wait checks that the session still exists. File polling alone
+# cannot see death (the files outlive the shell), and every check costs a bridge
+# round trip, so it is far slower than the 0.3s file poll.
+_EXEC_PROBE_EVERY_S = 5.0
+
 # Ceiling for a single yield_time_ms (clamped so one tool call can't pin the
 # single-threaded MCP server for an unbounded time).
 _MAX_YIELD_MS = 300_000  # 5 minutes
@@ -84,12 +93,18 @@ def _create_exec_session(remote: str, profile: str, cmd: str, cwd: str | None) -
     return sid
 
 
-def _close_exec_session(sid: int, c) -> None:
+def _close_exec_session(sid: int, c, *, timeout: float | None = None) -> None:
+    """Kill the session and delete its temp files.
+
+    ``timeout`` bounds each bridge call, for callers that must not block on a
+    dead client (process exit); ``None`` lets each call use its own default.
+    """
     sess = _sessions.pop(sid, None)
     if not sess:
         return
+    kw: dict = {} if timeout is None else {"timeout": timeout}
     try:
-        c.kill_session(remote=sess["remote"], name=sess["name"])
+        c.kill_session(remote=sess["remote"], name=sess["name"], **kw)
     except Exception:
         pass
     # Best-effort cleanup of the temp script/output/code files created by the
@@ -99,33 +114,28 @@ def _close_exec_session(sid: int, c) -> None:
         if not path:
             continue
         try:
-            c.file_delete(remote=sess["remote"], path=path)
+            c.file_delete(remote=sess["remote"], path=path, **kw)
         except Exception:
             pass
 
 
 def _reap_all_sessions(c, *, timeout: float = 5.0) -> int:
-    """Kill every tracked exec session. Best-effort, idempotent, safe to call
+    """Close every tracked exec session. Best-effort, idempotent, safe to call
     repeatedly (kill_session treats a missing session as success). Returns the
-    count reaped. Called at process exit so the bridge PTYs this MCP server
-    created do not leak on the (shared) remote client.
+    count reaped. Called at process exit so neither the bridge PTYs this MCP
+    server created nor their temp script/output/code files leak on the
+    (shared) remote client.
 
     Iterates ONLY this process's local ``_sessions`` — never list_sessions() /
     pattern-matches — so it cannot touch a concurrent sibling MCP process's
     sessions (mcp-exec-<uuid> names are globally unique regardless). Short
     timeout bounds exit latency if the client is down.
     """
-    sids = list(_sessions.keys())
     reaped = 0
-    for sid in sids:
-        sess = _sessions.get(sid)
-        if not sess:
+    for sid in list(_sessions.keys()):
+        if sid not in _sessions:
             continue
-        try:
-            c.kill_session(remote=sess["remote"], name=sess["name"], timeout=timeout)
-        except Exception as e:
-            print(f"aimux-mcp: reap kill_session failed sid={sid}: {e}", file=sys.stderr)
-        _sessions.pop(sid, None)
+        _close_exec_session(sid, c, timeout=timeout)
         reaped += 1
     return reaped
 
@@ -211,7 +221,10 @@ def _truncate_output(text: str, max_tokens: int) -> tuple[str, int]:
 def _drain(c, remote: str, name: str, marker: str, yield_ms: int, expect_marker: bool):
     """Poll capture until ``marker`` appears (command finished) or yield_ms elapses.
 
-    Returns (output, exit_code, finished, wall_seconds).
+    Returns (output, exit_code, finished, wall_seconds, dead). ``dead`` is True
+    when the remote says the session itself is gone: a killed session never
+    prints the marker, so without this it looks exactly like a slow command and
+    the caller polls a session that no longer exists, forever.
     """
     started = time.time()
     deadline = started + max(yield_ms, 0) / 1000.0
@@ -224,6 +237,10 @@ def _drain(c, remote: str, name: str, marker: str, yield_ms: int, expect_marker:
         time.sleep(0.3)
         try:
             cap = c.capture(remote=remote, name=name, lines=4000, ansi=False, timeout=10.0)
+        except bridge.BridgeError as e:
+            if e.kind in ("session_gone", "not_found"):
+                return out, -1, True, time.time() - started, True
+            cap = {}
         except Exception:
             cap = {}
         out = str((cap or {}).get("content") or "")
@@ -238,10 +255,11 @@ def _drain(c, remote: str, name: str, marker: str, yield_ms: int, expect_marker:
                 out = out[: m.start()]
                 finished = True
                 break
-    return out, exit_code, finished, time.time() - started
+    return out, exit_code, finished, time.time() - started, False
 
 
-def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, finished: bool, wall: float) -> dict:
+def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, finished: bool, wall: float,
+                 *, note: str | None = None) -> dict:
     res = {
         "output": output,
         "original_token_count": original_tokens,
@@ -250,6 +268,8 @@ def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, fini
     if finished:
         if exit_code is not None:
             res["exit_code"] = exit_code
+        if note:
+            res["note"] = note
         _close_exec_session(sid, c)
     else:
         # still running: hand back session_id for remote_write_stdin
@@ -438,17 +458,47 @@ def _read_out_file(c, remote: str, outfile: str) -> str:
     return _decode_text(_file_bytes(res))
 
 
-def _wait_exec_done(c, remote: str, outfile: str, codefile: str, yield_ms: int):
-    """Poll for the exit-code file; return (output, exit_code, finished, wall)."""
+def _session_is_gone(c, remote: str, name: str) -> bool:
+    """True when the remote no longer has this session.
+
+    The temp-script poll reads *files*, and files outlive the shell that wrote
+    them: a session killed from outside leaves the poll watching a code file
+    that will never appear — indistinguishable from a slow command. ``capture``
+    is the liveness probe the bridge already exposes: it raises ``session_gone``
+    for a session that is not there.
+    """
+    try:
+        c.capture(remote=remote, name=name, lines=1, ansi=False, timeout=10.0)
+        return False
+    except bridge.BridgeError as e:
+        return e.kind in ("session_gone", "not_found")
+    except Exception:
+        return False  # a transient error is not proof of death
+
+
+def _wait_exec_done(c, remote: str, outfile: str, codefile: str, yield_ms: int,
+                    *, name: str | None = None, probe_every: float | None = None):
+    """Poll for the exit-code file; return (output, exit_code, finished, wall, dead).
+
+    ``name`` enables a periodic liveness probe every ``probe_every`` seconds
+    (default ``_EXEC_PROBE_EVERY_S``), so a session that died mid-wait is
+    reported instead of polled forever.
+    """
+    probe_every = _EXEC_PROBE_EVERY_S if probe_every is None else probe_every
     started = time.time()
     deadline = started + max(yield_ms, 0) / 1000.0
+    last_probe = started
     while True:
         if time.time() >= deadline:
-            return _read_out_file(c, remote, outfile), None, False, time.time() - started
+            return _read_out_file(c, remote, outfile), None, False, time.time() - started, False
         time.sleep(0.3)
         code = _read_code_file(c, remote, codefile)
         if code is not None:
-            return _read_out_file(c, remote, outfile), code, True, time.time() - started
+            return _read_out_file(c, remote, outfile), code, True, time.time() - started, False
+        if name and time.time() - last_probe >= probe_every:
+            last_probe = time.time()
+            if _session_is_gone(c, remote, name):
+                return _read_out_file(c, remote, outfile), -1, True, time.time() - started, True
 
 
 # ---------------------------------------------------------------------------
@@ -522,9 +572,10 @@ def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
                 flags=[],
                 timeout=15.0,
             )
-            out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, True)
+            out, exit_code, finished, wall, dead = _drain(c, remote, name, marker, yield_ms, True)
             out_t, original = _truncate_output(out, max_tokens)
-            return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
+            return _exec_result(sid, c, out_t, original, exit_code, finished, wall,
+                                note=_DEAD_NOTE if dead else None)
         except bridge.BridgeError as e:
             _close_exec_session(sid, c)
             if e.kind in ("session_gone", "not_found") and attempt < max_retries:
@@ -573,9 +624,11 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
             # 2) trivial launch line -> redirect output + exit code to files.
             c.send_keys(remote=remote, name=name, keys=[plan.launch, "Enter"], flags=[], timeout=15.0)
             # 3) poll the exit-code file, then read clean output + exit code.
-            out, exit_code, finished, wall = _wait_exec_done(c, remote, plan.out, plan.code, yield_ms)
+            out, exit_code, finished, wall, dead = _wait_exec_done(
+                c, remote, plan.out, plan.code, yield_ms, name=name)
             out_t, original = _truncate_output(out, max_tokens)
-            return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
+            return _exec_result(sid, c, out_t, original, exit_code, finished, wall,
+                                note=_DEAD_NOTE if dead else None)
         except bridge.BridgeError as e:
             _close_exec_session(sid, c)
             if e.kind in ("session_gone", "not_found") and attempt < max_retries:
@@ -633,8 +686,8 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
         if sess.get("tmp_code"):
             # temp-file session: completion is signalled by the exit-code file;
             # read clean output + exit code from the redirected temp files.
-            out, exit_code, finished, wall = _wait_exec_done(
-                c, remote, sess["tmp_out"], sess["tmp_code"], yield_ms
+            out, exit_code, finished, wall, dead = _wait_exec_done(
+                c, remote, sess["tmp_out"], sess["tmp_code"], yield_ms, name=name
             )
         else:
             # legacy PTY marker session (Windows exec): poll capture for the
@@ -642,7 +695,7 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
             # password prompt, raw stdin reader) must never consume the marker
             # as stdin, so keep the marker out of the write path.
             marker = sess.get("marker", "")
-            out, exit_code, finished, wall = _drain(c, remote, name, marker, yield_ms, bool(marker))
+            out, exit_code, finished, wall, dead = _drain(c, remote, name, marker, yield_ms, bool(marker))
     except bridge.BridgeError as e:
         if e.kind in ("session_gone", "not_found") and not has_chars:
             # Empty poll on a dead session: the remote shell exited (or was
@@ -654,13 +707,14 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
                 "original_token_count": 0,
                 "wall_time_seconds": 0,
                 "exit_code": -1,
-                "note": "session ended (shell exited)",
+                "note": _DEAD_NOTE,
             }
         # Session gone mid-write or any other error: clean up and re-raise.
         _close_exec_session(sid, c)
         raise
     out_t, original = _truncate_output(out, max_tokens)
-    return _exec_result(sid, c, out_t, original, exit_code, finished, wall)
+    return _exec_result(sid, c, out_t, original, exit_code, finished, wall,
+                        note=_DEAD_NOTE if dead else None)
 
 
 # ---------------------------------------------------------------------------
