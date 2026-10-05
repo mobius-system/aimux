@@ -674,6 +674,7 @@ def test_exec_reports_dead_session_and_cleans_up(monkeypatch):
 
     assert r["exit_code"] == -1
     assert r["note"] == "session ended (shell exited)"
+    assert r["output"] == "<aimux>session ended (shell exited)</aimux>"
     assert "session_id" not in r
     assert c.killed and c.files == {}  # session + all three temp files cleaned up
 
@@ -739,6 +740,11 @@ def test_output_markers():
         "<aimux>command timeout after 10 seconds</aimux>"
     assert mcp_server._decorate_output("partial\n", finished=False, timeout_ms=250) == \
         "partial\n<aimux>get some output, but command timeout after 0.25 seconds</aimux>"
+    # dead session: the reader must not mistake it for "finished with no output"
+    assert mcp_server._decorate_output("", finished=True, dead=True) == \
+        "<aimux>session ended (shell exited)</aimux>"
+    assert mcp_server._decorate_output("half\n", finished=True, dead=True) == \
+        "half\n<aimux>get some output, but session ended (shell exited)</aimux>"
     assert mcp_server._seconds_label(300000) == "300"
 
 
@@ -777,3 +783,22 @@ def test_timeout_marker_survives_truncation(monkeypatch):
     assert r["output"].endswith("<aimux>get some output, but command timeout after 1 seconds</aimux>")
     assert "...[truncated]..." in r["output"]
     assert r["original_token_count"] > 50
+
+
+class PartialThenDeadClient(NeverFinishesClient):
+    """Printed something, then the session was killed before it finished."""
+
+    def capture(self, **kw):
+        raise bridge.BridgeError("session not found", kind="session_gone")
+
+
+def test_exec_dead_after_partial_output_says_so(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_EXEC_PROBE_EVERY_S", 0.4)
+    c = PartialThenDeadClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "sleep 900", "yield_time_ms": 3000})
+
+    assert r["output"] == "partial line 1\npartial line 2\n<aimux>get some output, but session ended (shell exited)</aimux>"
+    assert r["exit_code"] == -1 and r["note"] == "session ended (shell exited)"

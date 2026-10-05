@@ -264,31 +264,35 @@ def _seconds_label(ms: int | None) -> str:
     return f"{secs:g}"
 
 
-def _decorate_output(output: str, *, finished: bool, timeout_ms: int | None) -> str:
+def _decorate_output(output: str, *, finished: bool, timeout_ms: int | None = None, dead: bool = False) -> str:
     """Make a result self-describing when it has nothing to show.
 
-    An empty ``output`` is ambiguous: the command may have printed nothing, or
-    the wait may have expired before it printed anything. Both read to an agent
-    as "no result", so say which one happened, and never drop what did arrive:
-    a timed-out wait with partial output keeps it and says so explicitly.
+    An empty ``output`` is ambiguous: the command may have printed nothing and
+    finished, the wait may have expired, or the session may have been killed
+    before it printed. All three read as "no result", so say which one happened
+    — and never drop what did arrive: a wait that ended with partial output
+    keeps it and states the outcome after it.
 
     Markers are added *after* truncation so a long partial output cannot push
     the status line off the end.
     """
-    if finished:
-        if not output.strip():
-            return "<aimux>command output is empty</aimux>"
+    if dead:
+        status = _DEAD_NOTE
+    elif not finished:
+        status = f"command timeout after {_seconds_label(timeout_ms)} seconds"
+    elif output.strip():
         return output
-    waited = f"after {_seconds_label(timeout_ms)} seconds"
+    else:
+        return "<aimux>command output is empty</aimux>"
     if not output.strip():
-        return f"<aimux>command timeout {waited}</aimux>"
-    return output.rstrip("\n") + "\n" + f"<aimux>get some output, but command timeout {waited}</aimux>"
+        return f"<aimux>{status}</aimux>"
+    return output.rstrip("\n") + "\n" + f"<aimux>get some output, but {status}</aimux>"
 
 
 def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, finished: bool, wall: float,
-                 *, note: str | None = None, timeout_ms: int | None = None) -> dict:
+                 *, note: str | None = None, timeout_ms: int | None = None, dead: bool = False) -> dict:
     res = {
-        "output": _decorate_output(output, finished=finished, timeout_ms=timeout_ms),
+        "output": _decorate_output(output, finished=finished, timeout_ms=timeout_ms, dead=dead),
         "original_token_count": original_tokens,
         "wall_time_seconds": round(wall, 3),
     }
@@ -602,7 +606,7 @@ def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
             out, exit_code, finished, wall, dead = _drain(c, remote, name, marker, yield_ms, True)
             out_t, original = _truncate_output(out, max_tokens)
             return _exec_result(sid, c, out_t, original, exit_code, finished, wall,
-                                note=_DEAD_NOTE if dead else None, timeout_ms=yield_ms)
+                                note=_DEAD_NOTE if dead else None, timeout_ms=yield_ms, dead=dead)
         except bridge.BridgeError as e:
             _close_exec_session(sid, c)
             if e.kind in ("session_gone", "not_found") and attempt < max_retries:
@@ -655,7 +659,7 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
                 c, remote, plan.out, plan.code, yield_ms, name=name)
             out_t, original = _truncate_output(out, max_tokens)
             return _exec_result(sid, c, out_t, original, exit_code, finished, wall,
-                                note=_DEAD_NOTE if dead else None, timeout_ms=yield_ms)
+                                note=_DEAD_NOTE if dead else None, timeout_ms=yield_ms, dead=dead)
         except bridge.BridgeError as e:
             _close_exec_session(sid, c)
             if e.kind in ("session_gone", "not_found") and attempt < max_retries:
@@ -730,7 +734,7 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
             # instead of a cryptic error.
             _close_exec_session(sid, c)
             return {
-                "output": _decorate_output("", finished=True, timeout_ms=None),
+                "output": _decorate_output("", finished=True, dead=True),
                 "original_token_count": 0,
                 "wall_time_seconds": 0,
                 "exit_code": -1,
@@ -741,7 +745,7 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
         raise
     out_t, original = _truncate_output(out, max_tokens)
     return _exec_result(sid, c, out_t, original, exit_code, finished, wall,
-                        note=_DEAD_NOTE if dead else None, timeout_ms=yield_ms)
+                        note=_DEAD_NOTE if dead else None, timeout_ms=yield_ms, dead=dead)
 
 
 # ---------------------------------------------------------------------------
@@ -1107,7 +1111,7 @@ TOOLS = [
                 "chars": {"type": "string", "description": "Characters to write to stdin."},
                 "append_enter": {"type": "boolean", "description": "Append Enter after chars. Defaults to true for command lines; common pager/control keys (q, Ctrl-C, Ctrl-D, Escape) are sent raw."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget. Defaults to 10000."},
-                "session_id": {"type": "number", "description": "Identifier of the running unified exec session. A poll that expires before the command finishes reports it in output ('<aimux>command timeout after N seconds</aimux>', or '<aimux>get some output, but command timeout after N seconds</aimux>' when partial output exists); a session that is gone returns exit_code -1."},
+                "session_id": {"type": "number", "description": "Identifier of the running unified exec session. A poll that expires before the command finishes reports it in output ('<aimux>command timeout after N seconds</aimux>', or '<aimux>get some output, but command timeout after N seconds</aimux>' when partial output exists); a session that is gone returns exit_code -1 with '<aimux>session ended (shell exited)</aimux>' in output."},
                 "yield_time_ms": {"type": "number", "description": "Wait before yielding output. Non-empty writes default to 250 ms; empty polls wait 5000+ ms; capped at 300000 ms (5 min)."},
             },
             "required": ["session_id"],
