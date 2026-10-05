@@ -695,3 +695,85 @@ def test_reap_deletes_temp_files_of_unfinished_sessions(monkeypatch):
     assert c.killed == [{"remote": "r", "name": "mcp-exec-reap", "timeout": 5.0}]
     assert c.files == {}
     assert mcp_server._sessions == {}
+
+
+# ---- self-describing output (empty / timed out) ----
+
+
+class SilentFinishClient(ExecTempClient):
+    """Command completes with no output at all (e.g. a redirect-only command)."""
+
+    def send_keys(self, *, remote, name, keys, flags, timeout=30.0):
+        self.sent.append(list(keys))
+        m = re.match(r"(\S+) (\S+) > (\S+) 2>&1; echo \$\? > (\S+)", str(keys[0]))
+        assert m, f"unexpected launch line: {keys[0]!r}"
+        _, _script, out, code = m.groups()
+        self.files[out] = b""
+        self.files[code] = b"0"
+        return {"ok": True}
+
+
+class NeverFinishesClient(ExecTempClient):
+    """Still printing when the wait expires: partial .out file, no .code file."""
+
+    def __init__(self):
+        super().__init__()
+        self.partial = b"partial line 1\npartial line 2\n"
+
+    def send_keys(self, *, remote, name, keys, flags, timeout=30.0):
+        self.sent.append(list(keys))
+        m = re.match(r"(\S+) (\S+) > (\S+) 2>&1; echo \$\? > (\S+)", str(keys[0]))
+        assert m, f"unexpected launch line: {keys[0]!r}"
+        _, _script, out, _code = m.groups()
+        self.files[out] = self.partial  # never writes .code -> never finished
+        return {"ok": True}
+
+
+def test_output_markers():
+    assert mcp_server._decorate_output("", finished=True, timeout_ms=10000) == \
+        "<aimux>command output is empty</aimux>"
+    assert mcp_server._decorate_output("   \n", finished=True, timeout_ms=10000) == \
+        "<aimux>command output is empty</aimux>"
+    assert mcp_server._decorate_output("hi\n", finished=True, timeout_ms=10000) == "hi\n"
+    assert mcp_server._decorate_output("", finished=False, timeout_ms=10000) == \
+        "<aimux>command timeout after 10 seconds</aimux>"
+    assert mcp_server._decorate_output("partial\n", finished=False, timeout_ms=250) == \
+        "partial\n<aimux>command timeout after 0.25 seconds</aimux>"
+    assert mcp_server._seconds_label(300000) == "300"
+
+
+def test_exec_with_no_output_says_it_finished_empty(monkeypatch):
+    c = SilentFinishClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "true > /dev/null", "yield_time_ms": 1000})
+
+    assert r["exit_code"] == 0
+    assert r["output"] == "<aimux>command output is empty</aimux>"
+
+
+def test_exec_timeout_keeps_partial_output_and_appends_marker(monkeypatch):
+    c = NeverFinishesClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "sleep 99", "yield_time_ms": 1000})
+
+    assert "session_id" in r and "exit_code" not in r
+    assert r["output"].endswith("<aimux>command timeout after 1 seconds</aimux>")
+    assert "partial line 1" in r["output"]  # partial output is never dropped
+
+
+def test_timeout_marker_survives_truncation(monkeypatch):
+    c = NeverFinishesClient()
+    c.partial = ("\n".join(f"line {i}" for i in range(2000)) + "\n").encode()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command(
+        "r", "posix-pty", {"cmd": "sleep 99", "yield_time_ms": 1000, "max_output_tokens": 50})
+
+    assert r["output"].endswith("<aimux>command timeout after 1 seconds</aimux>")
+    assert "...[truncated]..." in r["output"]
+    assert r["original_token_count"] > 50
