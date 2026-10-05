@@ -196,6 +196,10 @@ class ClientInfo:
     # Local ports this client allows *other* clients to reach. Empty means the
     # client cannot be connected to at all — the safe default.
     allow_http_ports: frozenset[int] = frozenset()
+    # GUI helper capability as reported at registration:
+    # {"available": bool, "error"?: str, "protocolVersion"?: int, ...} or None
+    # for clients that never spoke about GUI (older versions).
+    gui: dict[str, Any] | None = None
 
 
 @dataclass
@@ -285,6 +289,7 @@ class BridgeBrokerState:
         client_version = str(payload.get("version") or "")
         client_id = str(payload.get("client_id") or "")
         allow_http_ports = parse_allow_http_ports(payload.get("allow_http_ports"))
+        gui = payload.get("gui") if isinstance(payload.get("gui"), dict) else None
         mismatch = version_mismatch_message(client_version, __version__)
         if mismatch:
             logger.warning("bridge client {} registered with {}", name, mismatch)
@@ -310,6 +315,7 @@ class BridgeBrokerState:
                 client_version=client_version,
                 client_id=client_id,
                 allow_http_ports=allow_http_ports,
+                gui=gui,
             )
             stale_keys: list[tuple[str, str]] = []
             if not same_client_process:
@@ -398,6 +404,7 @@ class BridgeBrokerState:
                         "last_seen": client.last_seen,
                         "client_version": client.client_version,
                         "allow_http_ports": sorted(client.allow_http_ports),
+                        "gui": client.gui,
                         "server_version": __version__,
                         "version_mismatch": bool(version_mismatch_message(client.client_version, __version__)),
                     }
@@ -1002,6 +1009,12 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     if action == "kill":
                         self._json(HTTPStatus.OK, state.kill_session(remote, name, timeout))
                         return
+                if len(parts) == 3 and parts[:2] == ["api", "gui"]:
+                    self._require_auth()
+                    remote = parts[2]
+                    timeout = min(max(float(payload.pop("timeout", 45) or 45), 1.0), 180.0)
+                    self._json(HTTPStatus.OK, state.submit(remote, "gui.request", payload, timeout))
+                    return
                 if len(parts) == 5 and parts[:2] == ["api", "remotes"] and parts[3] == "files":
                     self._require_auth()
                     remote, action = parts[2], parts[4]

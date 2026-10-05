@@ -121,6 +121,21 @@ Windows bridge profiles include `cmd`, `powershell`, `pwsh`, and `mingw64`
 when available. macOS exposes `mac-pty` and `mac-terminal`; Linux exposes
 `posix-pty`.
 
+On a Windows client you can also opt into computer use. Pass `--enable-gui`
+and the client downloads a small accessibility helper (UIA-based, single
+binary, sha256-verified) to `~/.aimux/helpers/`, starts it, and reports the
+GUI capability with its registration. The helper never needs an OS permission
+prompt; it must simply run inside a logged-in desktop session (not over SSH).
+A failed download or probe never blocks the connection — the remote just
+registers with GUI off:
+
+```bash
+aimux reverse connect http://SERVER:8765 --identifier=winbox --token=<token> --enable-gui
+```
+
+`aimux remote ls` shows a `GUI` column (`on`/`off`) so the capability stays
+visible.
+
 4. Forward a browser-facing HTTP service through the bridge server.
 
 ```bash
@@ -161,6 +176,25 @@ Now `http://127.0.0.1:9000` on B reaches `http://127.0.0.1:8000` on A. The
 tunnel moves raw bytes, so ordinary HTTP, streaming SSE responses, and
 WebSocket upgrades all work — and, as with `port forward`, nothing is parsed or
 rewritten in between.
+
+6. Expose a remote to an MCP agent — optionally with computer use.
+
+```bash
+# classic tools only (remote_exec_command, remote_write_stdin, ...)
+aimux mcp serve --remote=winbox
+
+# classic + computer-use tools (remote_gui_diagnostics, remote_gui_list_windows,
+# remote_gui_look, remote_gui_act, remote_gui_read_text, remote_gui_wait_for,
+# remote_gui_focus_window)
+aimux mcp serve --remote=winbox --toolset=classic-and-gui
+```
+
+GUI tools drive the remote's accessibility tree: `remote_gui_look` returns an
+element outline (with refs) plus a screenshot, and `remote_gui_act` acts on a
+ref semantically through UIA patterns. The default policy `ax_only` never
+injects real mouse/keyboard input; raw input requires explicitly passing
+`policy=foreground`. Serving `--toolset=classic-and-gui` against a remote
+without GUI fails fast with the reason.
 
 The command is symmetric: run it on A too (naming B) to get the reverse
 direction. Ports are checked twice — the broker refuses a port the target

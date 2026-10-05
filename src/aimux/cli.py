@@ -1038,13 +1038,15 @@ def cmd_remote_ls(
         r = results.get(h.name)
         rtt = f"{r.rtt_ms}ms" if r and r.rtt_ms is not None else "-"
         status = r.status if r else "unknown"
-        rows.append([h.name, "ssh", h.user or "-", h.hostname or h.name, h.port, status, rtt])
+        rows.append([h.name, "ssh", h.user or "-", h.hostname or h.name, h.port, status, rtt, "-"])
     for remote in bridge_remotes:
         profiles = ",".join(
             str(p.get("name"))
             for p in remote.get("profiles", [])
             if isinstance(p, dict) and p.get("available", True)
         )
+        gui = remote.get("gui") if isinstance(remote.get("gui"), dict) else None
+        gui_label = "on" if gui and gui.get("available") else ("off" if gui is not None else "-")
         rows.append(
             [
                 remote.get("name"),
@@ -1054,9 +1056,10 @@ def cmd_remote_ls(
                 "-",
                 remote.get("status") or "unknown",
                 "-",
+                gui_label,
             ]
         )
-    emit_table(["HOST", "TYPE", "USER/PLATFORM", "HOSTNAME/PROFILES", "PORT", "STATUS", "RTT"], rows)
+    emit_table(["HOST", "TYPE", "USER/PLATFORM", "HOSTNAME/PROFILES", "PORT", "STATUS", "RTT", "GUI"], rows)
 
 
 # ---------- remote test ----------
@@ -1309,6 +1312,13 @@ def cmd_reverse_connect(
     watchdog: Annotated[Optional[str], typer.Option("--watchdog", help="Path to a TUI/Electron keepalive file; exit when it is stale.")] = None,
     watchdog_timeout: Annotated[float, typer.Option("--watchdog-timeout", help="Seconds without keepalive before AIMUX exits.")] = 30.0,
     runtime: Annotated[Optional[str], typer.Option("--runtime", help="Path to AIMUX runtime JSON state.")] = None,
+    enable_gui: Annotated[
+        bool,
+        typer.Option(
+            "--enable-gui",
+            help="Start the GUI accessibility helper (computer use). Windows x64 only in this release; run from a logged-in desktop session. Failure does not block the connection.",
+        ),
+    ] = False,
 ):
     try:
         allowed_ports = port_tunnel.parse_port_list(allow_http_ports)
@@ -1327,6 +1337,7 @@ def cmd_reverse_connect(
             watchdog_path=watchdog,
             watchdog_timeout=watchdog_timeout,
             runtime_path=runtime,
+            enable_gui=enable_gui,
         )
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
@@ -2022,10 +2033,17 @@ def cmd_mcp_serve(
         Optional[str],
         typer.Option("--profile", help="Override the bridge session profile."),
     ] = None,
+    toolset: Annotated[
+        str,
+        typer.Option(
+            "--toolset",
+            help="Tool set to expose: classic (6 remote_* tools, default) or classic-and-gui (adds remote_gui_* computer-use tools).",
+        ),
+    ] = "classic",
 ):
     from . import mcp_server  # lazy import: keep `mcp` off the common command path
     try:
-        mcp_server.run_stdio(remote=remote, profile=profile)
+        mcp_server.run_stdio(remote=remote, profile=profile, toolset=toolset)
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
     except KeyboardInterrupt:

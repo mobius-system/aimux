@@ -290,6 +290,7 @@ def test_broker_state_registers_bridge_remote(monkeypatch):
             "last_seen": state.list_remotes()[0]["last_seen"],
             "client_version": "",
             "allow_http_ports": [],
+            "gui": None,
             "server_version": __version__,
             "version_mismatch": False,
         }

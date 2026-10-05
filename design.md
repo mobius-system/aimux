@@ -1066,3 +1066,30 @@ aimux 的最终形态来自一系列简化决策：
 - **多 agent 并发**：tmux server 自身串行处理命令，无并发问题
 - **远端长任务断网**：ssh 断了 pane 退；agent 看到 `[process exited]` 后 `kill` + `new` 重建，但任务进度会丢。如确实需要续跑，让 agent 在 send-keys 时自己用 `nohup` / `screen` 包裹命令
 - **TUI 监控**（可选未来扩展）：`aimux top`，实时看所有 session 最新几行（agent 行为可视化）
+
+
+## Computer use (GUI helper) — 0.3.64
+
+**Shape:** the native helper is a single Rust binary speaking JSON lines on
+stdin/stdout (protocol 4, upstream pi-computer-use windows-bridge). The
+reverse client owns its whole lifecycle.
+
+- **Install:** CDN manifest (`helpers.windows-x64`) -> download -> sha256
+  verify -> atomic rename under `~/.aimux/helpers/`, with a `.meta.json`
+  sidecar recording the installed digest. `AIMUX_GUI_HELPER_PATH` bypasses the
+  CDN for dev/debug (and the platform gate, so mocks run anywhere).
+- **Gate:** `aimux reverse connect --enable-gui`. Install/spawn/probe failures
+  NEVER block the connection; the registration simply carries
+  `gui: {available: false, error}` instead.
+- **Transport:** one new bridge message, `gui.request` `{cmd, args}` ->
+  `result` of the helper response. Requests are serialized client-side; the
+  broker routes it like any other per-remote command (`POST /api/gui/<remote>`,
+  timeout 1-180s, clamped). Old brokers/clients ignore the extra fields, so
+  mixed versions interoperate.
+- **MCP:** `aimux mcp serve --toolset classic|classic-and-gui`. The default
+  `classic` toolset is byte-identical to the pre-GUI server. The gui toolset
+  adds seven `remote_gui_*` tools; serving it against a GUI-less remote exits
+  with the reason. `remote_gui_act` defaults to `policy=ax_only` (semantic UIA
+  patterns only); raw input needs an explicit `policy=foreground`.
+- **Visibility:** `aimux remote ls` gains a `GUI` column (`on`/`off`/`-` for
+  clients that never spoke about GUI).

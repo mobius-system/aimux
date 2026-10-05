@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import __version__
 from . import bridge
+from .gui_helper import REQUEST_TIMEOUTS as _GUI_TIMEOUTS
 
 # ---------------------------------------------------------------------------
 # bridge control
@@ -1084,7 +1085,7 @@ def _apply_hunks(orig: str, hunks: list) -> str:
 # MCP tool registry
 # ---------------------------------------------------------------------------
 
-TOOLS = [
+CLASSIC_TOOLS = [
     {
         "name": "remote_exec_command",
         "description": "Runs a shell command, returning clean output and an exit code. One-shot by default: the command is uploaded to a temp script and its output and exit code are read back from files, on every platform. On a Windows cmd remote that script is a .cmd file, so write for-loop variables with a doubled percent (for /l %%i in (1,1,3) do ...). Pass interactive=true to keep a live PTY session for remote_write_stdin. `output` never comes back blank: a command that printed nothing yields '<aimux>command output is empty</aimux>', and a wait that expired before the command finished reports it: '<aimux>command timeout after N seconds</aimux>' when nothing had arrived yet, or '<aimux>get some output, but command timeout after N seconds</aimux>' appended to the partial output.",
@@ -1181,6 +1182,316 @@ _TOOL_FUNCS = {
     "remote_ping": _remote_ping,
 }
 
+TOOLSETS = ("classic", "classic-and-gui")
+
+
+# ---------------------------------------------------------------------------
+# remote_gui_* — computer-use tools backed by the reverse client's GUI helper
+# ---------------------------------------------------------------------------
+
+_GUI_COMMON = (
+    " The remote must be connected with `aimux reverse connect --enable-gui` "
+    "from a logged-in desktop session (not over SSH). "
+    "Refs look like `win:look_1:@e2`; a ref from a recent look can be re-resolved "
+    "even after the window moves (refound, not stale). Menus and many popups are "
+    "SEPARATE roots: after opening one, list windows again and look at the new root "
+    "instead of re-reading the original window."
+)
+
+
+def _gui_call(remote: str, cmd: str, args: dict, *, timeout: float | None = None) -> dict:
+    budget = timeout if timeout is not None else _GUI_TIMEOUTS.get(cmd, 45.0)
+    # Broker-side timeout must exceed the helper budget: the broker would
+    # otherwise give up while the helper is still legitimately working.
+    return _client().gui_request(remote=remote, cmd=cmd, args=args, timeout=budget + 15.0)
+
+
+def _gui_diagnostics(remote: str, profile: str, args: dict) -> dict:
+    return _gui_call(remote, "diagnostics", {})
+
+
+def _gui_list_windows(remote: str, profile: str, args: dict) -> dict:
+    call_args: dict = {}
+    if args.get("pid") is not None:
+        call_args["pid"] = int(args["pid"])
+    res = _gui_call(remote, "listRoots", call_args)
+    roots = res.get("roots") if isinstance(res.get("roots"), list) else []
+    limit = 100
+    summary = []
+    for w in roots[:limit]:
+        summary.append(
+            {
+                "pid": w.get("pid"),
+                "title": w.get("title"),
+                "kind": w.get("kind"),
+                "processName": w.get("processName"),
+                "rootRef": w.get("rootRef"),
+                "windowId": w.get("windowId"),
+                "isFocused": w.get("isFocused"),
+                "isMain": w.get("isMain"),
+                "isMinimized": w.get("isMinimized"),
+            }
+        )
+    return {"count": len(roots), "roots": summary, "truncated": len(roots) > limit}
+
+
+def _gui_look(remote: str, profile: str, args: dict) -> dict:
+    root_ref = args.get("root_ref") or args.get("rootRef")
+    if not isinstance(root_ref, str) or not root_ref:
+        raise ValueError("root_ref is required (get one from remote_gui_list_windows)")
+    call_args: dict = {
+        "rootRef": root_ref,
+        "includeImage": bool(args.get("include_image", True)),
+        "maxDimension": int(args.get("max_dimension", 1024) or 1024),
+    }
+    res = _gui_call(remote, "look", call_args)
+    image_url = ""
+    image = res.get("image") if isinstance(res.get("image"), dict) else None
+    if image and image.get("jpegBase64"):
+        # Field is historical: the payload is PNG despite the name.
+        mime = str(image.get("mimeType") or "image/png")
+        image_url = f"data:{mime};base64,{image['jpegBase64']}"
+    out = {
+        "lookId": res.get("lookId"),
+        "window": res.get("window"),
+        "outline": res.get("outline"),
+        "timings": res.get("timings"),
+    }
+    if image_url:
+        out["image_url"] = image_url
+    text, est = _truncate_output(json.dumps(out, ensure_ascii=False), int(args.get("max_output_tokens", 20000)))
+    if est >= int(args.get("max_output_tokens", 20000)):
+        return {"lookId": res.get("lookId"), "window": res.get("window"), "timings": res.get("timings"),
+                "error": "look result exceeded max_output_tokens; re-run with a higher budget or without the image"}
+    out["estimated_tokens"] = est
+    return out
+
+
+def _gui_act(remote: str, profile: str, args: dict) -> dict:
+    look_id = args.get("look_id")
+    if not isinstance(look_id, str) or not look_id:
+        raise ValueError("look_id is required (from a previous remote_gui_look)")
+    action = args.get("action")
+    if not isinstance(action, str) or not action:
+        raise ValueError("action is required (press, click, setText, scroll, ...)")
+    policy = args.get("policy") or "ax_only"
+    if policy not in ("ax_only", "default", "foreground"):
+        raise ValueError("policy must be ax_only, default, or foreground")
+    ref = args.get("ref")
+    x = args.get("x")
+    y = args.get("y")
+    if isinstance(ref, str) and ref:
+        target: dict = {"ref": ref}
+    elif x is not None and y is not None:
+        target = {"x": float(x), "y": float(y)}
+    else:
+        raise ValueError("target needs ref (preferred, from the look outline) or x/y image coordinates")
+    params: dict = {}
+    for src_key, dst_key in (
+        ("text", "text"),
+        ("scroll_x", "scrollX"),
+        ("scroll_y", "scrollY"),
+        ("keys", "keys"),
+        ("path", "path"),
+    ):
+        if args.get(src_key) is not None:
+            params[dst_key] = args[src_key]
+    if args.get("preserve_focus") is not None:
+        params["preserveFocus"] = bool(args["preserve_focus"])
+    call_args = {
+        "lookId": look_id,
+        "action": action,
+        "policy": policy,
+        "target": target,
+        "params": params,
+    }
+    if args.get("defer_root_delta") is not None:
+        call_args["deferRootDelta"] = bool(args["defer_root_delta"])
+    return _gui_call(remote, "act", call_args)
+
+
+def _gui_read_text(remote: str, profile: str, args: dict) -> dict:
+    look_id = args.get("look_id")
+    ref = args.get("ref")
+    if not isinstance(look_id, str) or not look_id:
+        raise ValueError("look_id is required")
+    if not isinstance(ref, str) or not ref:
+        raise ValueError("ref is required")
+    call_args: dict = {"lookId": look_id, "elementRef": ref}
+    if args.get("offset") is not None:
+        call_args["offset"] = int(args["offset"])
+    if args.get("limit") is not None:
+        call_args["limit"] = int(args["limit"])
+    return _gui_call(remote, "axReadText", call_args)
+
+
+def _gui_wait_for(remote: str, profile: str, args: dict) -> dict:
+    if not any(args.get(k) for k in ("text", "role", "value")):
+        raise ValueError("wait_for requires at least one of text, role, or value")
+    call_args: dict = {}
+    mapping = (
+        ("text", "text"),
+        ("role", "role"),
+        ("value", "value"),
+        ("gone", "gone"),
+        ("timeout_ms", "timeoutMs"),
+        ("scope_exact", "scopeExact"),
+        ("look_id", "lookId"),
+        ("scope_ref", "scopeRef"),
+        ("window_id", "windowId"),
+        ("root_ref", "rootRef"),
+        ("pid", "pid"),
+    )
+    for src_key, dst_key in mapping:
+        if args.get(src_key) is not None:
+            call_args[dst_key] = args[src_key]
+    timeout_ms = int(call_args.get("timeoutMs", 10000) or 10000)
+    return _gui_call(remote, "axWaitFor", call_args, timeout=timeout_ms / 1000.0 + 15.0)
+
+
+def _gui_focus_window(remote: str, profile: str, args: dict) -> dict:
+    root_ref = args.get("root_ref") or args.get("rootRef")
+    if not isinstance(root_ref, str) or not root_ref:
+        raise ValueError("root_ref is required")
+    return _gui_call(remote, "focusWindow", {"rootRef": root_ref})
+
+
+GUI_TOOLS = [
+    {
+        "name": "remote_gui_diagnostics",
+        "description": "Check the remote's GUI accessibility helper: protocol version, OS, arch, helper pid."
+        + _GUI_COMMON,
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "remote_gui_list_windows",
+        "description": "List top-level windows on the remote desktop (pid, title, kind, rootRef, focus state). "
+        "rootRef is the handle for remote_gui_look. Windows owned by elevated processes cannot be driven "
+        "unless this client itself is elevated (Windows UIPI)."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "number", "description": "Only list windows of this process id."},
+            },
+        },
+    },
+    {
+        "name": "remote_gui_look",
+        "description": "Observe one window atomically: accessibility outline tree (refs, roles, text, rects) plus a "
+        "screenshot as an image data URL. The outline's refs are what remote_gui_act targets. Element rects are in "
+        "image pixels. Menus/popups open as NEW roots — look at those, not the original window."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_ref": {"type": "string", "description": "Root handle from remote_gui_list_windows."},
+                "include_image": {"type": "boolean", "default": True, "description": "Attach a screenshot data URL."},
+                "max_dimension": {"type": "number", "default": 1024, "description": "Max screenshot dimension in px."},
+                "max_output_tokens": {"type": "number", "default": 20000, "description": "Token budget for the outline."},
+            },
+            "required": ["root_ref"],
+        },
+    },
+    {
+        "name": "remote_gui_act",
+        "description": "Act on a UI element from a previous look. Prefer ref targets: press/click drive UIA patterns "
+        "(Invoke/Toggle/SelectionItem/ExpandCollapse) and setText writes through ValuePattern — semantic delivery, "
+        "no real mouse/keyboard. Coordinates and typeText/keypress/drag are raw input and need policy=foreground. "
+        "Returns outcome (worked/didnt/unknown), performed.delivery (ax=semantic, hid=raw input), evidence, and a "
+        "rootDelta (appeared/disappeared roots — check it after menu clicks). Coordinate acts preflight occlusion "
+        "and fail with occluded_target instead of blind-clicking."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "look_id": {"type": "string", "description": "lookId of the look the ref came from."},
+                "action": {"type": "string", "description": "press, click, setText, scroll, typeText, keypress, drag, moveMouse."},
+                "ref": {"type": "string", "description": "Element ref from the look outline (preferred target)."},
+                "x": {"type": "number", "description": "Image x coordinate (only with y; raw-input path)."},
+                "y": {"type": "number", "description": "Image y coordinate (only with x; raw-input path)."},
+                "policy": {"type": "string", "enum": ["ax_only", "default", "foreground"], "default": "ax_only",
+                            "description": "ax_only (default) never injects real input; foreground allows raw input on the user's desktop."},
+                "text": {"type": "string", "description": "Text for setText/typeText."},
+                "scroll_x": {"type": "number", "description": "Horizontal scroll amount."},
+                "scroll_y": {"type": "number", "description": "Vertical scroll amount."},
+                "preserve_focus": {"type": "boolean", "description": "Raw-input acts: do not force the window to foreground first."},
+            },
+            "required": ["look_id", "action"],
+        },
+    },
+    {
+        "name": "remote_gui_read_text",
+        "description": "Read the live text of one element (TextPattern -> ValuePattern -> name), faster and cheaper "
+        "than a fresh look. Secure (password) fields are refused."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "look_id": {"type": "string"},
+                "ref": {"type": "string"},
+                "offset": {"type": "number", "default": 0},
+                "limit": {"type": "number", "default": 4096},
+            },
+            "required": ["look_id", "ref"],
+        },
+    },
+    {
+        "name": "remote_gui_wait_for",
+        "description": "Poll the remote's live accessibility tree until an element matching text/role/value appears "
+        "(or disappears with gone=true). Scoped to a window via root_ref/window_id/pid, or an exact subtree via "
+        "look_id+scope_ref."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Case-insensitive substring to match."},
+                "role": {"type": "string", "description": "Element role to match."},
+                "value": {"type": "string", "description": "Element value to match."},
+                "gone": {"type": "boolean", "default": False, "description": "Wait for the match to disappear instead."},
+                "timeout_ms": {"type": "number", "default": 10000, "description": "Poll budget, 100-60000."},
+                "root_ref": {"type": "string"},
+                "window_id": {"type": "number"},
+                "pid": {"type": "number"},
+                "look_id": {"type": "string"},
+                "scope_ref": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "remote_gui_focus_window",
+        "description": "Bring one window to the foreground."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"root_ref": {"type": "string"}},
+            "required": ["root_ref"],
+        },
+    },
+]
+
+_GUI_TOOL_FUNCS = {
+    "remote_gui_diagnostics": _gui_diagnostics,
+    "remote_gui_list_windows": _gui_list_windows,
+    "remote_gui_look": _gui_look,
+    "remote_gui_act": _gui_act,
+    "remote_gui_read_text": _gui_read_text,
+    "remote_gui_wait_for": _gui_wait_for,
+    "remote_gui_focus_window": _gui_focus_window,
+}
+
+_TOOL_FUNCS.update(_GUI_TOOL_FUNCS)
+
+TOOLS = CLASSIC_TOOLS  # default toolset; run_stdio selects the final list
+
+
+def tools_for(toolset: str) -> list[dict]:
+    if toolset == "classic":
+        return CLASSIC_TOOLS
+    if toolset == "classic-and-gui":
+        return CLASSIC_TOOLS + GUI_TOOLS
+    raise ValueError(f"unknown toolset {toolset!r}")
+
 
 # ---------------------------------------------------------------------------
 # JSON-RPC 2.0 over stdio
@@ -1202,6 +1513,9 @@ def _error(req_id, code, message):
     _send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
 
 
+_ACTIVE_TOOLSET = "classic"
+
+
 def _dispatch(remote: str, profile: str, req: dict) -> None:
     method = req.get("method")
     req_id = req.get("id")
@@ -1215,13 +1529,15 @@ def _dispatch(remote: str, profile: str, req: dict) -> None:
     if method == "notifications/initialized":
         return  # notification — no response
     if method == "tools/list":
-        _result(req_id, {"tools": TOOLS})
+        _result(req_id, {"tools": tools_for(_ACTIVE_TOOLSET)})
         return
     if method == "tools/call":
         params = req.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
         func = _TOOL_FUNCS.get(name)
+        if func is not None and name not in {t["name"] for t in tools_for(_ACTIVE_TOOLSET)}:
+            func = None
         if func is None:
             _error(req_id, -32601, f"unknown tool: {name}")
             return
@@ -1234,8 +1550,13 @@ def _dispatch(remote: str, profile: str, req: dict) -> None:
     _error(req_id, -32601, f"method not found: {method}")
 
 
-def run_stdio(*, remote: str, profile: str | None = None) -> None:
+def run_stdio(*, remote: str, profile: str | None = None, toolset: str = "classic") -> None:
     """Run the MCP stdio server bound to one bridge remote."""
+    global _ACTIVE_TOOLSET
+    if toolset not in TOOLSETS:
+        print(f"aimux-mcp: unknown toolset {toolset!r} (choose from {', '.join(TOOLSETS)})", file=sys.stderr)
+        sys.exit(2)
+    _ACTIVE_TOOLSET = toolset
     ctl = _client()
     info = ctl.get_remote(remote)
     if not info:
@@ -1245,6 +1566,17 @@ def run_stdio(*, remote: str, profile: str | None = None) -> None:
     if not prof:
         print(f"aimux-mcp: remote {remote!r} has no default_profile; pass --profile", file=sys.stderr)
         sys.exit(2)
+    if toolset == "classic-and-gui":
+        gui = info.get("gui") if isinstance(info.get("gui"), dict) else None
+        if not gui or not gui.get("available"):
+            reason = str((gui or {}).get("error") or "the remote did not report GUI capability")
+            print(
+                f"aimux-mcp: remote {remote!r} has GUI disabled: {reason}\n"
+                f"           (start the client with `aimux reverse connect --enable-gui` on a "
+                "logged-in desktop session, or serve with --toolset classic)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     global _reap_client, _remote_platform
     _reap_client = ctl

@@ -802,3 +802,32 @@ def test_exec_dead_after_partial_output_says_so(monkeypatch):
 
     assert r["output"] == "partial line 1\npartial line 2\n<aimux>get some output, but session ended (shell exited)</aimux>"
     assert r["exit_code"] == -1 and r["note"] == "session ended (shell exited)"
+
+
+def test_toolsets_select_tools():
+    from aimux import mcp_server
+
+    classic = mcp_server.tools_for("classic")
+    combined = mcp_server.tools_for("classic-and-gui")
+    assert [t["name"] for t in classic] == [t["name"] for t in mcp_server.CLASSIC_TOOLS]
+    gui_names = [t["name"] for t in mcp_server.GUI_TOOLS]
+    assert all(name.startswith("remote_gui_") for name in gui_names)
+    assert [t["name"] for t in combined] == [t["name"] for t in classic] + gui_names
+    with pytest.raises(ValueError):
+        mcp_server.tools_for("gui")
+
+
+def test_dispatch_hides_gui_tools_under_classic_toolset(monkeypatch):
+    from aimux import mcp_server
+
+    results: list[dict] = []
+    monkeypatch.setattr(mcp_server, "_send", lambda obj: results.append(obj))
+    monkeypatch.setattr(mcp_server, "_ACTIVE_TOOLSET", "classic")
+
+    mcp_server._dispatch("box", "cmd", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    listed = [t["name"] for t in results[-1]["result"]["tools"]]
+    assert "remote_gui_look" not in listed and "remote_exec_command" in listed
+
+    mcp_server._dispatch("box", "cmd", {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                        "params": {"name": "remote_gui_diagnostics", "arguments": {}}})
+    assert "unknown tool" in str(results[-1].get("error", {}))

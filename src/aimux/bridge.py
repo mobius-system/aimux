@@ -369,6 +369,16 @@ class BridgeControlClient:
             timeout=timeout,
         )
 
+    def gui_request(self, *, remote: str, cmd: str, args: dict[str, Any], timeout: float = 45.0) -> dict[str, Any]:
+        """Forward one computer-use helper command to a reverse client."""
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/gui/{_quote(remote)}",
+            self.runtime.token,
+            {"cmd": cmd, "args": args, "timeout": timeout},
+            timeout=timeout + 10.0,
+        )
+
     def file_stat(self, *, remote: str, path: str, timeout: float = 60.0) -> dict[str, Any]:
         return _request_json(
             "POST",

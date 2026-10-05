@@ -113,3 +113,21 @@ aimux local-http-port-reroute --local-port=9000 --remote-client-id=a-box \
 ```bash
 aimux kill "local-8824/testsession"
 ```
+
+## Computer use (Windows x64)
+
+If the remote was connected with `aimux reverse connect --enable-gui`, you can
+serve GUI accessibility tools alongside the classic ones:
+
+```bash
+aimux mcp serve --remote <device> --toolset classic-and-gui
+```
+
+Flow: `remote_gui_list_windows` -> `remote_gui_look` (outline + screenshot +
+refs) -> `remote_gui_act` on a ref (`policy=ax_only` by default: semantic UIA
+delivery, no real input) -> `remote_gui_read_text` / `remote_gui_wait_for` to
+verify. Menus and popups appear as NEW roots — list windows again after
+clicking one instead of re-reading the original window. Elevated (admin)
+windows cannot be driven unless the client itself is elevated.
+
+Check capability with `aimux remote ls` (GUI column) or `remote_gui_diagnostics`.

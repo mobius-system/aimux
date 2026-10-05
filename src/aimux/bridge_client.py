@@ -32,6 +32,7 @@ from loguru import logger
 from . import __version__
 from . import port_tunnel
 from .bridge import BridgeError, validate_identifier, version_mismatch_message
+from . import gui_helper
 from .transfer import (
     DEFAULT_BRIDGE_MAX_ARCHIVE_SIZE,
     apply_sync_archive_b64,
@@ -92,6 +93,9 @@ def _bridge_command_summary(message_type: str, payload: dict[str, Any]) -> dict[
         return {"session": payload.get("session")}
     if message_type == "session.list":
         return {}
+    if message_type == "gui.request":
+        args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+        return {"cmd": payload.get("cmd"), "args": sorted(args)}
     if message_type == "file.write":
         content_b64 = str(payload.get("content_b64") or "")
         return {
@@ -125,7 +129,11 @@ def _bridge_command_summary(message_type: str, payload: dict[str, Any]) -> dict[
 
 
 def _is_logged_bridge_command(message_type: str) -> bool:
-    return message_type.startswith("file.") or message_type.startswith("session.")
+    return (
+        message_type.startswith("file.")
+        or message_type.startswith("session.")
+        or message_type.startswith("gui.")
+    )
 
 
 @dataclass
@@ -788,6 +796,7 @@ class ReverseClientRuntime:
         silent_shell: bool = False,
         silent_shell_v2: bool = False,
         allow_http_ports: tuple[int, ...] = (),
+        enable_gui: bool = False,
     ):
         self.identifier = identifier
         self.client_id = str(uuid.uuid4())
@@ -797,6 +806,57 @@ class ReverseClientRuntime:
         # Local ports other clients may reach. Empty means this client cannot
         # be connected to at all — the safe default.
         self.allow_http_ports = frozenset(allow_http_ports)
+        # GUI accessibility helper. --enable-gui is opt-in; a failed helper
+        # (unsupported platform, CDN unreachable, probe timeout) must never
+        # take the reverse connection down, so start() never raises.
+        self.gui_helper: gui_helper.GuiHelper | None = None
+        self.gui_status: dict[str, Any] = {"available": False, "error": "gui not requested"}
+        if enable_gui:
+            self.gui_helper, self.gui_status = gui_helper.start()
+            if self.gui_helper is None:
+                logger.warning(
+                    "bridge client {} --enable-gui requested but unavailable: {}",
+                    identifier,
+                    self.gui_status.get("error"),
+                )
+            else:
+                logger.info(
+                    "bridge client {} gui helper ready ({})",
+                    identifier,
+                    self.gui_status,
+                )
+
+    def shutdown(self) -> None:
+        helper, self.gui_helper = self.gui_helper, None
+        if helper is not None:
+            helper.stop()
+
+    def _gui_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        helper = self.gui_helper
+        if helper is None:
+            reason = str(self.gui_status.get("error") or "gui helper is not running")
+            raise BridgeError(
+                f"GUI tools unavailable on this remote: {reason}. "
+                "Start the client with `aimux reverse connect --enable-gui` on a logged-in desktop session.",
+                kind="gui_unavailable",
+            )
+        cmd = str(payload.get("cmd") or "")
+        args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+        if not cmd:
+            raise BridgeError("gui.request requires cmd", kind="bad_request")
+        try:
+            response = helper.request(cmd, args)
+        except gui_helper.GuiHelperError as exc:
+            self.gui_status = {"available": False, "error": str(exc)}
+            raise BridgeError(f"GUI helper error: {exc}", kind="gui_error") from exc
+        if response.get("ok") is not True:
+            error = response.get("error") if isinstance(response.get("error"), dict) else {}
+            raise BridgeError(
+                str(error.get("message") or "GUI helper command failed"),
+                kind=str(error.get("code") or "gui_error"),
+            )
+        result = response.get("result")
+        return result if isinstance(result, dict) else {"result": result}
 
     def http_port_allowed(self, port: int) -> bool:
         return port in self.allow_http_ports
@@ -811,6 +871,7 @@ class ReverseClientRuntime:
             "version": __version__,
             "client_id": self.client_id,
             "allow_http_ports": sorted(self.allow_http_ports),
+            "gui": self.gui_status,
         }
 
     def handle(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -842,6 +903,8 @@ class ReverseClientRuntime:
             return self._file_archive(payload)
         if message_type == "file.apply_archive":
             return self._file_apply_archive(payload)
+        if message_type == "gui.request":
+            return self._gui_request(payload)
         raise BridgeError(f"unsupported bridge message type {message_type!r}")
 
     def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1899,6 +1962,7 @@ def connect(
     watchdog_path: str | os.PathLike[str] | None = None,
     watchdog_timeout: float = WATCHDOG_TIMEOUT,
     runtime_path: str | os.PathLike[str] | None = None,
+    enable_gui: bool = False,
 ) -> None:
     validate_identifier(identifier)
     runtime = ReverseClientRuntime(
@@ -1907,6 +1971,7 @@ def connect(
         silent_shell=silent_shell,
         silent_shell_v2=silent_shell_v2,
         allow_http_ports=allow_http_ports,
+        enable_gui=enable_gui,
     )
     base = url.rstrip("/")
     payload = runtime.registration_payload(replace=replace)
@@ -1988,86 +2053,89 @@ def connect(
     watchdog_thread = threading.Thread(target=watchdog_loop, name="aimux-watchdog", daemon=True)
     watchdog_thread.start()
 
-    intervals = reconnect_intervals if reconnect_intervals is not None else RECONNECT_INTERVALS
-    attempt = 0
-    while True:
-        if watchdog_stop.is_set():
-            return
-        disconnect_error: Exception | None
-        try:
-            register_response = _register_with_retry(
-                base,
-                token,
-                payload,
-                identifier=identifier,
-                reconnect=reconnect,
-                retry_intervals=register_retry_intervals,
-                sleep=sleep,
-            )
-            if not logged_registration:
-                logger.info("aimux bridge client version {}", __version__)
-                server_version = (
-                    str(register_response.get("server_version") or "")
-                    if isinstance(register_response, dict)
-                    else ""
+    try:
+        intervals = reconnect_intervals if reconnect_intervals is not None else RECONNECT_INTERVALS
+        attempt = 0
+        while True:
+            if watchdog_stop.is_set():
+                return
+            disconnect_error: Exception | None
+            try:
+                register_response = _register_with_retry(
+                    base,
+                    token,
+                    payload,
+                    identifier=identifier,
+                    reconnect=reconnect,
+                    retry_intervals=register_retry_intervals,
+                    sleep=sleep,
                 )
-                client_mismatch = version_mismatch_message(__version__, server_version)
-                if client_mismatch:
-                    logger.warning("bridge client {} — {}", identifier, client_mismatch)
-                logger.info(
-                    "connected bridge remote {!r}; profiles={}; default={}; allow_http_ports={}",
-                    identifier,
-                    ",".join(runtime.adapters),
-                    runtime.default_profile,
-                    sorted(runtime.allow_http_ports) or "none",
-                )
-                logged_registration = True
-            else:
-                logger.info("bridge remote {!r} re-registered before reconnecting event stream", identifier)
-            with _open_events(base, token, identifier) as response:
-                try:
-                    runtime_update(realtime_healthy_display=True, last_healthy_heartbeat=int(time.time() * 1000), need_external_restart=False)
-                    _serve_event_stream(
-                        response,
-                        runtime=runtime,
-                        base=base,
-                        token=token,
-                        stop_event=watchdog_stop,
-                        poll_interval=stream_poll_interval,
-                        heartbeat_interval=heartbeat_interval,
+                if not logged_registration:
+                    logger.info("aimux bridge client version {}", __version__)
+                    server_version = (
+                        str(register_response.get("server_version") or "")
+                        if isinstance(register_response, dict)
+                        else ""
                     )
-                finally:
-                    # Shut the socket down before the context manager closes it:
-                    # closing a buffered response takes the same lock the reader
-                    # holds while blocked in recv, so a quiet stream would stall
-                    # the shutdown until the next frame — up to a full heartbeat.
-                    _unblock_response(response)
-            disconnect_error = OSError("bridge server closed the event stream")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            disconnect_error = e
-            runtime_update(realtime_healthy_display=False)
+                    client_mismatch = version_mismatch_message(__version__, server_version)
+                    if client_mismatch:
+                        logger.warning("bridge client {} — {}", identifier, client_mismatch)
+                    logger.info(
+                        "connected bridge remote {!r}; profiles={}; default={}; allow_http_ports={}",
+                        identifier,
+                        ",".join(runtime.adapters),
+                        runtime.default_profile,
+                        sorted(runtime.allow_http_ports) or "none",
+                    )
+                    logged_registration = True
+                else:
+                    logger.info("bridge remote {!r} re-registered before reconnecting event stream", identifier)
+                with _open_events(base, token, identifier) as response:
+                    try:
+                        runtime_update(realtime_healthy_display=True, last_healthy_heartbeat=int(time.time() * 1000), need_external_restart=False)
+                        _serve_event_stream(
+                            response,
+                            runtime=runtime,
+                            base=base,
+                            token=token,
+                            stop_event=watchdog_stop,
+                            poll_interval=stream_poll_interval,
+                            heartbeat_interval=heartbeat_interval,
+                        )
+                    finally:
+                        # Shut the socket down before the context manager closes it:
+                        # closing a buffered response takes the same lock the reader
+                        # holds while blocked in recv, so a quiet stream would stall
+                        # the shutdown until the next frame — up to a full heartbeat.
+                        _unblock_response(response)
+                disconnect_error = OSError("bridge server closed the event stream")
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                disconnect_error = e
+                runtime_update(realtime_healthy_display=False)
 
-        if not reconnect:
-            raise BridgeError(
-                f"bridge connection lost: {disconnect_error}",
-                kind="remote_disconnected",
-                exit_code=2,
+            if not reconnect:
+                raise BridgeError(
+                    f"bridge connection lost: {disconnect_error}",
+                    kind="remote_disconnected",
+                    exit_code=2,
+                )
+            if watchdog_stop.is_set():
+                return
+            if attempt >= len(intervals):
+                raise BridgeError(
+                    f"bridge connection lost after {len(intervals)} retries: {disconnect_error}",
+                    kind="remote_disconnected",
+                    exit_code=2,
+                )
+            delay = intervals[attempt]
+            logger.warning(
+                "bridge connection lost ({}); retry {}/{} in {:g}s",
+                disconnect_error,
+                attempt + 1,
+                len(intervals),
+                delay,
             )
-        if watchdog_stop.is_set():
-            return
-        if attempt >= len(intervals):
-            raise BridgeError(
-                f"bridge connection lost after {len(intervals)} retries: {disconnect_error}",
-                kind="remote_disconnected",
-                exit_code=2,
-            )
-        delay = intervals[attempt]
-        logger.warning(
-            "bridge connection lost ({}); retry {}/{} in {:g}s",
-            disconnect_error,
-            attempt + 1,
-            len(intervals),
-            delay,
-        )
-        sleep(delay)
-        attempt += 1
+            sleep(delay)
+            attempt += 1
+    finally:
+        runtime.shutdown()
