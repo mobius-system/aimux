@@ -1259,10 +1259,16 @@ def _gui_look(remote: str, profile: str, args: dict) -> dict:
     }
     if image_url:
         out["image_url"] = image_url
-    text, est = _truncate_output(json.dumps(out, ensure_ascii=False), int(args.get("max_output_tokens", 20000)))
-    if est >= int(args.get("max_output_tokens", 20000)):
+    # The token budget guards the OUTLINE only: a base64 screenshot easily
+    # exceeds any text budget, and an earlier version silently dropped the
+    # whole payload (image included) whenever the PNG pushed it over.
+    budget = int(args.get("max_output_tokens", 20000))
+    outline_text, est = _truncate_output(json.dumps(res.get("outline"), ensure_ascii=False), budget)
+    if est >= budget:
         return {"lookId": res.get("lookId"), "window": res.get("window"), "timings": res.get("timings"),
-                "error": "look result exceeded max_output_tokens; re-run with a higher budget or without the image"}
+                "image_url": image_url,
+                "outline_truncated": True,
+                "error": "outline exceeded max_output_tokens; re-run with a higher budget"}
     out["estimated_tokens"] = est
     return out
 
