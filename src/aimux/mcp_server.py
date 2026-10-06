@@ -22,6 +22,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -1235,6 +1236,60 @@ def _gui_list_windows(remote: str, profile: str, args: dict) -> dict:
     return {"count": len(roots), "roots": summary, "truncated": len(roots) > limit}
 
 
+# Screenshots arrive base64-encoded inside the look payload. Inlining them as a
+# data URL puts ~90 KB of text into a single tool result, which overruns host
+# token limits and buries the outline behind it. Spool to a temp file instead
+# and hand back the path: the caller reads the image only when it wants to.
+_GUI_SHOT_TTL_SECONDS = 6 * 60 * 60
+_GUI_SHOT_MAX_FILES = 400
+
+
+def _gui_shot_dir() -> Path:
+    """Per-user spool directory. gettempdir() honours TMPDIR/TEMP/TMP."""
+    directory = Path(tempfile.gettempdir()) / "aimux-gui-shots"
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    return directory
+
+
+def _prune_gui_shots(directory: Path) -> None:
+    """Drop expired shots, then the oldest ones past the count cap."""
+    now = time.time()
+    fresh: list[tuple[float, Path]] = []
+    for path in directory.glob("*.png"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime > _GUI_SHOT_TTL_SECONDS:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+        fresh.append((mtime, path))
+    for _, path in sorted(fresh)[: max(0, len(fresh) - _GUI_SHOT_MAX_FILES)]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _spool_gui_shot(remote: str, look_id: str, b64: str) -> str:
+    """Write one screenshot to a temp PNG and return its absolute path."""
+    directory = _gui_shot_dir()
+    _prune_gui_shots(directory)
+    # Two agents bound to the same remote both issue look_1..., so disambiguate
+    # with the pid of this MCP server process.
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{remote}-{look_id}")[:120] or "shot"
+    path = directory / f"{stem}-{os.getpid()}.png"
+    path.write_bytes(base64.b64decode(b64))
+    return str(path)
+
+
 def _gui_look(remote: str, profile: str, args: dict) -> dict:
     root_ref = args.get("root_ref") or args.get("rootRef")
     if not isinstance(root_ref, str) or not root_ref:
@@ -1245,28 +1300,26 @@ def _gui_look(remote: str, profile: str, args: dict) -> dict:
         "maxDimension": int(args.get("max_dimension", 1024) or 1024),
     }
     res = _gui_call(remote, "look", call_args)
-    image_url = ""
+    image_path = ""
     image = res.get("image") if isinstance(res.get("image"), dict) else None
     if image and image.get("jpegBase64"):
         # Field is historical: the payload is PNG despite the name.
-        mime = str(image.get("mimeType") or "image/png")
-        image_url = f"data:{mime};base64,{image['jpegBase64']}"
+        image_path = _spool_gui_shot(remote, str(res.get("lookId") or "look"), image["jpegBase64"])
     out = {
         "lookId": res.get("lookId"),
         "window": res.get("window"),
         "outline": res.get("outline"),
         "timings": res.get("timings"),
     }
-    if image_url:
-        out["image_url"] = image_url
-    # The token budget guards the OUTLINE only: a base64 screenshot easily
-    # exceeds any text budget, and an earlier version silently dropped the
-    # whole payload (image included) whenever the PNG pushed it over.
+    if image_path:
+        out["image_path"] = image_path
+    # The token budget guards the OUTLINE. The screenshot no longer competes
+    # with it: it is spooled to a file, so the outline is the only text here.
     budget = int(args.get("max_output_tokens", 20000))
     outline_text, est = _truncate_output(json.dumps(res.get("outline"), ensure_ascii=False), budget)
     if est >= budget:
         return {"lookId": res.get("lookId"), "window": res.get("window"), "timings": res.get("timings"),
-                "image_url": image_url,
+                "image_path": image_path,
                 "outline_truncated": True,
                 "error": "outline exceeded max_output_tokens; re-run with a higher budget"}
     out["estimated_tokens"] = est
@@ -1385,8 +1438,9 @@ GUI_TOOLS = [
     {
         "name": "remote_gui_look",
         "description": "Observe one window atomically: accessibility outline tree (refs, roles, text, rects) plus a "
-        "screenshot as an image data URL. The outline's refs are what remote_gui_act targets. Element rects are in "
-        "image pixels. Menus/popups open as NEW roots — look at those, not the original window."
+        "screenshot spooled to a local temp file whose path is returned as image_path (open it with your image "
+        "reader; it is not inlined, so the tree stays readable). The outline's refs are what remote_gui_act targets. "
+        "Element rects are in image pixels. Menus/popups open as NEW roots — look at those, not the original window."
         + _GUI_COMMON,
         "inputSchema": {
             "type": "object",

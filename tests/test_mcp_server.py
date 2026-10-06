@@ -1,6 +1,8 @@
 """Unit tests for aimux.mcp_server (stdio MCP server, codex-facing tools)."""
 import base64
+import os
 import re
+import time
 
 import pytest
 
@@ -831,3 +833,74 @@ def test_dispatch_hides_gui_tools_under_classic_toolset(monkeypatch):
     mcp_server._dispatch("box", "cmd", {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                                         "params": {"name": "remote_gui_diagnostics", "arguments": {}}})
     assert "unknown tool" in str(results[-1].get("error", {}))
+
+
+def _look_result(**overrides):
+    payload = {
+        "lookId": "look_7",
+        "window": {"rootRef": "@w1"},
+        "outline": {"ref": "@e1"},
+        "timings": {"totalMs": 12},
+        "image": {"jpegBase64": base64.b64encode(b"\x89PNG\r\n\x1a\nbytes").decode("ascii"),
+                  "mimeType": "image/png"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_gui_look_spools_screenshot_and_returns_a_path(monkeypatch, tmp_path):
+    from aimux import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_gui_shot_dir", lambda: tmp_path)
+    monkeypatch.setattr(mcp_server, "_gui_call", lambda remote, cmd, args, **kw: _look_result())
+
+    out = mcp_server._gui_look("box", "cmd", {"root_ref": "@w1"})
+
+    # A base64 payload in the result is what overran the host token limit.
+    assert "image_url" not in out
+    assert out["image_path"].startswith(str(tmp_path))
+    with open(out["image_path"], "rb") as fh:
+        assert fh.read() == b"\x89PNG\r\n\x1a\nbytes"
+    assert out["lookId"] == "look_7" and out["outline"] == {"ref": "@e1"}
+
+
+def test_gui_look_spools_screenshot_even_when_the_outline_is_truncated(monkeypatch, tmp_path):
+    from aimux import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_gui_shot_dir", lambda: tmp_path)
+    monkeypatch.setattr(mcp_server, "_gui_call",
+                        lambda remote, cmd, args, **kw: _look_result(outline={"x": "y" * 5000}))
+
+    out = mcp_server._gui_look("box", "cmd", {"root_ref": "@w1", "max_output_tokens": 10})
+
+    assert out["outline_truncated"] is True and "outline" not in out
+    assert out["image_path"].endswith(".png") and "image_url" not in out
+
+
+def test_gui_look_omits_image_path_when_the_helper_sends_no_image(monkeypatch, tmp_path):
+    from aimux import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_gui_shot_dir", lambda: tmp_path)
+    monkeypatch.setattr(mcp_server, "_gui_call",
+                        lambda remote, cmd, args, **kw: _look_result(image=None))
+
+    out = mcp_server._gui_look("box", "cmd", {"root_ref": "@w1"})
+
+    assert "image_path" not in out and "image_url" not in out
+    assert list(tmp_path.glob("*.png")) == []
+
+
+def test_prune_gui_shots_keeps_the_newest_and_drops_expired(monkeypatch, tmp_path):
+    from aimux import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_GUI_SHOT_MAX_FILES", 2)
+    now = time.time()
+    # Recent enough to survive the TTL, ordered newest-last.
+    for name, age in (("a.png", 30), ("b.png", 20), ("c.png", 10), ("stale.png", 10 * 60 * 60)):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        os.utime(path, (now - age, now - age))
+
+    mcp_server._prune_gui_shots(tmp_path)
+
+    assert sorted(p.name for p in tmp_path.glob("*.png")) == ["b.png", "c.png"]
