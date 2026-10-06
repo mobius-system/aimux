@@ -60,6 +60,23 @@ class GuiHelperError(RuntimeError):
     """Raised for helper-side failures that map onto a bridge error."""
 
 
+def is_elevated() -> bool:
+    """True when this process runs with an elevated (administrator) token.
+
+    Windows only concept; elsewhere the question is meaningless and we report
+    False. GUI input into elevated windows (games with kernel anti-cheat,
+    admin apps) is blocked by UIPI unless the helper itself is elevated.
+    """
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def _platform_key() -> str | None:
     machine = (platform.machine() or "").lower()
     if platform.system() == "Windows":
@@ -282,13 +299,18 @@ def probe_status(helper: GuiHelper) -> dict[str, Any]:
         error = response.get("error") if isinstance(response.get("error"), dict) else {}
         raise GuiHelperError(str(error.get("message") or "helper diagnostics failed"))
     result = response.get("result") or {}
-    return {
+    status = {
         "available": True,
         "protocolVersion": result.get("protocolVersion"),
         "os": result.get("os"),
         "arch": result.get("arch"),
         "pid": result.get("pid"),
     }
+    if platform.system() == "Windows":
+        # Surface the elevation state so remote ls / the web device picker can
+        # tell "GUI works" from "GUI works and can drive elevated windows".
+        status["elevated"] = is_elevated()
+    return status
 
 
 def start() -> tuple[GuiHelper | None, dict[str, Any]]:

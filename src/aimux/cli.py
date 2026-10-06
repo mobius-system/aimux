@@ -1283,6 +1283,69 @@ def cmd_bridge_restart(
 
 # ---------- reverse connect ----------
 
+def _windows_is_admin() -> bool:
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _print_elevation_notice(declined: bool = False) -> None:
+    """A loud, boxed notice before the UAC prompt fires (and after a decline).
+
+    Mirrors the TUI's highlighted confirm screen: the OS prompt must never
+    ambush the user. Goes to stderr; rich is a direct dependency.
+    """
+    try:
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+
+        nl = chr(10)
+        if declined:
+            body = Text()
+            body.append("Elevation declined - continuing WITHOUT administrator rights." + nl + nl, style="bold")
+            body.append("Normal windows remain operable; elevated windows (admin apps," + nl)
+            body.append("games with kernel anti-cheat) will refuse GUI input.")
+            Console(stderr=True).print(Panel(body, border_style="red", title="GUI authorization declined"))
+            return
+        body = Text()
+        body.append("aimux --enable-gui is requesting administrator rights." + nl + nl, style="bold")
+        body.append("A UAC prompt will appear on your screen - please confirm it to" + nl)
+        body.append("enable full GUI control (including elevated windows).")
+        Console(stderr=True).print(Panel(body, border_style="yellow", title="GUI authorization"))
+    except Exception:
+        if declined:
+            print("aimux: warning: elevation declined/failed; continuing unelevated (administrator windows will not be operable)")
+        else:
+            print("aimux: requesting administrator rights - please confirm the UAC prompt...")
+
+
+def _relaunch_elevated() -> bool:
+    """Re-run the current command under an administrator token (Windows).
+
+    Spawns the same interpreter + argv via ShellExecuteW with the "runas"
+    verb — the OS puts a UAC consent prompt on the secure desktop, which only
+    a human can approve. Returns True when the elevated process launched (the
+    caller should exit), False when the user declined or the launch failed.
+    """
+    import ctypes
+    import subprocess as _sp
+
+    params = _sp.list2cmdline(["-m", "aimux", *sys.argv[1:]])
+    # SW_SHOWNORMAL on purpose: an elevated, remotely-drivable process must
+    # stay visible on the user's desktop, never hidden.
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    except Exception:
+        return False
+    return int(rc) > 32
+
+
 @reverse_app.command("connect", help="Reverse-connect this machine to an aimux bridge broker.")
 def cmd_reverse_connect(
     url: Annotated[str, typer.Argument(help="Bridge broker URL, e.g. http://server:8765.")],
@@ -1316,7 +1379,14 @@ def cmd_reverse_connect(
         bool,
         typer.Option(
             "--enable-gui",
-            help="Start the GUI accessibility helper (computer use). Windows x64 only in this release; run from a logged-in desktop session. Failure does not block the connection.",
+            help="Start the GUI accessibility helper (computer use). Windows x64 only in this release; run from a logged-in desktop session. Failure does not block the connection. On Windows this asks for elevation (UAC) once so elevated windows can be driven too.",
+        ),
+    ] = False,
+    gui_no_elevate: Annotated[
+        bool,
+        typer.Option(
+            "--gui-no-elevate",
+            help="Skip the automatic UAC elevation request that --enable-gui normally triggers; stay unelevated (administrator windows will not be operable).",
         ),
     ] = False,
 ):
@@ -1324,6 +1394,16 @@ def cmd_reverse_connect(
         allowed_ports = port_tunnel.parse_port_list(allow_http_ports)
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
+    # --enable-gui is the one GUI consent moment, so elevation is requested
+    # right here: GUI input into elevated windows (admin apps, games with
+    # kernel anti-cheat) is UIPI-blocked unless the client itself is elevated.
+    # Declining the UAC prompt degrades gracefully: the connection continues
+    # unelevated and drives every normal window, just not elevated ones.
+    if enable_gui and not gui_no_elevate and platform.system() == "Windows" and not _windows_is_admin():
+        _print_elevation_notice()
+        if _relaunch_elevated():
+            raise typer.Exit(0)
+        _print_elevation_notice(declined=True)
     try:
         bridge_client.connect(
             url,
