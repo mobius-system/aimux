@@ -1111,7 +1111,7 @@ CLASSIC_TOOLS = [
                 "login": {"type": "boolean", "default": True, "description": "True runs the shell with -l/-i semantics; false disables them (uses --norc --noprofile). Defaults to true."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
                 "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
-                "workdir": {"type": "string", "description": "Working directory for the command. Defaults to the turn cwd."},
+                "workdir": {"type": "string", "description": "Working directory for the command, as an absolute path on the remote. A path that does not exist fails the call instead of falling back. When omitted, the command runs wherever the remote's reverse-connect client process happens to be started, which is not knowable in advance -- pass workdir explicitly to be sure."},
                 "yield_time_ms": {"type": "number", "default": 10000, "description": "Wait before yielding output. Defaults to 10000 ms; effective range 250-300000 ms."},
             },
             "required": ["cmd"],
