@@ -378,7 +378,7 @@ def test_exec_temp_base_naming():
 
 def test_exec_temp_paths_same_base():
     s, o, c = mcp_server._exec_temp_paths()
-    assert s.startswith("/tmp/incoming_command_") and s.endswith(".sh")
+    assert s.startswith("/tmp/aimux_tmp/incoming_command_") and s.endswith(".sh")
     base = s[:-3]  # strip the .sh extension
     assert o == base + ".out"
     assert c == base + ".code"
@@ -399,7 +399,7 @@ def test_exec_tempfile_writes_script_runs_and_cleans_up(monkeypatch):
     assert any(path.endswith(".sh") and data == b"echo hello\npwd" for path, data in c.writes)
     # launch line ran the script and redirected output + exit code
     assert len(c.sent) == 1
-    assert c.sent[0][0].startswith("bash /tmp/incoming_command_")
+    assert c.sent[0][0].startswith("bash /tmp/aimux_tmp/incoming_command_")
     # finished -> session killed + all three temp files cleaned up
     assert c.killed
     assert c.files == {}
@@ -456,7 +456,7 @@ def test_exec_interactive_true_uses_pty_path(monkeypatch):
     assert c.sent
     keys = c.sent[0]["keys"]
     assert "echo __AIMUX_EXIT_" in keys[0]  # marker path, not a temp-file launch
-    assert not keys[0].startswith("bash /tmp/incoming_command_")
+    assert not keys[0].startswith("bash /tmp/aimux_tmp/incoming_command_")
 
 
 def test_apply_hunks_whitespace_mismatch_reports_specific_error():
@@ -517,14 +517,14 @@ class WindowsExecClient(ExecTempClient):
 
 def test_exec_plan_posix_unchanged():
     plan = mcp_server._exec_plan(cmd="echo hi", profile="posix-pty", shell_bin=None, windows=False)
-    assert plan.script.startswith("/tmp/incoming_command_") and plan.script.endswith(".sh")
+    assert plan.script.startswith("/tmp/aimux_tmp/incoming_command_") and plan.script.endswith(".sh")
     assert plan.body == "echo hi"
     assert plan.launch == f"bash {plan.script} > {plan.out} 2>&1; echo $? > {plan.code}"
 
 
 def test_exec_plan_windows_cmd_writes_exit_code_inside_the_batch_file():
     plan = mcp_server._exec_plan(cmd="whoami", profile="cmd", shell_bin=None, windows=True)
-    assert plan.script.startswith("~/AppData/Local/Temp/") and plan.script.endswith(".cmd")
+    assert plan.script.startswith("~/AppData/Local/Temp/aimux_tmp/") and plan.script.endswith(".cmd")
     assert plan.body.startswith("@echo off\r\nwhoami\r\n")
     assert f'echo %errorlevel% > "{mcp_server._win_path(plan.code)}"' in plan.body
     assert plan.launch == f'"{mcp_server._win_path(plan.script)}" > "{mcp_server._win_path(plan.out)}" 2>&1'
@@ -541,10 +541,10 @@ def test_exec_plan_windows_powershell_captures_output_itself():
 
 def test_exec_plan_windows_mingw_uses_home_paths():
     plan = mcp_server._exec_plan(cmd="ls", profile="mingw64", shell_bin=None, windows=True)
-    assert plan.script.startswith("~/AppData/Local/Temp/") and plan.script.endswith(".sh")
+    assert plan.script.startswith("~/AppData/Local/Temp/aimux_tmp/") and plan.script.endswith(".sh")
     # Git Bash cannot read the bridge client's '~' spelling, and $HOME inside
     # double quotes is the one form that expands there.
-    assert plan.launch.startswith('bash "$HOME/AppData/Local/Temp/')
+    assert plan.launch.startswith('bash "$HOME/AppData/Local/Temp/aimux_tmp/')
     assert plan.body == "ls"
 
 
@@ -552,7 +552,7 @@ def test_exec_temp_paths_windows_extensions():
     s, o, c = mcp_server._exec_temp_paths("cmd", windows=True)
     assert s.endswith(".cmd") and o.endswith(".out") and c.endswith(".code")
     assert s[:-4] == o[:-4] == c[:-5]
-    assert s.startswith("~/AppData/Local/Temp/")
+    assert s.startswith("~/AppData/Local/Temp/aimux_tmp/")
 
 
 def test_windows_exec_runs_cleans_up_and_reports_exit_code(monkeypatch):

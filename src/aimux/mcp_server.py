@@ -336,6 +336,14 @@ def _is_windows_profile(profile: str) -> bool:
 # the same directory its own way, and '~' is what the bridge client expands.
 _WIN_TEMP_DIR = "AppData/Local/Temp"
 
+# aimux keeps its scratch files in a directory of its own instead of scattering
+# them across the system temp dir: they are easy to spot, easy to sweep, and they
+# never collide with another tool's names. The client creates the directory when
+# it writes the script (parents=True), so the launcher's redirects have somewhere
+# to land.
+_POSIX_TEMP_DIR = "/tmp/aimux_tmp"
+_WIN_TEMP_SUBDIR = "aimux_tmp"
+
 # Set from the bridge registration in run_stdio(); '' when unknown (unit tests).
 _remote_platform = ""
 
@@ -388,17 +396,20 @@ def _exec_temp_base() -> str:
 def _exec_temp_paths(shell: str = "bash", *, windows: bool = False) -> tuple[str, str, str]:
     """Return (script, out, code) paths for the temp-script run.
 
-    POSIX remotes use /tmp/<base>.{sh,out,code}. Windows remotes cannot: only the
-    MSYS shells have a /tmp, and the bridge client resolves it against the
-    current drive, so the MCP server and the shell would silently disagree about
-    which file they mean. They use ``~/AppData/Local/Temp`` instead — the same
-    directory in every Windows shell (%USERPROFILE%, $env:USERPROFILE, $HOME).
+    POSIX remotes use /tmp/aimux_tmp/<base>.{sh,out,code}. Windows remotes cannot
+    use /tmp at all: only the MSYS shells have one, and the bridge client
+    resolves it against the current drive, so the MCP server and the shell would
+    silently disagree about which file they mean. They use
+    ``~/AppData/Local/Temp/aimux_tmp`` instead — the same directory in every
+    Windows shell (%USERPROFILE%, $env:USERPROFILE, $HOME).
     """
     base = _exec_temp_base()
     if not windows:
-        return f"/tmp/{base}.sh", f"/tmp/{base}.out", f"/tmp/{base}.code"
+        return (f"{_POSIX_TEMP_DIR}/{base}.sh",
+                f"{_POSIX_TEMP_DIR}/{base}.out",
+                f"{_POSIX_TEMP_DIR}/{base}.code")
     ext = {"cmd": "cmd", "powershell": "ps1"}.get(shell, "sh")
-    root = f"~/{_WIN_TEMP_DIR}"
+    root = f"~/{_WIN_TEMP_DIR}/{_WIN_TEMP_SUBDIR}"
     return f"{root}/{base}.{ext}", f"{root}/{base}.out", f"{root}/{base}.code"
 
 
@@ -445,7 +456,9 @@ def _exec_plan(*, cmd: str, profile: str, shell_bin: str | None, windows: bool) 
                          f"powershell -NoProfile -ExecutionPolicy Bypass -File \"{_ps_path(script)}\"")
 
     # MSYS / Git-Bash on Windows: sh semantics, Windows-visible paths.
-    launch = f"bash \"$HOME/{_WIN_TEMP_DIR}/{_basename(script)}\" > \"$HOME/{_WIN_TEMP_DIR}/{_basename(outfile)}\" 2>&1; echo $? > \"$HOME/{_WIN_TEMP_DIR}/{_basename(codefile)}\""
+    win_dir = f"$HOME/{_WIN_TEMP_DIR}/{_WIN_TEMP_SUBDIR}"
+    launch = (f"bash \"{win_dir}/{_basename(script)}\" > \"{win_dir}/{_basename(outfile)}\" 2>&1; "
+              f"echo $? > \"{win_dir}/{_basename(codefile)}\"")
     return _ExecPlan(script, outfile, codefile, cmd, launch)
 
 
