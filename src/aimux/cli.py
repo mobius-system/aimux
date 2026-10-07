@@ -2118,13 +2118,21 @@ def cmd_mcp_serve(
         str,
         typer.Option(
             "--toolset",
-            help="Tool set to expose: classic (6 remote_* tools, default) or classic-and-gui (adds remote_gui_* computer-use tools).",
+            help="Tool set to expose: classic (the remote_* tools, default) or classic-and-gui (adds remote_gui_* computer-use tools).",
         ),
     ] = "classic",
+    mobius_session: Annotated[
+        str,
+        typer.Option(
+            "--mobius-session",
+            help="Mobius session id that owns this server. Scopes the remote_set_remote_workdir default to that session and persists it across restarts.",
+        ),
+    ] = "",
 ):
     from . import mcp_server  # lazy import: keep `mcp` off the common command path
     try:
-        mcp_server.run_stdio(remote=remote, profile=profile, toolset=toolset)
+        mcp_server.run_stdio(remote=remote, profile=profile, toolset=toolset,
+                             mobius_session=mobius_session)
     except bridge.BridgeError as e:
         _exit_bridge_error(e)
     except KeyboardInterrupt:

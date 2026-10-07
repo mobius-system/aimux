@@ -276,7 +276,8 @@ def test_jsonrpc_tools_list(monkeypatch):
     monkeypatch.setattr(mcp_server, "_send", lambda obj: sent.append(obj))
     mcp_server._dispatch("rem", "prof", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = [t["name"] for t in sent[0]["result"]["tools"]]
-    assert names == ["remote_exec_command", "remote_write_stdin", "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping"]
+    assert names == ["remote_exec_command", "remote_set_remote_workdir", "remote_write_stdin",
+                    "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping"]
 
 
 def test_jsonrpc_tools_call_ping(monkeypatch, fake):
@@ -904,3 +905,146 @@ def test_prune_gui_shots_keeps_the_newest_and_drops_expired(monkeypatch, tmp_pat
     mcp_server._prune_gui_shots(tmp_path)
 
     assert sorted(p.name for p in tmp_path.glob("*.png")) == ["b.png", "c.png"]
+
+
+# ---- default workdir (remote_set_remote_workdir) ----
+
+
+@pytest.fixture(autouse=True)
+def _reset_workdir_state(monkeypatch, tmp_path):
+    """Keep the default-workdir state from leaking between tests."""
+    monkeypatch.setattr(mcp_server, "_mobius_session", "")
+    monkeypatch.setattr(mcp_server, "_workdir_default", "")
+    monkeypatch.setattr(mcp_server, "_WORKDIR_CACHE", None)
+    monkeypatch.setattr(mcp_server, "_WORKDIR_STORE", tmp_path / "mcp_workdirs.json")
+
+
+class WorkdirClient(ExecTempClient):
+    """Records the cwd each exec session was created with, and knows some dirs."""
+
+    def __init__(self, *, dirs=("/srv/app",)):
+        super().__init__()
+        self.dirs = set(dirs)
+        self.created: list[str] = []
+        self.session_cwds: list[str | None] = []
+
+    def create_session(self, **kw):
+        self.session_cwds.append(kw.get("cwd"))
+        return {"ok": True}
+
+    def file_stat(self, *, remote, path, timeout=60.0):
+        if path in self.dirs:
+            return {"exists": True, "type": "dir", "size": 0}
+        if path in self.files:
+            return super().file_stat(remote=remote, path=path, timeout=timeout)
+        return {"exists": False, "type": "none", "size": 0}
+
+    def file_mkdir(self, *, remote, path, timeout=60.0):
+        self.created.append(path)
+        self.dirs.add(path)
+        return {"ok": True}
+
+
+def _client_for(monkeypatch, c):
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+
+def test_workdir_default_is_used_when_the_argument_is_omitted(monkeypatch):
+    c = WorkdirClient()
+    _client_for(monkeypatch, c)
+
+    assert mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": "/srv/app"}) == {
+        "ok": True, "scope": "process", "remote": "r", "workdir": "/srv/app", "verified": "dir",
+    }
+
+    res = mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "pwd", "yield_time_ms": 1000})
+
+    assert c.session_cwds == ["/srv/app"]          # the session was created in the default
+    assert res["workdir"] == "/srv/app"
+    assert res["workdir_source"] == "session_default"
+
+
+def test_explicit_workdir_beats_the_default(monkeypatch):
+    c = WorkdirClient(dirs=("/srv/app", "/tmp"))
+    _client_for(monkeypatch, c)
+    mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": "/srv/app"})
+
+    res = mcp_server._remote_exec_command(
+        "r", "posix-pty", {"cmd": "pwd", "workdir": "/tmp", "yield_time_ms": 1000})
+
+    assert c.session_cwds == ["/tmp"]
+    assert res["workdir"] == "/tmp" and res["workdir_source"] == "explicit"
+    # the default is not consumed: the next call without workdir still uses it
+    mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "pwd", "yield_time_ms": 1000})
+    assert c.session_cwds == ["/tmp", "/srv/app"]
+
+
+def test_clearing_the_default_returns_to_the_client_directory(monkeypatch):
+    c = WorkdirClient()
+    _client_for(monkeypatch, c)
+    mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": "/srv/app"})
+
+    cleared = mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": ""})
+    assert cleared["workdir"] is None and cleared["verified"] == "cleared"
+
+    res = mcp_server._remote_exec_command("r", "posix-pty", {"cmd": "pwd", "yield_time_ms": 1000})
+    assert c.session_cwds == [None]
+    assert res["workdir"] is None and res["workdir_source"] == "client_cwd"
+
+
+def test_set_workdir_validates_against_the_remote(monkeypatch):
+    c = WorkdirClient()
+    _client_for(monkeypatch, c)
+
+    with pytest.raises(ValueError, match="absolute path"):
+        mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": "relative/dir"})
+    with pytest.raises(ValueError, match="does not exist"):
+        mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": "/nope"})
+
+    made = mcp_server._remote_set_remote_workdir(
+        "r", "posix-pty", {"workdir": "/srv/new", "create": True})
+    assert made["verified"] == "created" and c.created == ["/srv/new"]
+
+    # a file where a directory was expected
+    c.files["/etc/hosts"] = b"x"
+    with pytest.raises(ValueError, match="not a directory"):
+        mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": "/etc/hosts"})
+
+
+def test_workdir_scope_follows_the_mobius_session(monkeypatch):
+    c = WorkdirClient()
+    _client_for(monkeypatch, c)
+    monkeypatch.setattr(mcp_server, "_mobius_session", "sess-1")
+
+    saved = mcp_server._remote_set_remote_workdir("r", "posix-pty", {"workdir": "/srv/app"})
+    assert saved["scope"] == "session"
+
+    # A fresh MCP process in the same session still sees it (persisted), but
+    # another session does not: the key is (mobius session, bridge client).
+    monkeypatch.setattr(mcp_server, "_workdir_default", "")
+    monkeypatch.setattr(mcp_server, "_WORKDIR_CACHE", None)
+    assert mcp_server._effective_workdir({}, "r") == ("/srv/app", "session_default")
+
+    monkeypatch.setattr(mcp_server, "_mobius_session", "sess-2")
+    monkeypatch.setattr(mcp_server, "_WORKDIR_CACHE", None)
+    assert mcp_server._effective_workdir({}, "r") == (None, "client_cwd")
+    # ... and the same session pointed at another bridge client, likewise
+    monkeypatch.setattr(mcp_server, "_mobius_session", "sess-1")
+    assert mcp_server._effective_workdir({}, "other_client") == (None, "client_cwd")
+
+
+def test_workdir_store_drops_stale_and_corrupt_entries(monkeypatch, tmp_path):
+    store = tmp_path / "mcp_workdirs.json"
+    monkeypatch.setattr(mcp_server, "_WORKDIR_STORE", store)
+    monkeypatch.setattr(mcp_server, "_WORKDIR_CACHE", None)
+    store.write_text(
+        '{"sess-1|r": {"workdir": "/srv/app", "updated_at": %d},'
+        ' "sess-1|old": {"workdir": "/gone", "updated_at": 1},'
+        ' "junk": "not-a-dict"}' % time.time(),
+        encoding="utf-8")
+    assert list(mcp_server._load_workdir_store()) == ["sess-1|r"]
+
+    store.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_WORKDIR_CACHE", None)
+    assert mcp_server._load_workdir_store() == {}   # a corrupt store must not raise

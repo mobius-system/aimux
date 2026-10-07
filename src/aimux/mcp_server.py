@@ -1,7 +1,8 @@
 """aimux MCP server — expose one bridge remote as MCP tools over stdio.
 
-Codex-facing tools (6, aligned with codex native tool specs):
+Codex-facing tools (7, aligned with codex native tool specs):
   remote_exec_command  Run a command (one-shot temp-script on every platform; interactive=true keeps a live PTY); return clean output + exit code, or session_id.
+  remote_set_remote_workdir  Set the default working directory for this session's commands (scoped to the mobius session and bridge client).
   remote_write_stdin   Write chars to an existing exec session, return output.
   remote_apply_patch   Apply a patch (FREEFORM input).
   remote_view_image    Return a remote image file as a data URL.
@@ -76,6 +77,107 @@ _DEAD_NOTE = "session ended (shell exited)"
 # cannot see death (the files outlive the shell), and every check costs a bridge
 # round trip, so it is far slower than the 0.3s file poll.
 _EXEC_PROBE_EVERY_S = 5.0
+
+# ---------------------------------------------------------------------------
+# default workdir per (mobius session × bridge client)
+#
+# An agent can pre-set the directory its commands run in with
+# remote_set_remote_workdir instead of repeating workdir on every call. The
+# setting is keyed by the pair (mobius session, bridge client identifier):
+# another session's default never applies here, and this session talking to a
+# different client gets that client's own default.
+#
+# With a mobius session id (mobius passes --mobius-session) the map is persisted
+# so it survives an MCP restart inside the same session. Without one there is
+# nothing to key on but this process, so the setting lives in memory only and
+# the tool reports scope="process".
+# ---------------------------------------------------------------------------
+
+# Set from --mobius-session; '' when mobius did not pass one (unit tests, manual use).
+_mobius_session = ""
+# In-process default, used when there is no session id to key the store with.
+_workdir_default = ""
+
+_WORKDIR_STORE = Path.home() / ".aimux" / "mcp_workdirs.json"
+_WORKDIR_TTL_S = 7 * 24 * 3600
+_WORKDIR_CACHE: dict[str, dict] | None = None
+
+# Absolute on POSIX (`/x`) or Windows (`C:\x`, `C:/x`, `\\host\share`).
+_ABS_PATH_RE = re.compile(r"^(/|[A-Za-z]:[\\/]|\\\\)")
+
+
+def _workdir_scope() -> str:
+    """How long the setting lasts: the mobius session, or just this process."""
+    return "session" if _mobius_session else "process"
+
+
+def _workdir_key(remote: str) -> str:
+    return f"{_mobius_session}|{remote}"
+
+
+def _load_workdir_store() -> dict[str, dict]:
+    """Read the persisted map, dropping malformed and stale entries."""
+    global _WORKDIR_CACHE
+    if _WORKDIR_CACHE is not None:
+        return _WORKDIR_CACHE
+    data: dict[str, dict] = {}
+    try:
+        raw = json.loads(_WORKDIR_STORE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raw = {}
+    except Exception:
+        raw = {}  # a corrupt store must not take the tool down
+    if isinstance(raw, dict):
+        now = time.time()
+        for key, value in raw.items():
+            if not isinstance(value, dict) or not value.get("workdir"):
+                continue
+            try:
+                fresh = now - float(value.get("updated_at") or 0) < _WORKDIR_TTL_S
+            except (TypeError, ValueError):
+                fresh = False
+            if fresh:
+                data[str(key)] = value
+    _WORKDIR_CACHE = data
+    return data
+
+
+def _save_workdir_store() -> None:
+    """Write the map atomically (tmp + rename), owner-readable only."""
+    if _WORKDIR_CACHE is None:
+        return
+    try:
+        _WORKDIR_STORE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _WORKDIR_STORE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_WORKDIR_CACHE, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _WORKDIR_STORE)
+    except Exception as e:
+        print(f"aimux-mcp: cannot persist workdir default: {e}", file=sys.stderr)
+
+
+def _session_workdir_default(remote: str) -> str:
+    """The default set for (this mobius session × this bridge client), if any."""
+    if not _mobius_session:
+        return _workdir_default
+    entry = _load_workdir_store().get(_workdir_key(remote)) or {}
+    return str(entry.get("workdir") or "")
+
+
+def _effective_workdir(args: dict, remote: str) -> tuple[str | None, str]:
+    """Resolve where a command should run: (workdir, source).
+
+    Explicit argument wins outright; then the default set for this session and
+    client; then nothing, which leaves the command in whatever directory the
+    remote's reverse-connect client process was started in.
+    """
+    explicit = str(args.get("workdir") or "").strip()
+    if explicit:
+        return explicit, "explicit"
+    saved = _session_workdir_default(remote)
+    if saved:
+        return saved, "session_default"
+    return None, "client_cwd"
 
 # Ceiling for a single yield_time_ms (clamped so one tool call can't pin the
 # single-threaded MCP server for an unbounded time).
@@ -293,10 +395,15 @@ def _decorate_output(output: str, *, finished: bool, timeout_ms: int | None = No
 
 def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, finished: bool, wall: float,
                  *, note: str | None = None, timeout_ms: int | None = None, dead: bool = False) -> dict:
+    sess = _sessions.get(sid) or {}
     res = {
         "output": _decorate_output(output, finished=finished, timeout_ms=timeout_ms, dead=dead),
         "original_token_count": original_tokens,
         "wall_time_seconds": round(wall, 3),
+        # Where the command actually ran, and why -- so a default picked up from
+        # remote_set_remote_workdir is visible instead of silently applied.
+        "workdir": sess.get("workdir") or None,
+        "workdir_source": sess.get("workdir_source"),
     }
     if finished:
         if exit_code is not None:
@@ -587,7 +694,7 @@ def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
     cmd = args.get("cmd")
     if not isinstance(cmd, str) or not cmd.strip():
         raise ValueError("cmd is required")
-    workdir = args.get("workdir") or None
+    workdir, workdir_source = _effective_workdir(args, remote)
     shell_bin = args.get("shell") or None
     login = args.get("login")
     if login is None:
@@ -608,6 +715,7 @@ def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
     for attempt in range(max_retries + 1):
         sid = _create_exec_session(remote, profile, shell_cmd, workdir)
         name = _sessions[sid]["name"]
+        _sessions[sid].update(workdir=workdir or "", workdir_source=workdir_source)
         marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
         _sessions[sid]["marker"] = marker
         try:
@@ -644,7 +752,7 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
     cmd = args.get("cmd")
     if not isinstance(cmd, str) or not cmd.strip():
         raise ValueError("cmd is required")
-    workdir = args.get("workdir") or None
+    workdir, workdir_source = _effective_workdir(args, remote)
     shell_bin = args.get("shell") or None
     max_tokens = int(args.get("max_output_tokens") or 10000)
     yield_ms = max(250, min(_MAX_YIELD_MS, int(args.get("yield_time_ms") or 10000)))
@@ -657,6 +765,7 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
     for attempt in range(max_retries + 1):
         sid = _create_exec_session(remote, profile, shell_bin, workdir)
         name = _sessions[sid]["name"]
+        _sessions[sid].update(workdir=workdir or "", workdir_source=workdir_source)
         plan = _exec_plan(cmd=cmd, profile=profile, shell_bin=shell_bin, windows=windows)
         _sessions[sid].update(tmp_script=plan.script, tmp_out=plan.out, tmp_code=plan.code)
         try:
@@ -701,6 +810,66 @@ def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     if args.get("interactive"):
         return _remote_exec_command_pty(remote, profile, args)
     return _remote_exec_command_tempfile(remote, profile, args)
+
+
+# ---------------------------------------------------------------------------
+# remote_set_remote_workdir
+# ---------------------------------------------------------------------------
+
+
+def _remote_set_remote_workdir(remote: str, profile: str, args: dict) -> dict:
+    """Set or clear the directory later commands run in.
+
+    Validated here, at set time, so a typo surfaces now rather than on the next
+    command: the directory must exist on the remote (or be created on request)
+    and be a directory. Passing an empty workdir clears the default.
+    """
+    global _workdir_default
+    raw = args.get("workdir")
+    workdir = "" if raw is None else str(raw).strip()
+    create = bool(args.get("create", False))
+    c = _client()
+
+    if not workdir:
+        if _mobius_session:
+            store = _load_workdir_store()
+            if store.pop(_workdir_key(remote), None) is not None:
+                _save_workdir_store()
+        _workdir_default = ""
+        return {
+            "ok": True, "scope": _workdir_scope(), "remote": remote,
+            "workdir": None, "verified": "cleared",
+        }
+
+    if not _ABS_PATH_RE.match(workdir):
+        raise ValueError(
+            f"workdir must be an absolute path on the remote (got {workdir!r}); "
+            "a relative path would be resolved against the remote client's own directory"
+        )
+
+    stat = c.file_stat(remote=remote, path=workdir, timeout=30.0)
+    if stat.get("exists"):
+        if stat.get("type") != "dir":
+            raise ValueError(f"workdir is not a directory on {remote}: {workdir}")
+        verified = "dir"
+    elif create:
+        c.file_mkdir(remote=remote, path=workdir)
+        verified = "created"
+    else:
+        raise ValueError(
+            f"workdir does not exist on {remote}: {workdir} (pass create=true to create it)"
+        )
+
+    if _mobius_session:
+        store = _load_workdir_store()
+        store[_workdir_key(remote)] = {"workdir": workdir, "updated_at": time.time()}
+        _save_workdir_store()
+    else:
+        _workdir_default = workdir
+    return {
+        "ok": True, "scope": _workdir_scope(), "remote": remote,
+        "workdir": workdir, "verified": verified,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1271,7 @@ def _apply_hunks(orig: str, hunks: list) -> str:
 CLASSIC_TOOLS = [
     {
         "name": "remote_exec_command",
-        "description": "Runs a shell command, returning clean output and an exit code. One-shot by default: the command is uploaded to a temp script and its output and exit code are read back from files, on every platform. On a Windows cmd remote that script is a .cmd file, so write for-loop variables with a doubled percent (for /l %%i in (1,1,3) do ...). Pass interactive=true to keep a live PTY session for remote_write_stdin. `output` never comes back blank: a command that printed nothing yields '<aimux>command output is empty</aimux>', and a wait that expired before the command finished reports it: '<aimux>command timeout after N seconds</aimux>' when nothing had arrived yet, or '<aimux>get some output, but command timeout after N seconds</aimux>' appended to the partial output.",
+        "description": "Runs a shell command, returning clean output and an exit code. One-shot by default: the command is uploaded to a temp script and its output and exit code are read back from files, on every platform. On a Windows cmd remote that script is a .cmd file, so write for-loop variables with a doubled percent (for /l %%i in (1,1,3) do ...). Pass interactive=true to keep a live PTY session for remote_write_stdin. Set a default with remote_set_remote_workdir to stop repeating workdir on every call. `output` never comes back blank: a command that printed nothing yields '<aimux>command output is empty</aimux>', and a wait that expired before the command finished reports it: '<aimux>command timeout after N seconds</aimux>' when nothing had arrived yet, or '<aimux>get some output, but command timeout after N seconds</aimux>' appended to the partial output.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1111,10 +1280,30 @@ CLASSIC_TOOLS = [
                 "login": {"type": "boolean", "default": True, "description": "True runs the shell with -l/-i semantics; false disables them (uses --norc --noprofile). Defaults to true."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
                 "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
-                "workdir": {"type": "string", "description": "Working directory for the command, as an absolute path on the remote. A path that does not exist fails the call instead of falling back. When omitted, the command runs wherever the remote's reverse-connect client process happens to be started, which is not knowable in advance -- pass workdir explicitly to be sure."},
+                "workdir": {"type": "string", "description": "Working directory for the command, as an absolute path on the remote. A path that does not exist fails the call instead of falling back. When omitted, the command runs in the default set for this session by remote_set_remote_workdir, or -- if none was set -- wherever the remote's reverse-connect client process happens to be started, which is not knowable in advance. The reply reports both the directory used and where it came from."},
                 "yield_time_ms": {"type": "number", "default": 10000, "description": "Wait before yielding output. Defaults to 10000 ms; effective range 250-300000 ms."},
             },
             "required": ["cmd"],
+        },
+    },
+    {
+        "name": "remote_set_remote_workdir",
+        "description": (
+            "Sets the working directory that this session's remote_exec_command calls use when they omit "
+            "workdir, so it does not have to be repeated on every call. Scoped to (this mobius session, this "
+            "bridge client): other sessions and other clients are unaffected. The directory is validated on "
+            "the remote when set -- it must already be a directory unless create=true. Pass workdir='' to "
+            "clear the default; the reply reports the scope and what was verified. Each remote_exec_command "
+            "reply echoes the effective workdir and whether it came from the argument, this default, or the "
+            "client's own directory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workdir": {"type": "string", "description": "Absolute directory on the remote to use as the default working directory for this session. Pass an empty string to clear it."},
+                "create": {"type": "boolean", "default": False, "description": "Create the directory when it does not exist yet. Defaults to false, in which case a missing directory is an error."},
+            },
+            "required": ["workdir"],
         },
     },
     {
@@ -1189,6 +1378,7 @@ CLASSIC_TOOLS = [
 
 _TOOL_FUNCS = {
     "remote_exec_command": _remote_exec_command,
+    "remote_set_remote_workdir": _remote_set_remote_workdir,
     "remote_write_stdin": _remote_write_stdin,
     "remote_apply_patch": _remote_apply_patch,
     "remote_view_image": _remote_view_image,
@@ -1623,9 +1813,16 @@ def _dispatch(remote: str, profile: str, req: dict) -> None:
     _error(req_id, -32601, f"method not found: {method}")
 
 
-def run_stdio(*, remote: str, profile: str | None = None, toolset: str = "classic") -> None:
-    """Run the MCP stdio server bound to one bridge remote."""
-    global _ACTIVE_TOOLSET
+def run_stdio(*, remote: str, profile: str | None = None, toolset: str = "classic",
+               mobius_session: str = "") -> None:
+    """Run the MCP stdio server bound to one bridge remote.
+
+    ``mobius_session`` is the id of the mobius session that owns this server.
+    It scopes remote_set_remote_workdir's default and lets it persist across an
+    MCP restart; without it the default lasts only as long as this process.
+    """
+    global _ACTIVE_TOOLSET, _mobius_session
+    _mobius_session = (mobius_session or "").strip()
     if toolset not in TOOLSETS:
         print(f"aimux-mcp: unknown toolset {toolset!r} (choose from {', '.join(TOOLSETS)})", file=sys.stderr)
         sys.exit(2)
