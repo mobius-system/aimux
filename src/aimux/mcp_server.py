@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.resources
+import pathlib
 import json
 import os
 import re
@@ -1394,6 +1396,10 @@ TOOLSETS = ("classic", "classic-and-gui")
 # ---------------------------------------------------------------------------
 
 _GUI_COMMON = (
+    " Start with remote_gui_diagnostics: it reports whether the helper is usable "
+    "(accessibility + screen recording) and returns `skill_path`, the absolute path of "
+    "the GUI-operation guide shipped with aimux -- read that SKILL.md before driving a "
+    "GUI, it carries the two working methods and their pitfalls. "
     " The remote must be connected with `aimux reverse connect --enable-gui` "
     "from a logged-in desktop session (not over SSH). "
     "Refs look like `win:look_1:@e2`; a ref from a recent look can be re-resolved "
@@ -1410,8 +1416,26 @@ def _gui_call(remote: str, cmd: str, args: dict, *, timeout: float | None = None
     return _client().gui_request(remote=remote, cmd=cmd, args=args, timeout=budget + 15.0)
 
 
+def gui_skill_path() -> str | None:
+    """Absolute path of the GUI-operation guide that ships inside the package.
+
+    The guide is package data, not a file next to the caller: an MCP server can
+    run anywhere, so the path has to come from the installed distribution.
+    Returns None when the file is absent (a hand-copied install), in which case
+    diagnostics simply omits the field.
+    """
+    try:
+        path = pathlib.Path(str(importlib.resources.files("aimux").joinpath(
+            "skills", "mobius-gui-operation", "SKILL.md")))
+    except Exception:
+        return None
+    return str(path) if path.is_file() else None
+
+
 def _gui_diagnostics(remote: str, profile: str, args: dict) -> dict:
-    return _gui_call(remote, "diagnostics", {})
+    res = _gui_call(remote, "diagnostics", {})
+    skill = gui_skill_path()
+    return {**res, "skill_path": skill} if skill else res
 
 
 def _gui_list_windows(remote: str, profile: str, args: dict) -> dict:
@@ -1621,7 +1645,8 @@ def _gui_focus_window(remote: str, profile: str, args: dict) -> dict:
 GUI_TOOLS = [
     {
         "name": "remote_gui_diagnostics",
-        "description": "Check the remote's GUI accessibility helper: protocol version, OS, arch, helper pid."
+        "description": "Check the remote's GUI accessibility helper: protocol version, OS, arch, helper pid, "
+        "and `skill_path`, the absolute path of the bundled GUI-operation guide (SKILL.md) to read before driving a GUI."
         + _GUI_COMMON,
         "inputSchema": {"type": "object", "properties": {}},
     },

@@ -5,6 +5,7 @@ import re
 import time
 
 import pytest
+from pathlib import Path
 
 from aimux import bridge
 from aimux import mcp_server
@@ -1048,3 +1049,33 @@ def test_workdir_store_drops_stale_and_corrupt_entries(monkeypatch, tmp_path):
     store.write_text("{ not json", encoding="utf-8")
     monkeypatch.setattr(mcp_server, "_WORKDIR_CACHE", None)
     assert mcp_server._load_workdir_store() == {}   # a corrupt store must not raise
+
+
+# ---- GUI operation guide shipped with the package ----
+
+def test_gui_diagnostics_reports_the_bundled_skill_path(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_gui_call", lambda remote, cmd, args, **kw: {"ok": True, "protocol": 1})
+
+    res = mcp_server._gui_diagnostics("r", "p", {})
+
+    assert res["ok"] is True                      # the helper's own fields survive
+    path = res["skill_path"]
+    assert path.endswith("skills/mobius-gui-operation/SKILL.md")
+    assert Path(path).is_file(), f"the guide is not packaged: {path}"
+    assert "GUI操作方法" in Path(path).read_text(encoding="utf-8")
+
+
+def test_gui_skill_path_is_none_when_packaging_is_broken(monkeypatch):
+    import importlib.resources
+
+    def boom(_name):
+        raise ModuleNotFoundError("aimux")
+
+    monkeypatch.setattr(importlib.resources, "files", boom)
+    assert mcp_server.gui_skill_path() is None
+
+
+def test_every_gui_tool_description_points_at_diagnostics_first():
+    for tool in mcp_server.GUI_TOOLS:
+        assert "remote_gui_diagnostics" in tool["description"], tool["name"]
+        assert "skill_path" in tool["description"], tool["name"]
