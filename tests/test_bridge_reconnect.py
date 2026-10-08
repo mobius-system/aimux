@@ -256,11 +256,13 @@ def test_handle_event_logs_bridge_command_details(monkeypatch):
         logger.remove(sink_id)
 
     joined = "\n".join(logs)
-    assert "bridge client received command" in joined
+    # one line per command now: the outcome, the summary, and what came back
+    assert "bridge client ran command" in joined
     assert "type=file.write" in joined
+    assert "ok=True" in joined
     assert "C:\\\\tmp\\\\out.txt" in joined
     assert "content_b64_len" in joined
-    assert "bridge client completed command" in joined
+    assert "result_keys=['size']" in joined
     assert posted[0]["payload"] == {"id": "req-1", "ok": True, "payload": {"size": 5}}
 
 

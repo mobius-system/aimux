@@ -495,8 +495,11 @@ class BridgeBrokerState:
                 message,
             )
             raise BridgeError(message, kind=kind, exit_code=exit_code)
-        (logger.debug if is_quiet_command(message_type) else logger.info)(
-            "bridge broker request completed remote={!r} request_id={} type={}", remote, request_id, message_type)
+        # The queue line is the dispatch record (it appears even if the command
+        # never comes back); the completion is the detail you only want when
+        # tracing, so it stays at DEBUG.
+        logger.debug("bridge broker request completed remote={!r} request_id={} type={}",
+                     remote, request_id, message_type)
         return result.get("payload") if isinstance(result.get("payload"), dict) else {}
 
     def complete(self, payload: dict[str, Any]) -> None:

@@ -1275,26 +1275,9 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
     if message_type == "http_port.open":
         _handle_http_port_open(runtime, base, token, request_id, payload)
         return
-    log_command = logger.debug if bridge.is_quiet_command(message_type) else logger.info
-    if _is_logged_bridge_command(message_type):
-        log_command(
-            "bridge client received command identifier={} request_id={} type={} details={}",
-            runtime.identifier,
-            request_id,
-            message_type,
-            _bridge_command_summary(message_type, payload),
-        )
     try:
         result = runtime.handle(message_type, payload)
         response_payload = {"id": request_id, "ok": True, "payload": result}
-        if _is_logged_bridge_command(message_type):
-            log_command(
-                "bridge client completed command identifier={} request_id={} type={} result_keys={}",
-                runtime.identifier,
-                request_id,
-                message_type,
-                sorted(result) if isinstance(result, dict) else [],
-            )
     except BridgeError as e:
         response_payload = {
             "id": request_id,
@@ -1321,6 +1304,19 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
             runtime.identifier,
             request_id,
             message_type,
+        )
+    # One line per command, written once it has an outcome: the old pair
+    # (received + completed) doubled the log for every file.write / file.delete
+    # an exec performs, which is most of what an exec does.
+    if _is_logged_bridge_command(message_type):
+        (logger.debug if bridge.is_quiet_command(message_type) else logger.info)(
+            "bridge client ran command identifier={} request_id={} type={} ok={} details={} result_keys={}",
+            runtime.identifier,
+            request_id,
+            message_type,
+            bool(response_payload.get("ok")),
+            _bridge_command_summary(message_type, payload),
+            sorted(response_payload["payload"]) if isinstance(response_payload.get("payload"), dict) else [],
         )
     _post_json(f"{base}/client/result", token, response_payload)
 
