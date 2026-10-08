@@ -29,6 +29,8 @@ from typing import Any, Protocol
 
 from loguru import logger
 
+from . import bridge
+
 from . import __version__
 from . import port_tunnel
 from .bridge import BridgeError, validate_identifier, version_mismatch_message
@@ -1273,8 +1275,9 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
     if message_type == "http_port.open":
         _handle_http_port_open(runtime, base, token, request_id, payload)
         return
+    log_command = logger.debug if bridge.is_quiet_command(message_type) else logger.info
     if _is_logged_bridge_command(message_type):
-        logger.info(
+        log_command(
             "bridge client received command identifier={} request_id={} type={} details={}",
             runtime.identifier,
             request_id,
@@ -1285,7 +1288,7 @@ def _handle_event(runtime: ReverseClientRuntime, base: str, token: str, event: d
         result = runtime.handle(message_type, payload)
         response_payload = {"id": request_id, "ok": True, "payload": result}
         if _is_logged_bridge_command(message_type):
-            logger.info(
+            log_command(
                 "bridge client completed command identifier={} request_id={} type={} result_keys={}",
                 runtime.identifier,
                 request_id,

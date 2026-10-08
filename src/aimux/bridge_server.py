@@ -24,6 +24,7 @@ from . import port_forward
 from . import port_tunnel
 from . import ssh as ssh_mod
 from .bridge import (
+    is_quiet_command,
     BridgeError,
     BridgeRuntime,
     clear_runtime,
@@ -462,7 +463,9 @@ class BridgeBrokerState:
             pending = PendingRequest(remote=remote, message_type=message_type)
             self.pending[request_id] = pending
             client.queue.put({"id": request_id, "type": message_type, "payload": payload})
-            logger.info("bridge broker queued request remote={!r} request_id={} type={}", remote, request_id, message_type)
+            _log_request = logger.debug if is_quiet_command(message_type) else logger.info
+            _log_request("bridge broker queued request remote={!r} request_id={} type={}",
+                         remote, request_id, message_type)
 
         if not pending.event.wait(timeout):
             with self.lock:
@@ -492,7 +495,8 @@ class BridgeBrokerState:
                 message,
             )
             raise BridgeError(message, kind=kind, exit_code=exit_code)
-        logger.info("bridge broker request completed remote={!r} request_id={} type={}", remote, request_id, message_type)
+        (logger.debug if is_quiet_command(message_type) else logger.info)(
+            "bridge broker request completed remote={!r} request_id={} type={}", remote, request_id, message_type)
         return result.get("payload") if isinstance(result.get("payload"), dict) else {}
 
     def complete(self, payload: dict[str, Any]) -> None:
@@ -503,7 +507,7 @@ class BridgeBrokerState:
         if pending is not None:
             pending.result = payload
             pending.event.set()
-            logger.info("bridge broker received result request_id={} ok={}", request_id, bool(payload.get("ok")))
+            logger.debug("bridge broker received result request_id={} ok={}", request_id, bool(payload.get("ok")))
             return
         if stream is not None:
             # A streaming request reports its outcome here. Reads report only

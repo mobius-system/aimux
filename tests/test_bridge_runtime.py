@@ -13,6 +13,7 @@ from loguru import logger
 
 from aimux import __version__
 from aimux import bridge
+from aimux import logging_setup
 from aimux import bridge_server
 from aimux.bridge_client import _keys_to_text
 from aimux.bridge_server import BridgeBrokerState
@@ -521,3 +522,45 @@ def test_disconnect_events_fails_pending_requests_without_waiting_for_timeout(mo
     assert result["kind"] == "remote_disconnected"
     assert result["exit_code"] == 2
     assert "session.capture" in str(result["message"])
+
+
+# ---- log noise: polled commands are DEBUG-only ----
+
+def test_quiet_command_types_are_the_polled_ones():
+    assert bridge.is_quiet_command("file.stat")
+    assert bridge.is_quiet_command("session.capture")
+    # user-facing commands stay at INFO
+    for t in ("session.create", "session.send_keys", "session.kill", "file.write", "file.read"):
+        assert not bridge.is_quiet_command(t)
+
+
+def test_setup_logging_defaults_to_info_and_honours_the_env(monkeypatch):
+    monkeypatch.delenv("AIMUX_LOG_LEVEL", raising=False)
+    assert logging_setup.setup_logging() == "INFO"
+    monkeypatch.setenv("AIMUX_LOG_LEVEL", "debug")
+    assert logging_setup.setup_logging() == "DEBUG"
+    # a typo must not take a bridge client down
+    monkeypatch.setenv("AIMUX_LOG_LEVEL", "chatty")
+    assert logging_setup.setup_logging() == "INFO"
+
+
+def test_polled_commands_do_not_reach_an_info_sink(capsys, monkeypatch):
+    """The flood was many lines per second at INFO; one exec's poll must be silent."""
+    from aimux import bridge_client
+
+    monkeypatch.setattr(bridge_client, "_post_json", lambda *a, **kw: None)  # no broker in a unit test
+    logging_setup.setup_logging("INFO")  # the sink the CLI installs
+    runtime = bridge_client.ReverseClientRuntime("box")
+    runtime.handle = lambda message_type, payload: {"ok": True}  # type: ignore[assignment]
+
+    # a file.stat from the exec poll
+    bridge_client._handle_event(runtime, "http://127.0.0.1:1", "tok",
+                                {"id": "req-1", "type": "file.stat", "payload": {"path": "/tmp/x.code"}})
+    assert capsys.readouterr().err.strip() == ""
+
+    # ...while a real command still shows up
+    bridge_client._handle_event(runtime, "http://127.0.0.1:1", "tok",
+                                {"id": "req-2", "type": "session.create",
+                                 "payload": {"name": "s", "profile": "posix-pty"}})
+    out = capsys.readouterr().err
+    assert "session.create" in out and "INFO" in out

@@ -39,6 +39,7 @@ from .constants import (
     OPT_LOCATION,
     OPT_OUTPUT_SYNC_FILE,
 )
+from .logging_setup import setup_logging
 from .output import emit_table, err, print_error_json, print_json
 
 # Top-level help is laid out in these panels; the order here is the order both
@@ -83,6 +84,17 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
     cls=_PaneledGroup,
 )
+
+@app.callback()
+def _configure_logging() -> None:
+    """One loguru sink for every command.
+
+    Without it loguru keeps its default DEBUG sink, and the bridge's poll loop
+    (file.stat every 0.3s, session.capture every 5s) floods the log. The level
+    comes from AIMUX_LOG_LEVEL; see logging_setup.
+    """
+    setup_logging()
+
 
 remote_app = typer.Typer(
     add_completion=False,

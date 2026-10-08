@@ -15,6 +15,18 @@ from typing import Any, Callable
 
 
 RUNTIME_ENV = "AIMUX_BRIDGE_RUNTIME"
+
+# Command types the bridge polls on a timer rather than on user action: the exec
+# wait loop asks for file.stat every 0.3s and probes session.capture every 5s.
+# They are logged at DEBUG, not INFO -- at INFO they drowned out every other
+# line in both the client's and the broker's log (one exec could emit tens of
+# thousands of them).
+QUIET_COMMAND_TYPES = frozenset({"file.stat", "session.capture"})
+
+
+def is_quiet_command(message_type: str) -> bool:
+    """True for polled commands, which are logged only at DEBUG."""
+    return message_type in QUIET_COMMAND_TYPES
 # Streaming file transfers relay raw bytes in 1 MiB chunks; the chunk size also
 # sets the granularity of the progress callback.
 STREAM_CHUNK_SIZE = 1024 * 1024

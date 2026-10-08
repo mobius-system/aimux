@@ -24,12 +24,12 @@ def test_ping_via_jsonrpc_content_is_json(mcp):
     assert json.loads(text) == {"ok": True}
 
 
-def test_tools_list_six_tools_in_order(mcp):
+def test_tools_list_classic_tools_in_order(mcp):
     tools = mcp.tools_list()
     names = [t["name"] for t in tools]
     assert names == [
-        "remote_exec_command", "remote_write_stdin", "remote_apply_patch",
-        "remote_view_image", "remote_download_file", "remote_ping",
+        "remote_exec_command", "remote_set_remote_workdir", "remote_write_stdin",
+        "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping",
     ]
 
 
