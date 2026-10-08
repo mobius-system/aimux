@@ -114,6 +114,12 @@ aimux local-http-port-reroute --local-port=9000 --remote-client-id=a-box \
 aimux kill "local-8824/testsession"
 ```
 
+# Logs
+
+One line per command at `INFO` on stderr; the bridge's own polling
+(`file.stat` every 0.3s, `session.capture` every 5s) is `DEBUG`, so a long
+command stays quiet. Set `AIMUX_LOG_LEVEL=DEBUG` to see every command it runs.
+
 ## Computer use (Windows x64)
 
 If the remote was connected with `aimux reverse connect --enable-gui`, you can

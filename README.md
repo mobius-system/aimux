@@ -215,6 +215,20 @@ specific interface instead.
 
 6. Upload and download files.
 
+## Logs
+
+Logs go to stderr, one line per command, at `INFO`. The bridge polls while it
+waits for a command (`file.stat` every 0.3s, `session.capture` every 5s) and
+those polled commands are logged at `DEBUG`, so a long-running command does not
+bury the log under thousands of lines.
+
+```bash
+AIMUX_LOG_LEVEL=DEBUG aimux reverse connect http://server:8765 --identifier box --token TOKEN
+```
+
+`AIMUX_LOG_LEVEL` accepts any loguru level (`TRACE`/`DEBUG`/`INFO`/`SUCCESS`/
+`WARNING`/`ERROR`/`CRITICAL`); anything unrecognized falls back to `INFO`.
+
 ### File transfer for bridge remotes
 
 `aimux send-files` and `aimux get-files` work the same way for bridge remotes
