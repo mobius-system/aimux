@@ -21,7 +21,7 @@ set -u
 
 AIMUX="${AIMUX:-$HOME/.local/bin/aimux}"
 REMOTE="${AIMUX_SMOKE_REMOTE:-young_garden}"
-RDIR="${AIMUX_SMOKE_REMOTE_DIR:-/home/fuqingxu/test_server/test_aimux}"
+RDIR="${AIMUX_SMOKE_REMOTE_DIR:-$HOME/test_server/test_aimux}"
 SESSION="${AIMUX_SMOKE_SESSION:-aimux_bridge_basic}"
 PROFILE="${AIMUX_SMOKE_PROFILE:-posix-pty}"
 DRIVER="${AIMUX_SMOKE_DRIVER:-$(hostname)}"
