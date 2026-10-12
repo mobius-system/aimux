@@ -908,6 +908,171 @@ def test_prune_gui_shots_keeps_the_newest_and_drops_expired(monkeypatch, tmp_pat
     assert sorted(p.name for p in tmp_path.glob("*.png")) == ["b.png", "c.png"]
 
 
+# ---- remote_gui_record_window_mp4 ----
+
+
+class _RecordingClient:
+    """Bridge client stub: file_stat + the two read paths the fetch may take."""
+
+    def __init__(self, payload=b"\x00\x00\x00\x18ftypmp42", size=None):
+        self.payload = payload
+        self.size = len(payload) if size is None else size
+        self.streamed = False
+        self.read_paths = []
+
+    def file_stat(self, *, remote, path, timeout=60.0):
+        return {"size": self.size, "path": path}
+
+    def file_read(self, *, remote, path, timeout=180.0):
+        self.read_paths.append(path)
+        return {"content_b64": base64.b64encode(self.payload).decode("ascii")}
+
+    def file_read_stream(self, *, remote, path, timeout=180.0, progress=None, total=0):
+        self.streamed = True
+        self.read_paths.append(path)
+        return self.payload
+
+
+def _record_calls(monkeypatch, *, status_active=False, stop=None, start=None):
+    """Drive the handler against a fake helper; returns (client, calls)."""
+    calls: list[tuple[str, dict]] = []
+
+    def fake_call(remote, cmd, args, **kw):
+        calls.append((cmd, args))
+        if cmd == "recordStart":
+            return start or {"recordingId": "rec_1", "path": "C:\\Temp\\a.mp4", "width": 640,
+                             "height": 480, "fps": 10, "audio": "system", "hasAudio": True}
+        if cmd == "recordStatus":
+            return {"active": status_active}
+        if cmd == "recordStop":
+            return stop or {"recordingId": "rec_1", "path": "C:\\Temp\\a.mp4", "bytes": 20,
+                            "durationMs": 1000, "width": 640, "height": 480, "fps": 10,
+                            "audio": "system", "hasAudio": True, "videoFrames": 10,
+                            "audioFrames": 46, "stopped": True}
+        raise AssertionError(f"unexpected helper command {cmd}")
+
+    client = _RecordingClient()
+    monkeypatch.setattr(mcp_server, "_gui_call", fake_call)
+    monkeypatch.setattr(mcp_server, "_client", lambda: client)
+    monkeypatch.setattr(mcp_server, "_remote_platform", "windows")
+    monkeypatch.setattr(mcp_server, "_GUI_RECORD_POLL_SECONDS", 0.01)
+    return client, calls
+
+
+def test_gui_record_window_mp4_downloads_the_mp4_and_returns_a_local_path(monkeypatch, tmp_path):
+    client, calls = _record_calls(monkeypatch, status_active=True)
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    out = mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "duration_ms": 1000})
+
+    names = [cmd for cmd, _ in calls]
+    # recordStatus is polled until the deadline, so only the ends are fixed.
+    assert names[0] == "recordStart" and names[-1] == "recordStop"
+    assert set(names[1:-1]) <= {"recordStatus"}
+    assert calls[0][1] == {"rootRef": "@w1", "fps": 10, "maxDurationMs": 1000, "audio": "system"}
+    assert out["video_path"].startswith(str(tmp_path)) and out["video_path"].endswith(".mp4")
+    with open(out["video_path"], "rb") as fh:
+        assert fh.read() == client.payload
+    assert out["remote_path"] == "C:\\Temp\\a.mp4" and out["recording_id"] == "rec_1"
+    assert out["has_audio"] is True and out["video_frames"] == 10 and out["size"] == len(client.payload)
+    assert "audio_warning" not in out and client.streamed is False
+
+
+def test_gui_record_window_mp4_streams_a_large_recording(monkeypatch, tmp_path):
+    client, _ = _record_calls(monkeypatch, status_active=True)
+    client.size = mcp_server._GUI_VIDEO_STREAM_THRESHOLD + 1
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "duration_ms": 1000})
+
+    assert client.streamed is True  # base64-in-one-message does not scale to MP4s
+
+
+def test_gui_record_window_mp4_stops_early_when_the_window_disappears(monkeypatch, tmp_path):
+    _record_calls(monkeypatch, status_active=False)
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    out = mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "duration_ms": 600000})
+
+    # A closed window (or the helper's own cap) must not hold the tool for 10 min.
+    assert out["duration_ms"] == 1000
+
+
+def test_gui_record_window_mp4_reports_audio_warnings_and_survives_them(monkeypatch, tmp_path):
+    _, calls = _record_calls(
+        monkeypatch, status_active=True,
+        stop={"recordingId": "rec_1", "path": "C:\\Temp\\a.mp4", "bytes": 20, "durationMs": 1000,
+              "audio": "system", "hasAudio": False, "audioWarning": "no default render device"})
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    out = mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "duration_ms": 1000})
+
+    assert out["audio_warning"] == "no default render device" and out["video_path"]
+
+
+def test_gui_record_window_mp4_raises_when_the_recording_produced_no_file(monkeypatch, tmp_path):
+    _record_calls(monkeypatch, status_active=True,
+                  stop={"recordingId": "rec_1", "path": "C:\\Temp\\a.mp4", "bytes": 0,
+                        "error": "capture failed: the window is gone"})
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="the window is gone"):
+        mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "duration_ms": 1000})
+
+
+def test_gui_record_window_mp4_fails_immediately_off_windows(monkeypatch):
+    from aimux import mcp_server as m
+
+    def boom(*a, **kw):
+        raise AssertionError("a non-Windows remote must not be called")
+
+    monkeypatch.setattr(m, "_gui_call", boom)
+    monkeypatch.setattr(m, "_remote_platform", "linux")
+
+    with pytest.raises(RuntimeError, match="only supported on Windows"):
+        m._gui_record_window_mp4("box", "posix-pty", {"root_ref": "@w1"})
+
+
+def test_gui_record_window_mp4_validates_its_arguments(monkeypatch, tmp_path):
+    _record_calls(monkeypatch, status_active=True)
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    with pytest.raises(ValueError, match="root_ref is required"):
+        mcp_server._gui_record_window_mp4("box", "cmd", {})
+    with pytest.raises(ValueError, match="audio must be one of"):
+        mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "audio": "loopback"})
+
+
+def test_gui_record_window_mp4_honours_an_explicit_local_path(monkeypatch, tmp_path):
+    _record_calls(monkeypatch, status_active=True)
+    target = tmp_path / "clips" / "demo.mp4"
+
+    out = mcp_server._gui_record_window_mp4(
+        "box", "cmd", {"root_ref": "@w1", "duration_ms": 1000, "local_path": str(target)})
+    assert out["video_path"] == str(target) and target.is_file()
+
+    with pytest.raises(FileExistsError):
+        mcp_server._gui_record_window_mp4(
+            "box", "cmd", {"root_ref": "@w1", "duration_ms": 1000, "local_path": str(target)})
+    out = mcp_server._gui_record_window_mp4(
+        "box", "cmd", {"root_ref": "@w1", "duration_ms": 1000, "local_path": str(target), "overwrite": True})
+    assert out["video_path"] == str(target)
+
+
+def test_prune_gui_videos_uses_the_same_policy_as_shots(monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_server, "_GUI_VIDEO_MAX_FILES", 1)
+    now = time.time()
+    for name, age in (("old.mp4", 40), ("new.mp4", 10), ("stale.mp4", 10 * 60 * 60)):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        os.utime(path, (now - age, now - age))
+
+    mcp_server._prune_gui_spool(tmp_path, "*.mp4", mcp_server._GUI_VIDEO_TTL_SECONDS,
+                                mcp_server._GUI_VIDEO_MAX_FILES)
+
+    assert [p.name for p in tmp_path.glob("*.mp4")] == ["new.mp4"]
+
+
 # ---- default workdir (remote_set_remote_workdir) ----
 
 

@@ -1482,27 +1482,31 @@ def _gui_shot_dir() -> Path:
     return directory
 
 
-def _prune_gui_shots(directory: Path) -> None:
-    """Drop expired shots, then the oldest ones past the count cap."""
+def _prune_gui_spool(directory: Path, pattern: str, ttl: float, max_files: int) -> None:
+    """Drop expired files, then the oldest ones past the count cap."""
     now = time.time()
     fresh: list[tuple[float, Path]] = []
-    for path in directory.glob("*.png"):
+    for path in directory.glob(pattern):
         try:
             mtime = path.stat().st_mtime
         except OSError:
             continue
-        if now - mtime > _GUI_SHOT_TTL_SECONDS:
+        if now - mtime > ttl:
             try:
                 path.unlink()
             except OSError:
                 pass
             continue
         fresh.append((mtime, path))
-    for _, path in sorted(fresh)[: max(0, len(fresh) - _GUI_SHOT_MAX_FILES)]:
+    for _, path in sorted(fresh)[: max(0, len(fresh) - max_files)]:
         try:
             path.unlink()
         except OSError:
             pass
+
+
+def _prune_gui_shots(directory: Path) -> None:
+    _prune_gui_spool(directory, "*.png", _GUI_SHOT_TTL_SECONDS, _GUI_SHOT_MAX_FILES)
 
 
 def _spool_gui_shot(remote: str, look_id: str, b64: str) -> str:
@@ -1578,6 +1582,7 @@ def _gui_act(remote: str, profile: str, args: dict) -> dict:
         ("scroll_x", "scrollX"),
         ("scroll_y", "scrollY"),
         ("keys", "keys"),
+        ("keep_pressdown_ms", "keepPressdownMs"),
         ("path", "path"),
     ):
         if args.get(src_key) is not None:
@@ -1642,6 +1647,155 @@ def _gui_focus_window(remote: str, profile: str, args: dict) -> dict:
     return _gui_call(remote, "focusWindow", {"rootRef": root_ref})
 
 
+# ---------------------------------------------------------------------------
+# remote_gui_record_window_mp4
+# ---------------------------------------------------------------------------
+
+# Recordings are two orders of magnitude larger than screenshots, so they get
+# their own spool directory and a much smaller count cap: a minute of a small
+# window is tens of megabytes, and keeping 400 of them would fill a disk.
+_GUI_VIDEO_TTL_SECONDS = 6 * 60 * 60
+_GUI_VIDEO_MAX_FILES = 40
+_GUI_VIDEO_STREAM_THRESHOLD = 4 * 1024 * 1024
+_GUI_RECORD_MIN_MS = 1000
+_GUI_RECORD_MAX_MS = 600_000
+_GUI_RECORD_DEFAULT_MS = 10_000
+_GUI_RECORD_POLL_SECONDS = 2.0
+
+
+def _gui_video_dir() -> Path:
+    """Per-user spool directory for downloaded recordings."""
+    directory = Path(tempfile.gettempdir()) / "aimux-gui-videos"
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    return directory
+
+
+def _record_local_path(remote: str, recording_id: str, raw: object) -> Path:
+    if raw is not None:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("local_path must be a non-empty string when provided")
+        path = Path(raw.strip()).expanduser().resolve()
+        if not path.name or path.is_dir():
+            raise ValueError(f"local_path resolves to a directory: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+    directory = _gui_video_dir()
+    _prune_gui_spool(directory, "*.mp4", _GUI_VIDEO_TTL_SECONDS, _GUI_VIDEO_MAX_FILES)
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{remote}-{recording_id}")[:120] or "recording"
+    return directory / f"{stem}-{os.getpid()}.mp4"
+
+
+def _fetch_recording(remote: str, remote_path: str, local: Path) -> bytes:
+    """Pull the MP4 off the remote, streaming it when it is not small."""
+    size = 0
+    try:
+        stat = _client().file_stat(remote=remote, path=remote_path)
+        size = int(stat.get("size") or 0)
+    except Exception:
+        size = 0  # a stat failure is not fatal; read() either works or does not
+    if size > _GUI_VIDEO_STREAM_THRESHOLD:
+        raw = _client().file_read_stream(remote=remote, path=remote_path, total=size)
+    else:
+        raw = _file_bytes(_client().file_read(remote=remote, path=remote_path))
+    local.write_bytes(raw)
+    return raw
+
+
+def _gui_record_window_mp4(remote: str, profile: str, args: dict) -> dict:
+    root_ref = args.get("root_ref") or args.get("rootRef")
+    if not isinstance(root_ref, str) or not root_ref:
+        raise ValueError("root_ref is required (get one from remote_gui_list_windows)")
+    # The helper answers unsupported_platform too, but failing here keeps a
+    # non-Windows remote from paying for a round trip to be told so.
+    if not _remote_is_windows(profile):
+        raise RuntimeError(
+            "remote_gui_record_window_mp4 is only supported on Windows: it encodes through the "
+            f"Windows Media Foundation sink writer, and remote {remote!r} reports platform "
+            f"{_remote_platform or 'unknown'}"
+        )
+    duration_ms = args.get("duration_ms", args.get("durationMs"))
+    try:
+        duration_ms = int(duration_ms) if duration_ms is not None else _GUI_RECORD_DEFAULT_MS
+    except (TypeError, ValueError):
+        raise ValueError("duration_ms must be a number") from None
+    duration_ms = max(_GUI_RECORD_MIN_MS, min(_GUI_RECORD_MAX_MS, duration_ms))
+    audio = str(args.get("audio") or "system")
+    if audio not in ("system", "mic", "none"):
+        raise ValueError("audio must be one of: system, mic, none")
+    fps = args.get("fps")
+    try:
+        fps = int(fps) if fps is not None else 10
+    except (TypeError, ValueError):
+        raise ValueError("fps must be a number") from None
+
+    start = _gui_call(remote, "recordStart", {
+        "rootRef": root_ref,
+        "fps": fps,
+        "maxDurationMs": duration_ms,
+        "audio": audio,
+    })
+    recording_id = str(start.get("recordingId") or "")
+    if not recording_id:
+        raise RuntimeError(f"the recording helper did not return a recordingId: {start}")
+
+    # The tool blocks for the requested stretch, so poll instead of sleeping
+    # through it: a recording that ends by itself (window closed, or the
+    # max-duration cap) should not keep the caller waiting for the remainder.
+    deadline = time.monotonic() + duration_ms / 1000.0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_GUI_RECORD_POLL_SECONDS, remaining))
+        if time.monotonic() >= deadline:
+            break
+        try:
+            status = _gui_call(remote, "recordStatus", {"recordingId": recording_id})
+        except Exception:
+            break  # stop anyway; recordStop reports the real state
+        if not status.get("active"):
+            break
+
+    stop = _gui_call(remote, "recordStop", {"recordingId": recording_id})
+    error = str(stop.get("error") or "")
+    if error and not stop.get("bytes"):
+        raise RuntimeError(f"recording failed: {error}")
+    remote_path = str(stop.get("path") or start.get("path") or "")
+    if not remote_path:
+        raise RuntimeError(f"the recording helper did not report a file path: {stop}")
+
+    local_raw = args.get("local_path")
+    local = _record_local_path(remote, recording_id, local_raw)
+    if local.exists() and not args.get("overwrite"):
+        raise FileExistsError(f"local file already exists (pass overwrite=true to replace): {local}")
+    raw = _fetch_recording(remote, remote_path, local)
+
+    out = {
+        "video_path": str(local),
+        "size": len(raw),
+        "recording_id": recording_id,
+        "remote_path": remote_path,
+        "duration_ms": stop.get("durationMs"),
+        "width": stop.get("width") or start.get("width"),
+        "height": stop.get("height") or start.get("height"),
+        "fps": stop.get("fps") or start.get("fps"),
+        "audio": stop.get("audio") or start.get("audio"),
+        "has_audio": bool(stop.get("hasAudio", start.get("hasAudio"))),
+        "video_frames": stop.get("videoFrames"),
+        "audio_frames": stop.get("audioFrames"),
+    }
+    warning = stop.get("audioWarning") or start.get("audioWarning")
+    if warning:
+        out["audio_warning"] = warning
+    if error:
+        out["error"] = error
+    return out
+
+
 GUI_TOOLS = [
     {
         "name": "remote_gui_diagnostics",
@@ -1701,6 +1855,18 @@ GUI_TOOLS = [
                 "policy": {"type": "string", "enum": ["ax_only", "default", "foreground"], "default": "ax_only",
                             "description": "ax_only (default) never injects real input; foreground allows raw input on the user's desktop."},
                 "text": {"type": "string", "description": "Text for setText/typeText."},
+                "keys": {"type": "array", "items": {"type": "string"},
+                          "description": "Key names for keypress, pressed in order (e.g. ['F1'], ['ctrl','c']). "
+                                         "Raw input: needs policy=foreground."},
+                "keep_pressdown_ms": {"type": "number", "default": 0,
+                                       "description": "Hold the key down this many milliseconds before releasing it "
+                                                      "(keypress only, capped at 5000). 0 releases inside one input batch, "
+                                                      "which per-frame pollers such as games never observe — pass 50-150 "
+                                                      "there. Costs that much latency per press. Raw input: needs "
+                                                      "policy=foreground."},
+                "path": {"type": "array", "items": {"type": "object"},
+                          "description": "Waypoints for drag in image coordinates ([{x, y}, ...], at least two). "
+                                         "Raw input: needs policy=foreground."},
                 "scroll_x": {"type": "number", "description": "Horizontal scroll amount."},
                 "scroll_y": {"type": "number", "description": "Vertical scroll amount."},
                 "preserve_focus": {"type": "boolean", "description": "Raw-input acts: do not force the window to foreground first."},
@@ -1743,6 +1909,8 @@ GUI_TOOLS = [
                 "pid": {"type": "number"},
                 "look_id": {"type": "string"},
                 "scope_ref": {"type": "string"},
+                "scope_exact": {"type": "boolean", "default": False,
+                                 "description": "Match only the scope_ref element itself, not its descendants."},
             },
         },
     },
@@ -1756,6 +1924,36 @@ GUI_TOOLS = [
             "required": ["root_ref"],
         },
     },
+    {
+        "name": "remote_gui_record_window_mp4",
+        "description": "Record one window of the remote desktop to an MP4 (H.264 video, AAC audio) and copy it "
+        "back to this machine, returning the local path as video_path. Captured through the same path as "
+        "remote_gui_look, so occlusion does not matter, but the window must stay alive for the whole recording: "
+        "closing it ends the recording early. Windows-only — any other platform fails immediately without "
+        "recording anything. The call blocks for duration_ms and then returns; it is not a background recorder, "
+        "and while it blocks the other tools of this server wait. Sound is taken from the desktop speakers "
+        "(audio='system', the default), the microphone (audio='mic') or not recorded at all ('none'); if the "
+        "audio device cannot be opened the video is still recorded and audio_warning explains why."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root_ref": {"type": "string", "description": "Root handle from remote_gui_list_windows."},
+                "duration_ms": {"type": "number", "default": 10000,
+                                 "description": "How long to record, in ms (1000-600000). A recording that is "
+                                                "cut short reports a smaller duration_ms in the result."},
+                "fps": {"type": "number", "default": 10, "description": "Frames per second (1-30)."},
+                "audio": {"type": "string", "enum": ["system", "mic", "none"], "default": "system",
+                           "description": "Audio source: desktop sound, microphone, or none."},
+                "local_path": {"type": "string",
+                                "description": "Absolute local destination for the MP4. Default: a temp file under "
+                                               "the GUI spool directory, pruned automatically."},
+                "overwrite": {"type": "boolean", "default": False,
+                               "description": "Replace local_path when it already exists."},
+            },
+            "required": ["root_ref"],
+        },
+    },
 ]
 
 _GUI_TOOL_FUNCS = {
@@ -1766,6 +1964,7 @@ _GUI_TOOL_FUNCS = {
     "remote_gui_read_text": _gui_read_text,
     "remote_gui_wait_for": _gui_wait_for,
     "remote_gui_focus_window": _gui_focus_window,
+    "remote_gui_record_window_mp4": _gui_record_window_mp4,
 }
 
 _TOOL_FUNCS.update(_GUI_TOOL_FUNCS)

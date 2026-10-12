@@ -185,7 +185,7 @@ aimux mcp serve --remote=winbox
 
 # classic + computer-use tools (remote_gui_diagnostics, remote_gui_list_windows,
 # remote_gui_look, remote_gui_act, remote_gui_read_text, remote_gui_wait_for,
-# remote_gui_focus_window)
+# remote_gui_focus_window, remote_gui_record_window_mp4)
 aimux mcp serve --remote=winbox --toolset=classic-and-gui
 ```
 
@@ -193,8 +193,12 @@ GUI tools drive the remote's accessibility tree: `remote_gui_look` returns an
 element outline (with refs) plus a screenshot, and `remote_gui_act` acts on a
 ref semantically through UIA patterns. The default policy `ax_only` never
 injects real mouse/keyboard input; raw input requires explicitly passing
-`policy=foreground`. Serving `--toolset=classic-and-gui` against a remote
-without GUI fails fast with the reason.
+`policy=foreground`. `remote_gui_record_window_mp4` records one window to an
+MP4 and copies it back: H.264 video from the same capture path `look` uses,
+plus AAC sound from the desktop's speakers or the microphone, encoded by
+Windows itself (no FFmpeg) — Windows-only, other platforms fail immediately.
+Serving `--toolset=classic-and-gui` against a remote without GUI fails fast
+with the reason.
 
 The command is symmetric: run it on A too (naming B) to get the reverse
 direction. Ports are checked twice — the broker refuses a port the target

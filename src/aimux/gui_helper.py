@@ -30,8 +30,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-# The helper speaks protocol 4 (pi-computer-use windows-bridge v0.5.1).
-EXPECTED_PROTOCOL_VERSION = 4
+# The helper speaks protocol 5 (pi-computer-use windows-bridge v0.5.1 plus the
+# window-recording commands).
+EXPECTED_PROTOCOL_VERSION = 5
 DEFAULT_MANIFEST_URL = "https://serve.nutshellai.cn/publish/auto/aimux-helpers/manifest.json"
 
 # Per-command budget for one helper round trip, in seconds. waitFor gets the
@@ -50,6 +51,12 @@ REQUEST_TIMEOUTS: dict[str, float] = {
     "axWaitFor": 75.0,
     "focusWindow": 20.0,
     "openBrowserLocation": 30.0,
+    # recordStart answers once the first frame is encoded, but it opens the
+    # capture device first; recordStop waits for the encoder to finalize the
+    # MP4, which is why it gets the longest budget of the three.
+    "recordStart": 30.0,
+    "recordStop": 45.0,
+    "recordStatus": 15.0,
 }
 DEFAULT_REQUEST_TIMEOUT = 45.0
 

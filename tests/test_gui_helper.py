@@ -26,16 +26,16 @@ for line in sys.stdin:
     req = json.loads(line)
     cmd = req.get("cmd")
     if cmd == "diagnostics":
-        result = {"protocolVersion": 4, "os": "windows", "arch": "x86_64", "pid": os.getpid()}
-        resp = {"protocolVersion": 4, "id": req.get("id"), "ok": True, "result": result}
+        result = {"protocolVersion": 5, "os": "windows", "arch": "x86_64", "pid": os.getpid()}
+        resp = {"protocolVersion": 5, "id": req.get("id"), "ok": True, "result": result}
     elif cmd == "listRoots":
-        resp = {"protocolVersion": 4, "id": req.get("id"), "ok": True,
+        resp = {"protocolVersion": 5, "id": req.get("id"), "ok": True,
                 "result": {"roots": [{"rootRef": "@w1", "title": "mock", "pid": 1}]}}
     elif cmd == "boom":
-        resp = {"protocolVersion": 4, "id": req.get("id"), "ok": False,
+        resp = {"protocolVersion": 5, "id": req.get("id"), "ok": False,
                 "error": {"message": "mock failure", "code": "target_not_found"}}
     else:
-        resp = {"protocolVersion": 4, "id": req.get("id"), "ok": True, "result": {"echo": cmd}}
+        resp = {"protocolVersion": 5, "id": req.get("id"), "ok": True, "result": {"echo": cmd}}
     sys.stdout.write(json.dumps(resp) + "\n")
     sys.stdout.flush()
 """
@@ -69,7 +69,7 @@ def test_start_probe_and_roundtrip(mock_helper_path: Path) -> None:
     assert helper is not None
     try:
         assert status["available"] is True
-        assert status["protocolVersion"] == 4
+        assert status["protocolVersion"] == 5
         assert helper.alive()
         res = helper.request("listRoots", {})
         assert res["ok"] is True
@@ -113,14 +113,14 @@ def test_broker_registry_stores_and_lists_gui() -> None:
             "platform": "windows",
             "default_profile": "cmd",
             "profiles": [],
-            "gui": {"available": True, "protocolVersion": 4},
+            "gui": {"available": True, "protocolVersion": 5},
         }
     )
     state.register_client(
         {"identifier": "old-box", "platform": "windows", "default_profile": "cmd", "profiles": []}
     )
     rows = {row["name"]: row for row in state.list_remotes()}
-    assert rows["win-box"]["gui"] == {"available": True, "protocolVersion": 4}
+    assert rows["win-box"]["gui"] == {"available": True, "protocolVersion": 5}
     assert rows["old-box"]["gui"] is None  # old clients: absent, not False
 
 
