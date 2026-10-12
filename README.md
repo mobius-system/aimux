@@ -197,6 +197,8 @@ injects real mouse/keyboard input; raw input requires explicitly passing
 MP4 and copies it back: H.264 video from the same capture path `look` uses,
 plus AAC sound from the desktop's speakers or the microphone, encoded by
 Windows itself (no FFmpeg) — Windows-only, other platforms fail immediately.
+`record_fps` (1-30, default 10) and `max_dimension` (cap the longest side,
+aspect ratio kept) are the two knobs that decide how big the file gets.
 Serving `--toolset=classic-and-gui` against a remote without GUI fails fast
 with the reason.
 

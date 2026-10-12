@@ -1726,16 +1726,35 @@ def _gui_record_window_mp4(remote: str, profile: str, args: dict) -> dict:
     audio = str(args.get("audio") or "system")
     if audio not in ("system", "mic", "none"):
         raise ValueError("audio must be one of: system, mic, none")
-    fps = args.get("fps")
+    # `fps` is the name 0.3.70 shipped with and still works; `record_fps` is the
+    # one to use, so that a rate is not confused with the frames a screenshot
+    # has. The helper clamps the value into the range it will encode.
+    fps_raw = args.get("record_fps")
+    if fps_raw is None:
+        fps_raw = args.get("fps")
     try:
-        fps = int(fps) if fps is not None else 10
+        fps = int(fps_raw) if fps_raw is not None else 10
     except (TypeError, ValueError):
-        raise ValueError("fps must be a number") from None
+        raise ValueError("record_fps must be a number") from None
+    # 0 (or leaving it out) means "record at the window's own size"; the helper
+    # clamps anything else into 64-8192.
+    max_dimension_raw = args.get("max_dimension")
+    if max_dimension_raw is None:
+        max_dimension_raw = args.get("maxDimension")
+    max_dimension = 0
+    if max_dimension_raw is not None:
+        try:
+            max_dimension = int(max_dimension_raw)
+        except (TypeError, ValueError):
+            raise ValueError("max_dimension must be a number") from None
+        if max_dimension < 0:
+            raise ValueError("max_dimension cannot be negative")
 
     start = _gui_call(remote, "recordStart", {
         "rootRef": root_ref,
         "fps": fps,
         "maxDurationMs": duration_ms,
+        "maxDimension": max_dimension,
         "audio": audio,
     })
     recording_id = str(start.get("recordingId") or "")
@@ -1783,6 +1802,9 @@ def _gui_record_window_mp4(remote: str, profile: str, args: dict) -> dict:
         "width": stop.get("width") or start.get("width"),
         "height": stop.get("height") or start.get("height"),
         "fps": stop.get("fps") or start.get("fps"),
+        # What the helper actually applied, so a clamped cap is visible; null
+        # means the video was encoded at the window's own size.
+        "max_dimension": start.get("maxDimension"),
         "audio": stop.get("audio") or start.get("audio"),
         "has_audio": bool(stop.get("hasAudio", start.get("hasAudio"))),
         "video_frames": stop.get("videoFrames"),
@@ -1933,7 +1955,8 @@ GUI_TOOLS = [
         "recording anything. The call blocks for duration_ms and then returns; it is not a background recorder, "
         "and while it blocks the other tools of this server wait. Sound is taken from the desktop speakers "
         "(audio='system', the default), the microphone (audio='mic') or not recorded at all ('none'); if the "
-        "audio device cannot be opened the video is still recorded and audio_warning explains why."
+        "audio device cannot be opened the video is still recorded and audio_warning explains why. The size of "
+        "the file is controlled by record_fps and max_dimension."
         + _GUI_COMMON,
         "inputSchema": {
             "type": "object",
@@ -1942,9 +1965,15 @@ GUI_TOOLS = [
                 "duration_ms": {"type": "number", "default": 10000,
                                  "description": "How long to record, in ms (1000-600000). A recording that is "
                                                 "cut short reports a smaller duration_ms in the result."},
-                "fps": {"type": "number", "default": 10, "description": "Frames per second (1-30)."},
-                "audio": {"type": "string", "enum": ["system", "mic", "none"], "default": "system",
-                           "description": "Audio source: desktop sound, microphone, or none."},
+                "record_fps": {"type": "number", "default": 10,
+                                "description": "Recorded frames per second (1-30)."},
+                "fps": {"type": "number", "description": "Alias of record_fps, kept for older callers."},
+                "max_dimension": {"type": "number",
+                                   "description": "Cap the longest side of the video, in pixels (64-8192, "
+                                                  "aspect ratio kept, never enlarged). Handy for keeping the file "
+                                                  "small: a 3096x1944 window at 1280 encodes as 1280x802. The "
+                                                  "result's width/height are the encoded size. Omit (or 0) to "
+                                                  "encode at the window's own size."},
                 "local_path": {"type": "string",
                                 "description": "Absolute local destination for the MP4. Default: a temp file under "
                                                "the GUI spool directory, pruned automatically."},

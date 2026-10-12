@@ -32,7 +32,7 @@ from typing import Any
 
 # The helper speaks protocol 5 (pi-computer-use windows-bridge v0.5.1 plus the
 # window-recording commands).
-EXPECTED_PROTOCOL_VERSION = 5
+EXPECTED_PROTOCOL_VERSION = 6
 DEFAULT_MANIFEST_URL = "https://serve.nutshellai.cn/publish/auto/aimux-helpers/manifest.json"
 
 # Per-command budget for one helper round trip, in seconds. waitFor gets the

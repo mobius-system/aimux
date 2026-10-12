@@ -969,13 +969,45 @@ def test_gui_record_window_mp4_downloads_the_mp4_and_returns_a_local_path(monkey
     # recordStatus is polled until the deadline, so only the ends are fixed.
     assert names[0] == "recordStart" and names[-1] == "recordStop"
     assert set(names[1:-1]) <= {"recordStatus"}
-    assert calls[0][1] == {"rootRef": "@w1", "fps": 10, "maxDurationMs": 1000, "audio": "system"}
+    assert calls[0][1] == {"rootRef": "@w1", "fps": 10, "maxDurationMs": 1000,
+                           "maxDimension": 0, "audio": "system"}
     assert out["video_path"].startswith(str(tmp_path)) and out["video_path"].endswith(".mp4")
     with open(out["video_path"], "rb") as fh:
         assert fh.read() == client.payload
     assert out["remote_path"] == "C:\\Temp\\a.mp4" and out["recording_id"] == "rec_1"
     assert out["has_audio"] is True and out["video_frames"] == 10 and out["size"] == len(client.payload)
+    assert out["max_dimension"] is None  # no cap: encoded at the window's own size
     assert "audio_warning" not in out and client.streamed is False
+
+
+def test_gui_record_window_mp4_passes_record_fps_and_the_size_cap(monkeypatch, tmp_path):
+    _, calls = _record_calls(
+        monkeypatch, status_active=True,
+        start={"recordingId": "rec_1", "path": "C:\\Temp\\a.mp4", "width": 1280, "height": 802,
+               "fps": 15, "maxDimension": 1280, "audio": "none", "hasAudio": False},
+        stop={"recordingId": "rec_1", "path": "C:\\Temp\\a.mp4", "bytes": 20, "durationMs": 1000,
+              "width": 1280, "height": 802, "fps": 15, "audio": "none", "hasAudio": False,
+              "videoFrames": 15, "stopped": True})
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    out = mcp_server._gui_record_window_mp4(
+        "box", "cmd", {"root_ref": "@w1", "duration_ms": 1000, "record_fps": 15,
+                       "max_dimension": 1280, "audio": "none"})
+
+    assert calls[0][1]["fps"] == 15 and calls[0][1]["maxDimension"] == 1280
+    assert (out["width"], out["height"]) == (1280, 802) and out["fps"] == 15
+    # The helper's own answer, so a cap it clamped is what the caller sees.
+    assert out["max_dimension"] == 1280
+
+
+def test_gui_record_window_mp4_still_accepts_the_older_fps_name(monkeypatch, tmp_path):
+    _, calls = _record_calls(monkeypatch, status_active=True)
+    monkeypatch.setattr(mcp_server, "_gui_video_dir", lambda: tmp_path)
+
+    mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "duration_ms": 1000, "fps": 20})
+
+    assert calls[0][1]["fps"] == 20
+    assert calls[0][1]["maxDimension"] == 0
 
 
 def test_gui_record_window_mp4_streams_a_large_recording(monkeypatch, tmp_path):
@@ -1041,6 +1073,12 @@ def test_gui_record_window_mp4_validates_its_arguments(monkeypatch, tmp_path):
         mcp_server._gui_record_window_mp4("box", "cmd", {})
     with pytest.raises(ValueError, match="audio must be one of"):
         mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "audio": "loopback"})
+    with pytest.raises(ValueError, match="record_fps must be a number"):
+        mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "record_fps": "fast"})
+    with pytest.raises(ValueError, match="max_dimension must be a number"):
+        mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "max_dimension": "big"})
+    with pytest.raises(ValueError, match="max_dimension cannot be negative"):
+        mcp_server._gui_record_window_mp4("box", "cmd", {"root_ref": "@w1", "max_dimension": -5})
 
 
 def test_gui_record_window_mp4_honours_an_explicit_local_path(monkeypatch, tmp_path):
