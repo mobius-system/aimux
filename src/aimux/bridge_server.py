@@ -886,7 +886,9 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path == "/api/health":
                     self._require_auth()
-                    self._json(HTTPStatus.OK, {"ok": True})
+                    # version: 客户端据此把自己的 aimux 对齐到 broker 跑的版本
+                    # （新增字段，老客户端忽略即可）。
+                    self._json(HTTPStatus.OK, {"ok": True, "version": __version__})
                     return
                 if parsed.path == "/api/remotes":
                     self._require_auth()

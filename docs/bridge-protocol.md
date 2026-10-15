@@ -58,7 +58,10 @@
 ### 2.1 健康与查询
 
 #### `GET /api/health`
-- 响应：`200 {"ok": true}`
+- 响应：`200 {"ok": true, "version": "0.3.71"}`
+- `version` = broker 自己跑的 aimux 版本。客户端（TUI/桌面端）在连接前读它，
+  不一致就把本地 aimux 装成同一个版本（升/降都算）。老 broker 没有该字段 →
+  客户端视为"版本未知"，什么都不做，绝不猜。
 
 #### `GET /api/remotes`
 - 响应：
