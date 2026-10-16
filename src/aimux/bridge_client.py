@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+import getpass
 import hashlib
 import http.client
 import json
@@ -790,6 +791,25 @@ def build_adapters(silent_shell: bool = False, silent_shell_v2: bool = False) ->
     return adapters, "posix-pty"
 
 
+# Environment variables that change what a command means: which shell is the
+# login shell, which one cmd.exe spawns for itself, whether an MSYS shell is in
+# play (MSYSTEM), and the locale, which decides how output is encoded.
+_SYS_ENV_KEYS = ("SHELL", "COMSPEC", "MSYSTEM", "PWD", "LANG", "LC_ALL", "PATHEXT")
+
+
+def _os_token() -> str:
+    """Lowercase OS token (windows/linux/darwin) — one spelling everywhere."""
+    return platform.system().lower() or sys.platform
+
+
+def _safe_user() -> str:
+    """Login name, or "" where the system cannot resolve one (bare containers)."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return ""
+
+
 class ReverseClientRuntime:
     def __init__(
         self,
@@ -867,13 +887,54 @@ class ReverseClientRuntime:
         return {
             "identifier": self.identifier,
             "replace": replace,
-            "platform": platform.system().lower() or sys.platform,
+            "platform": _os_token(),
             "default_profile": self.default_profile,
             "profiles": [adapter.profile_info() for adapter in self.adapters.values()],
             "version": __version__,
             "client_id": self.client_id,
             "allow_http_ports": sorted(self.allow_http_ports),
             "gui": self.gui_status,
+        }
+
+    def system_info(self) -> dict[str, Any]:
+        """Describe this machine the way someone who cannot see it needs to hear.
+
+        The agent on the other side of the bridge sees a black box: it cannot
+        tell whether its commands land on Windows or Linux, which shell runs
+        them, or which directory they start in — and path syntax, quoting, and
+        which tools exist all follow from those three answers. ``remote_ping``
+        asks for this report; the registration payload stays small, so this is
+        gathered on demand instead of on every reconnect.
+        """
+        shells: list[dict[str, Any]] = []
+        for adapter in self.adapters.values():
+            entry: dict[str, Any] = {"name": adapter.name, "available": True}
+            command = getattr(adapter, "command", None)
+            if command:
+                entry["command"] = command
+            shells.append(entry)
+        return {
+            "os": _os_token(),
+            "os_name": platform.system() or sys.platform,
+            "os_release": platform.release(),
+            "os_version": platform.version(),
+            "os_detail": platform.platform(),
+            "arch": platform.machine(),
+            "hostname": socket.gethostname(),
+            "user": _safe_user(),
+            "home": str(Path.home()),
+            "cwd": os.getcwd(),
+            "path_style": "windows" if os.name == "nt" else "posix",
+            "path_separator": os.sep,
+            "default_profile": self.default_profile,
+            "shells": shells,
+            "env": {key: os.environ[key] for key in _SYS_ENV_KEYS if os.environ.get(key)},
+            "encoding": locale.getpreferredencoding(False),
+            "python": platform.python_version(),
+            "aimux_version": __version__,
+            "gui": self.gui_status,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "timezone": time.tzname[0] if time.tzname else "",
         }
 
     def handle(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -905,6 +966,8 @@ class ReverseClientRuntime:
             return self._file_archive(payload)
         if message_type == "file.apply_archive":
             return self._file_apply_archive(payload)
+        if message_type == "sys.info":
+            return self.system_info()
         if message_type == "gui.request":
             return self._gui_request(payload)
         raise BridgeError(f"unsupported bridge message type {message_type!r}")

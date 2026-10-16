@@ -1,5 +1,6 @@
 """Unit tests for aimux.mcp_server (stdio MCP server, codex-facing tools)."""
 import base64
+import json
 import os
 import re
 import time
@@ -38,13 +39,54 @@ class FakeClient:
     def __init__(self):
         self.files: dict[str, bytes] = {}
         self.health_called = False
+        self.system_info_called = False
+        # Flip to make the live system report fail, the way an old or
+        # disconnected reverse client does.
+        self.system_info_error = ""
 
     def health(self, *, timeout=2.0):
         self.health_called = True
-        return {"ok": True}
+        return {"ok": True, "version": "0.3.72"}
 
     def get_remote(self, name, *, timeout=2.0):
-        return {"name": name, "default_profile": "posix-pty", "status": "connected"}
+        return {
+            "name": name,
+            "default_profile": "posix-pty",
+            "status": "connected",
+            "platform": "windows",
+            "client_version": "0.3.70",
+            "profiles": [{"name": "cmd", "available": True}],
+        }
+
+    def system_info(self, *, remote, timeout=15.0):
+        self.system_info_called = True
+        if self.system_info_error:
+            raise RuntimeError(self.system_info_error)
+        return {
+            "os": "darwin",
+            "os_name": "Darwin",
+            "os_release": "23.6.0",
+            "os_version": "Darwin Kernel Version 23.6.0",
+            "os_detail": "macOS-14.6-arm64-arm-64bit",
+            "arch": "arm64",
+            "hostname": "macbox",
+            "user": "ada",
+            "home": "/Users/ada",
+            "cwd": "/Users/ada/work",
+            "path_style": "posix",
+            "path_separator": "/",
+            "default_profile": "mac-pty",
+            "shells": [{"name": "mac-pty", "available": True}],
+            "env": {"SHELL": "/bin/zsh"},
+            "encoding": "UTF-8",
+            "python": "3.12.7",
+            "aimux_version": "0.3.72",
+            "gui": {"available": False, "error": "gui not requested"},
+            "time": "2026-10-16T10:00:00+0800",
+            "timezone": "CST",
+            # Not on the reported whitelist: the ping must drop it.
+            "internal_bookkeeping": "drop me",
+        }
 
     def file_read(self, *, remote, path, timeout=180.0):
         if path not in self.files:
@@ -168,8 +210,65 @@ def test_view_image_jpeg_and_detail(fake):
 
 
 def test_ping(fake):
-    assert mcp_server._remote_ping("r", "p", {}) == {"ok": True}
-    assert fake.health_called
+    r = mcp_server._remote_ping("r", "p", {})
+    assert r["ok"] is True and fake.health_called and fake.system_info_called
+    assert r["broker"] == {"ok": True, "version": "0.3.72"}
+    assert r["live"] is True
+    assert r["system"]["os"] == "darwin"
+    assert r["system"]["hostname"] == "macbox"
+    assert r["system"]["user"] == "ada"
+    # The whitelist drops whatever else the client happened to send.
+    assert "internal_bookkeeping" not in r["system"]
+    assert r["session"]["profile"] == "p"
+    assert r["summary"].startswith("remote r: Darwin 23.6.0 arm64")
+    assert "macbox" in r["summary"]
+
+
+def test_ping_reports_workdir_with_its_source(fake, monkeypatch):
+    monkeypatch.setattr(mcp_server, "_effective_workdir", lambda args, remote: ("/srv/app", "session_default"))
+    r = mcp_server._remote_ping("r", "p", {})
+    assert r["session"]["workdir"] == "/srv/app"
+    assert r["session"]["workdir_source"] == "session_default"
+    assert "/srv/app" in r["summary"]
+    assert "notes" not in r
+
+
+def test_ping_tells_windows_shell_syntax(fake, monkeypatch):
+    # run_stdio() learns the platform from the registration; unit tests set it.
+    monkeypatch.setattr(mcp_server, "_remote_platform", "windows")
+    r = mcp_server._remote_ping("r", "mingw64", {})
+    assert r["session"]["remote_is_windows"] is True
+    assert r["session"]["shell_family"] == "posix"
+    assert "Git-Bash" in r["session"]["shell_syntax"]
+
+
+def test_ping_notes_missing_workdir(fake):
+    r = mcp_server._remote_ping("r", "p", {})
+    assert r["session"]["workdir"] is None
+    assert r["session"]["workdir_source"] is None
+    # Where commands start is only knowable from the live report.
+    assert "/Users/ada/work" in r["notes"][0]
+
+
+def test_ping_falls_back_to_the_registry(fake, monkeypatch):
+    """An old or disconnected client still gets described, not left blank."""
+    fake.system_info_error = "BridgeError: unsupported bridge message type 'sys.info'"
+    r = mcp_server._remote_ping("r", "p", {})
+    assert r["ok"] is True
+    assert r["live"] is False
+    assert r["system"] == {"os": "windows", "aimux_version": "0.3.70"}
+    assert r["shells"] == [{"name": "cmd", "available": True}]
+    assert "unsupported bridge message type" in r["notes"][0]
+    assert "did not answer a live probe" in r["summary"]
+
+
+def test_ping_reports_broker_failure(monkeypatch, fake):
+    def boom(*, timeout=2.0):
+        raise OSError("connection refused")
+    monkeypatch.setattr(fake, "health", boom)
+    r = mcp_server._remote_ping("r", "p", {})
+    assert r["ok"] is False
+    assert "connection refused" in r["broker"]["error"]
 
 
 def test_write_stdin_control_key_is_raw(monkeypatch):
@@ -288,7 +387,10 @@ def test_jsonrpc_tools_call_ping(monkeypatch, fake):
         "jsonrpc": "2.0", "id": 3, "method": "tools/call",
         "params": {"name": "remote_ping", "arguments": {}},
     })
-    assert sent[0]["result"]["content"][0]["text"] == '{"ok": true}'
+    payload = json.loads(sent[0]["result"]["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["system"]["os"] == "darwin"
+    assert payload["summary"].startswith("remote rem:")
 
 
 def test_jsonrpc_unknown_tool(monkeypatch):

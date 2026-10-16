@@ -391,6 +391,22 @@ class BridgeControlClient:
             timeout=timeout + 10.0,
         )
 
+    def system_info(self, *, remote: str, timeout: float = 15.0) -> dict[str, Any]:
+        """Ask a reverse client to describe its own machine.
+
+        Answers with the remote's OS, the shells it offers, its home/cwd and
+        locale — what a caller needs to build commands that fit that platform.
+        A client older than this message type answers with an error, so callers
+        must treat the call as best-effort.
+        """
+        return _request_json(
+            "POST",
+            f"{self.runtime.url}/api/remotes/{_quote(remote)}/system-info",
+            self.runtime.token,
+            {},
+            timeout=timeout,
+        )
+
     def file_stat(self, *, remote: str, path: str, timeout: float = 60.0) -> dict[str, Any]:
         return _request_json(
             "POST",

@@ -120,6 +120,17 @@ One line per command at `INFO` on stderr; the bridge's own polling
 (`file.stat` every 0.3s, `session.capture` every 5s) is `DEBUG`, so a long
 command stays quiet. Set `AIMUX_LOG_LEVEL=DEBUG` to see every command it runs.
 
+## Driving a remote through MCP
+
+`aimux mcp serve --remote <device>` exposes one remote as MCP tools
+(`remote_exec_command`, `remote_write_stdin`, `remote_apply_patch`,
+`remote_view_image`, `remote_ping`, ...). Start with **`remote_ping`**: it is
+not just a health check — it reports where your commands actually land. You get
+the remote's OS and architecture, the shell profile they run in with the syntax
+it expects, the directory they start from, and the encoding its output comes
+back in. Write commands for that answer instead of probing with `hostname` /
+`uname`, and check it again after the user switches devices.
+
 ## Computer use (Windows x64)
 
 If the remote was connected with `aimux reverse connect --enable-gui`, you can

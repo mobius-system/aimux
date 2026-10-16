@@ -7,7 +7,7 @@ Codex-facing tools (7, aligned with codex native tool specs):
   remote_apply_patch   Apply a patch (FREEFORM input).
   remote_view_image    Return a remote image file as a data URL.
   remote_download_file Download a remote file to the local filesystem.
-  remote_ping          Health check.
+  remote_ping          Report the remote's OS, shell, working directory, and link health.
 
 Transport: newline-delimited JSON-RPC 2.0 over stdin/stdout (MCP stdio).
 Zero external dependencies — Python standard library only. The server binds
@@ -992,8 +992,125 @@ def _remote_download_file(remote: str, profile: str, args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# What is worth telling the agent about the remote machine. The reverse client
+# reports more than this; the rest is bookkeeping it has no use for, and every
+# extra field is context spent on every ping.
+_PING_SYS_FIELDS = (
+    "os", "os_name", "os_release", "os_version", "os_detail", "arch",
+    "hostname", "user", "home", "cwd", "path_style", "path_separator",
+    "encoding", "python", "aimux_version", "time", "timezone",
+)
+
+
+def _shell_syntax(profile: str, windows: bool) -> str:
+    """How a command must be written for the bound shell, in one phrase."""
+    family = _shell_family(profile)
+    if family == "cmd":
+        return "cmd.exe syntax: backslash paths, %VAR%, '&' to chain"
+    if family == "powershell":
+        return "PowerShell syntax: backslash paths, $env:VAR, ';' to chain"
+    if windows:
+        return "POSIX syntax in an MSYS/Git-Bash shell, but Windows-visible paths"
+    return "POSIX syntax: forward-slash paths, $VAR, ';' to chain"
+
+
+def _ping_summary(remote: str, system: dict, session: dict, live: bool) -> str:
+    """The one line that answers 'where am I' without reading the rest."""
+    head = " ".join(
+        str(part) for part in (
+            system.get("os_name") or system.get("os") or "unknown OS",
+            system.get("os_release"),
+            system.get("arch"),
+        ) if part
+    )
+    clauses = [head]
+    who = "@".join(str(part) for part in (system.get("user"), system.get("hostname")) if part)
+    if who:
+        clauses.append(who)
+    clauses.append(f"commands run in the {session['profile']!r} shell — {session['shell_syntax']}")
+    start = session.get("workdir") or system.get("cwd")
+    if start:
+        clauses.append(f"they start in {start}")
+    if not live:
+        clauses.append("(from the bridge registry; the remote did not answer a live probe)")
+    return f"remote {remote}: " + "; ".join(clauses)
+
+
 def _remote_ping(remote: str, profile: str, args: dict) -> dict:
-    return _client().health()
+    """Report the machine this server drives — not just that it answers.
+
+    The agent sees a bridge, not a computer, so until now it had to run
+    ``hostname``/``uname`` to find out where its commands land. This reports
+    what command syntax depends on: the remote's OS, the shell those commands
+    run in, the directory they start from, the encoding they print in. The
+    broker's own health comes along, so one call answers both "is the link
+    alive" and "what is on the other end of it".
+
+    The live report is best-effort: a client built before this request existed,
+    or one that just went away, still gets described from the bridge registry.
+    """
+    c = _client()
+    report: dict[str, Any] = {"ok": True, "remote": remote}
+
+    try:
+        report["broker"] = c.health(timeout=5.0)
+    except Exception as e:
+        report["ok"] = False
+        report["broker"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # Read the registry row even when the live probe works: it is what a client
+    # that cannot answer can still be described by.
+    try:
+        registered = c.get_remote(remote) or {}
+    except Exception:
+        registered = {}
+
+    notes: list[str] = []
+    live: dict[str, Any] = {}
+    try:
+        live = c.system_info(remote=remote, timeout=15.0)
+    except Exception as e:
+        notes.append(
+            f"the remote did not answer the system-info request ({type(e).__name__}: {e}); "
+            "everything below comes from the bridge registry, so the shell, the paths and the "
+            "working directory are unknown (the client needs a recent aimux and a live connection)"
+        )
+
+    system: dict[str, Any] = {}
+    for key in _PING_SYS_FIELDS:
+        value = live.get(key)
+        if value not in (None, ""):
+            system[key] = value
+    if not system.get("os") and registered.get("platform"):
+        system["os"] = registered["platform"]
+    if not system.get("aimux_version") and registered.get("client_version"):
+        system["aimux_version"] = registered["client_version"]
+
+    workdir, workdir_source = _effective_workdir({}, remote)
+    windows = _remote_is_windows(profile)
+    session = {
+        "profile": profile,
+        "shell_family": _shell_family(profile),
+        "remote_is_windows": windows,
+        "shell_syntax": _shell_syntax(profile, windows),
+        "workdir": workdir,
+        "workdir_source": workdir_source if workdir else None,
+        "toolset": _ACTIVE_TOOLSET,
+    }
+    if workdir is None:
+        notes.append(
+            "no workdir default is set for this session, so commands start in "
+            f"{system.get('cwd') or 'whatever directory the reverse-connect client was started in'}"
+        )
+
+    report["live"] = bool(live)
+    report["system"] = system
+    report["shells"] = live.get("shells") or registered.get("profiles") or []
+    report["session"] = session
+    report["summary"] = _ping_summary(remote, system, session, bool(live))
+    if notes:
+        report["notes"] = notes
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -1373,7 +1490,12 @@ CLASSIC_TOOLS = [
     },
     {
         "name": "remote_ping",
-        "description": "Health check.",
+        "description": (
+            "Report where your commands actually run: the remote machine's OS and architecture, "
+            "the shell they run in and the syntax it expects, the working directory they start "
+            "from, and the link's health. Call it before writing platform-specific commands "
+            "(paths, quoting, which tools exist) instead of probing with `hostname`/`uname`."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]

@@ -88,7 +88,7 @@
 ```
 
 - `allow_http_ports` — local ports this client permits other clients to reach
-  (§2.6). Empty array means the client cannot be connected to at all. Show it
+  (§2.7). Empty array means the client cannot be connected to at all. Show it
   in `remote ls`-style output: it is the whole security story for the tunnel.
 
 #### `GET /api/sessions`
@@ -355,7 +355,47 @@ endpoint 完成目标握手后进入双向流转发。
 一个巨大的 POST 会让接收侧在整个上传期间一个字节都看不到——表现为"进度条出现前卡十几秒"，
 而且文件越大卡得越久；分片同时还避开了代理默认的请求体大小上限。
 
-### 2.6 客户端到客户端 HTTP 端口隧道
+### 2.6 Remote 自述（不绑定 session，只走 remote）
+
+agent 只看见"命令发到某个 remote 去了"，看不见对面那台机器：是 Windows 还是 Linux、命令由哪个
+shell 跑、从哪个目录开始。路径写法、引号规则、有没有某个工具，全都取决于这三个答案，所以让 remote
+自己把它们报出来。`remote_ping` 走的就是这个端点。
+
+#### `POST /api/remotes/{remote}/system-info`
+- 请求：`{}`（可选 `timeout`，秒，clamp 到 1–60，默认 15）
+- 转发：broker 向该 remote 下发 `sys.info`（payload `{}`），remote 用 `POST /client/result` 回 `payload`
+- 响应（200）：
+```json
+{
+  "os": "windows",
+  "os_name": "Windows", "os_release": "10", "os_version": "10.0.19045",
+  "os_detail": "Windows-10-10.0.19045-SP0",
+  "arch": "AMD64",
+  "hostname": "winbox", "user": "alice",
+  "home": "C:\\Users\\alice", "cwd": "C:\\work",
+  "path_style": "windows", "path_separator": "\\",
+  "default_profile": "cmd",
+  "shells": [{"name": "cmd", "command": "cmd.exe /D /Q", "available": true}],
+  "env": {"COMSPEC": "C:\\WINDOWS\\system32\\cmd.exe"},
+  "encoding": "cp936", "python": "3.12.7", "aimux_version": "0.3.73",
+  "gui": {"available": false, "error": "gui not requested"},
+  "time": "2026-10-16T13:00:00+0800", "timezone": "China Standard Time"
+}
+```
+- 字段含义（都是 remote 自己视角，不是 broker 的）：
+  - `os`：`windows | linux | darwin`，与 `POST /client/register` 的 `platform` 同一套拼写。
+  - `path_style`：`windows` 表示路径是 `C:\...` 形状（MSYS shell 里也可写 `C:/...` / `/c/...`）；
+    `posix` 表示 `/home/...`。
+  - `shells`：该机器**可用的 shell 全套**（就是它的 profile 列表，多带 `command`：实际启动的命令行）。
+  - `cwd`：reverse client 进程的工作目录——相对路径的文件操作落在它下面。
+  - `encoding`：命令输出按这个编码读出来（中文 Windows 常是 `cp936`）。
+- **兼容性**：这是**可选能力**，两端都要按"可能没有"来写。
+  - 老 client（不认识 `sys.info` 消息）→ 回 `{"ok": false, "error": {"kind": "bad_request", ...}}`，
+    broker 原样翻成 400；调用方必须降级，**不能当作连接故障**。
+  - 老 broker（没有该端点）→ `404 {"kind": "not_found"}`；调用方退回到 `GET /api/remotes`
+    里已有的 `platform` / `profiles` / `client_version`。
+
+### 2.7 客户端到客户端 HTTP 端口隧道
 
 让**一个客户端**通过 broker 访问**另一个客户端的 loopback 端口**。
 
@@ -486,8 +526,8 @@ data: {"error": {"kind": "remote_disconnected", "message": "...", "code": 2}}
 | `timeout` | 504 | 124 | 客户端响应超时 |
 | `too_large` | 400 | 1 | 文件超限 |
 | `client_error` | 500 | 1 | 客户端崩了 |
-| `port_not_allowed` | 403 | 1 | 目标端口不在 `--allow-http-ports` 里（§2.6） |
-| `port_unreachable` | 502 | 2 | 目标客户端拨不通自己的 `127.0.0.1:<port>`（§2.6） |
+| `port_not_allowed` | 403 | 1 | 目标端口不在 `--allow-http-ports` 里（§2.7） |
+| `port_unreachable` | 502 | 2 | 目标客户端拨不通自己的 `127.0.0.1:<port>`（§2.7） |
 
 `code` 字段会作为 CLI 的退出码透传，所以必须准确。
 
@@ -564,7 +604,14 @@ CLI 用同一个 `aimux remote ls` 同时显示 SSH 和 bridge 远程。冲突�
 - 新 × 新：`slice_size` 分片上传 → 字节精确，且**首字节在几十毫秒内到达**（不是整个文件传完之后）
 - 乱序 `seq` → 400，且流未被污染
 
-端口隧道（§2.6）另需跑通：
+Remote 自述（§2.6）另需跑通：
+
+- 新 remote × 新 broker：`POST /api/remotes/X/system-info` 返回的 `os` 与注册时的 `platform` 一致，
+  `shells[].name` 与 `/api/remotes` 里的 `profiles[].name` 一致
+- 老 remote × 新 broker：同一端点返回 400（不是 500、不挂死），且不影响该 remote 的其他操作
+- 新 remote × 老 broker：端点 404，调用方回退到 `/api/remotes` 的 `platform` 字段
+
+端口隧道（§2.7）另需跑通：
 
 10. 目标客户端带 `--allow-http-ports=<P>` 注册 → `/api/remotes` 里能看到 `allow_http_ports: [P]`
 11. `POST /api/http-ports/open` 指向 `P` → 目标收到 `http_port.open` 并拨号成功

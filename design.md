@@ -1093,3 +1093,36 @@ reverse client owns its whole lifecycle.
   patterns only); raw input needs an explicit `policy=foreground`.
 - **Visibility:** `aimux remote ls` gains a `GUI` column (`on`/`off`/`-` for
   clients that never spoke about GUI).
+
+## Remote self-description (`remote_ping`) — 0.3.73
+
+**Problem:** an agent driving a bridge remote sees a black box. It cannot tell
+whether its commands land on Windows or Linux, which shell runs them, or which
+directory they start in — and path syntax, quoting, and which tools exist all
+follow from those three answers. The workaround was to probe with `hostname` /
+`uname` on every device switch, which is a round trip the agent has to know to
+spend, and which fails outright when the command that would answer it is itself
+platform-specific.
+
+- **Shape:** one new optional bridge message, `sys.info` `{}` -> the client's
+  own report, routed like any other per-remote command
+  (`POST /api/remotes/<remote>/system-info`, timeout clamped to 1-60s). The
+  report is gathered on demand rather than on every reconnect: it is bulky
+  (shell table, env, locale) and the registration payload is sent on every SSE
+  re-attach.
+- **Content:** OS identity and architecture, the full shell table with the
+  command each profile actually starts, `home`/`cwd`, `path_style`, output
+  encoding, python and aimux versions, GUI capability. A whitelist in the MCP
+  layer decides what reaches the model, so the client can grow fields without
+  spending agent context on them.
+- **MCP:** `remote_ping` answers with the broker's health *and* the remote's
+  description, plus a one-line `summary` the model can act on, and a
+  `session` block for what the server itself will do (bound profile, shell
+  family and syntax, effective workdir and where it came from). It stays a
+  ping: one call answers "is the link alive" and "what is on the other end".
+- **Compatibility:** best-effort in both directions. A client that predates
+  `sys.info` answers `bad_request`; an old broker has no such route. Either
+  way the ping degrades to the registry row (`platform`, `profiles`,
+  `client_version`) and says so in `notes` + `live: false` rather than failing
+  the call — an agent asking where it is must never be answered with an error
+  it cannot act on.

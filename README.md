@@ -180,7 +180,7 @@ rewritten in between.
 6. Expose a remote to an MCP agent — optionally with computer use.
 
 ```bash
-# classic tools only (remote_exec_command, remote_write_stdin, ...)
+# classic tools only (remote_exec_command, remote_write_stdin, remote_ping, ...)
 aimux mcp serve --remote=winbox
 
 # classic + computer-use tools (remote_gui_diagnostics, remote_gui_list_windows,
@@ -201,6 +201,13 @@ Windows itself (no FFmpeg) — Windows-only, other platforms fail immediately.
 aspect ratio kept) are the two knobs that decide how big the file gets.
 Serving `--toolset=classic-and-gui` against a remote without GUI fails fast
 with the reason.
+
+Start an MCP session with `remote_ping`: alongside the link's health it reports
+where your commands land — the remote's OS and architecture, the shell profile
+they run in with the syntax it expects, the directory they start from, and the
+encoding their output comes back in — so an agent can write Windows- or
+Linux-shaped commands without probing for the answer first. A remote whose
+aimux predates the request still answers from what the broker registry knows.
 
 The command is symmetric: run it on A too (naming B) to get the reverse
 direction. Ports are checked twice — the broker refuses a port the target

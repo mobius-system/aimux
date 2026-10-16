@@ -1024,6 +1024,14 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                     timeout = min(max(float(payload.pop("timeout", 45) or 45), 1.0), 180.0)
                     self._json(HTTPStatus.OK, state.submit(remote, "gui.request", payload, timeout))
                     return
+                if len(parts) == 4 and parts[:2] == ["api", "remotes"] and parts[3] == "system-info":
+                    self._require_auth()
+                    remote = parts[2]
+                    # Clamped: the call blocks on the remote's answer, so a
+                    # caller-supplied timeout must not pin a handler thread.
+                    timeout = min(max(float(payload.pop("timeout", 15) or 15), 1.0), 60.0)
+                    self._json(HTTPStatus.OK, state.submit(remote, "sys.info", {}, timeout))
+                    return
                 if len(parts) == 5 and parts[:2] == ["api", "remotes"] and parts[3] == "files":
                     self._require_auth()
                     remote, action = parts[2], parts[4]

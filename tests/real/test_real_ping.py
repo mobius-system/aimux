@@ -6,10 +6,38 @@ import time
 
 import pytest
 
+from aimux import __version__
+
 
 def test_ping_returns_ok(mcp):
     res = mcp.call("remote_ping")
     assert res.get("ok") is True, res
+
+
+def test_ping_describes_the_remote_machine(mcp):
+    """The whole point: the agent learns where its commands land."""
+    res = mcp.call("remote_ping")
+    assert res["live"] is True, res
+    system = res["system"]
+    # This container is Linux; the reverse client reports its own kernel.
+    assert system["os"] == "linux", system
+    assert system["path_style"] == "posix"
+    assert system["home"] and system["cwd"] and system["user"]
+    assert system["python"] and system["aimux_version"]
+    # Source-tree version: the container installs this checkout editable.
+    assert system["aimux_version"] == __version__, system
+    # The bound profile is the one the registration advertised.
+    assert res["session"]["profile"] == "posix-pty"
+    assert res["session"]["shell_family"] == "posix"
+    assert [s["name"] for s in res["shells"]] == ["posix-pty"]
+
+
+def test_ping_summary_is_a_sentence_about_the_remote(mcp):
+    res = mcp.call("remote_ping")
+    summary = res["summary"]
+    assert summary.startswith(f"remote {res['remote']}: Linux")
+    assert "posix-pty" in summary
+    assert "POSIX syntax" in summary
 
 
 def test_ping_via_jsonrpc_content_is_json(mcp):
@@ -21,7 +49,7 @@ def test_ping_via_jsonrpc_content_is_json(mcp):
     })
     r = mcp._recv()
     text = r["result"]["content"][0]["text"]
-    assert json.loads(text) == {"ok": True}
+    assert json.loads(text)["ok"] is True
 
 
 def test_tools_list_classic_tools_in_order(mcp):
