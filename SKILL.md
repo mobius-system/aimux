@@ -131,6 +131,11 @@ it expects, the directory they start from, and the encoding its output comes
 back in. Write commands for that answer instead of probing with `hostname` /
 `uname`, and check it again after the user switches devices.
 
+**Editing rule:** all file changes go through `remote_apply_patch`, never
+`remote_exec_command` — including redirection, heredocs, `python -c`, `tee`, and
+base64/gzip/hex payloads. Long content is not an exception: split the hunks or
+use `Delete File` + `Add File`.
+
 ## Computer use (Windows x64)
 
 If the remote was connected with `aimux reverse connect --enable-gui`, you can

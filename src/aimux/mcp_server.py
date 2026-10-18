@@ -1,7 +1,7 @@
 """aimux MCP server — expose one bridge remote as MCP tools over stdio.
 
 Codex-facing tools (7, aligned with codex native tool specs):
-  remote_exec_command  Run a command (one-shot temp-script on every platform; interactive=true keeps a live PTY); return clean output + exit code, or session_id.
+  remote_exec_command  Run a command (one-shot temp-script on every platform; interactive=true keeps a live PTY); return clean output + exit code, or session_id. Never use it to create or edit files — use remote_apply_patch.
   remote_set_remote_workdir  Set the default working directory for this session's commands (scoped to the mobius session and bridge client).
   remote_write_stdin   Write chars to an existing exec session, return output.
   remote_apply_patch   Apply a patch (FREEFORM input).
@@ -1410,11 +1410,11 @@ def _apply_hunks(orig: str, hunks: list) -> str:
 CLASSIC_TOOLS = [
     {
         "name": "remote_exec_command",
-        "description": "Runs a shell command, returning clean output and an exit code. One-shot by default: the command is uploaded to a temp script and its output and exit code are read back from files, on every platform. On a Windows cmd remote that script is a .cmd file, so write for-loop variables with a doubled percent (for /l %%i in (1,1,3) do ...). Pass interactive=true to keep a live PTY session for remote_write_stdin. Set a default with remote_set_remote_workdir to stop repeating workdir on every call. `output` never comes back blank: a command that printed nothing yields '<aimux>command output is empty</aimux>', and a wait that expired before the command finished reports it: '<aimux>command timeout after N seconds</aimux>' when nothing had arrived yet, or '<aimux>get some output, but command timeout after N seconds</aimux>' appended to the partial output.",
+        "description": "Runs a shell command, returning clean output and an exit code. Do NOT edit files with it: all file changes must use remote_apply_patch (reviewable diff); never write files via redirection, heredocs, `python -c`, `Set-Content`, `tee`, or base64/gzip/hex payloads, even when a command line is too long (large files: Delete + Add via remote_apply_patch). Reading files here is fine. One-shot by default: the command is uploaded to a temp script and its output and exit code are read back from files, on every platform. On a Windows cmd remote that script is a .cmd file, so write for-loop variables with a doubled percent (for /l %%i in (1,1,3) do ...). Pass interactive=true to keep a live PTY session for remote_write_stdin. Set a default with remote_set_remote_workdir to stop repeating workdir on every call. `output` never comes back blank: a command that printed nothing yields '<aimux>command output is empty</aimux>', and a wait that expired before the command finished reports it: '<aimux>command timeout after N seconds</aimux>' when nothing had arrived yet, or '<aimux>get some output, but command timeout after N seconds</aimux>' appended to the partial output.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "cmd": {"type": "string", "description": "Shell command to execute."},
+                "cmd": {"type": "string", "description": "Shell command to execute. Run/read only — edit files with remote_apply_patch."},
                 "interactive": {"type": "boolean", "default": False, "description": "True keeps a live PTY session for remote_write_stdin (REPL, pager, password prompt, heredoc). False (default) runs one-shot via a temp script and returns clean output + exit code — including on Windows, where cmd uses a .cmd temp script."},
                 "login": {"type": "boolean", "default": True, "description": "True runs the shell with -l/-i semantics; false disables them (uses --norc --noprofile). Defaults to true."},
                 "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
@@ -1447,7 +1447,7 @@ CLASSIC_TOOLS = [
     },
     {
         "name": "remote_write_stdin",
-        "description": "Writes characters to an existing unified exec session and returns recent output.",
+        "description": "Writes characters to an existing unified exec session and returns recent output. Never edit files here — use remote_apply_patch.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1463,7 +1463,7 @@ CLASSIC_TOOLS = [
     {
         "name": "remote_apply_patch",
         "description": (
-            "Apply a patch to edit files on the remote machine. "
+            "The ONLY way to create, modify, or delete files on the remote — never via remote_exec_command. "
             "FREEFORM: pass the raw patch text as `input`; do NOT wrap it in JSON. "
             "Patch shape: `*** Begin Patch\\n*** Update File: /abs/path/file.py\\n@@ context line\\n-old line\\n+new line\\n*** End Patch`. "
             "Supported ops: `*** Add File:` / `*** Update File:` / `*** Delete File:`. "
