@@ -45,10 +45,11 @@ def test_exec_description_forbids_writing_files():
     d = t["description"]
     # Command execution must never become an invisible editing channel: the
     # user has to be able to review every file change as a patch/diff.
-    assert "Do NOT edit files" in d
-    assert "remote_apply_patch" in d
+    assert "Create or modify files only with remote_apply_patch" in d
     # Encoded payloads are called out as a forbidden workaround.
     assert "base64/gzip/hex" in d
+    # Deletion is explicitly allowed through exec, so the rule is not overread.
+    assert "deleting files here is fine" in d.lower()
 
 
 def test_exec_cmd_parameter_restates_the_rule():
@@ -64,8 +65,9 @@ def test_write_stdin_description_forbids_writing_files():
 
 def test_apply_patch_description_is_the_only_editing_channel():
     d = _desc()
-    assert "ONLY way" in d
+    assert "ONLY way to create or modify files" in d
     assert "remote_exec_command" in d
+    assert "Deleting files with remote_exec_command is allowed" in d
 
 
 def test_input_field_description_restates_spec():
