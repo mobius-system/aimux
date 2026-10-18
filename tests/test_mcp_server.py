@@ -361,6 +361,35 @@ def test_apply_patch_windows_absolute_path_accepted(fake):
     assert fake.files["C:\\proj\\src\\conv.py"] == b"hello"
 
 
+def test_apply_patch_context_mismatch_points_at_remote_exec_command(fake):
+    # Retrying an unmatched hunk can never succeed, so the error must name the
+    # recovery step: read the file again with remote_exec_command.
+    fake.files["/f"] = b"foo\nold\nbar\n"
+    with pytest.raises(ValueError) as exc:
+        mcp_server._remote_apply_patch(
+            "r", "p",
+            {"input": "*** Begin Patch\n*** Update File: /f\n@@\n-nope\n+x\n*** End Patch\n"},
+        )
+    assert str(exc.value) == (
+        "patch context not found, you should read this file again with remote_exec_command!"
+    )
+    assert fake.files["/f"] == b"foo\nold\nbar\n"  # nothing written
+
+
+def test_apply_patch_whitespace_mismatch_keeps_diagnosis_and_hint(fake):
+    fake.files["/f"] = b"# ---\ndef foo():\n    pass\n"
+    with pytest.raises(ValueError) as exc:
+        mcp_server._remote_apply_patch(
+            "r", "p",
+            {"input": "*** Begin Patch\n*** Update File: /f\n@@\n  # ---\n+x\n*** End Patch\n"},
+        )
+    msg = str(exc.value)
+    assert "whitespace mismatch on context line 1" in msg
+    assert msg.endswith(
+        "You should read this file again with remote_exec_command and retry with the exact context."
+    )
+
+
 # ---- JSON-RPC dispatch ----
 
 def test_jsonrpc_initialize(monkeypatch):
@@ -416,6 +445,27 @@ def test_jsonrpc_apply_patch_format_error_is_visible(monkeypatch, fake):
     result = sent[0]["result"]
     assert result["isError"] is True
     assert "Begin Patch" in result["content"][0]["text"]
+
+
+def test_jsonrpc_apply_patch_context_mismatch_is_actionable(monkeypatch, fake):
+    # The text an agent actually sees: the dispatcher prefixes the exception
+    # type, so assert the whole rendered message rather than just the hint.
+    fake.files["/f"] = b"foo\nold\nbar\n"
+    sent = []
+    monkeypatch.setattr(mcp_server, "_send", lambda obj: sent.append(obj))
+    mcp_server._dispatch("rem", "prof", {
+        "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+        "params": {
+            "name": "remote_apply_patch",
+            "arguments": {"input": "*** Begin Patch\n*** Update File: /f\n@@\n-nope\n+x\n*** End Patch\n"},
+        },
+    })
+    result = sent[0]["result"]
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == (
+        "ValueError: patch context not found, "
+        "you should read this file again with remote_exec_command!"
+    )
 
 
 def test_jsonrpc_initialized_notification_no_response(monkeypatch):

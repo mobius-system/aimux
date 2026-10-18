@@ -1156,6 +1156,22 @@ def _write_verified(client, *, remote: str, path: str, data: bytes) -> None:
         raise ValueError(f"remote write verification failed for {path!r}")
 
 
+def _patch_context_error(exc: ValueError) -> ValueError:
+    """Add the recovery step to a context-mismatch error.
+
+    Context is matched byte-for-byte, so a failed hunk is only fixed by reading
+    the file again and rebuilding it. Say which tool to use — otherwise agents
+    retry the same patch unchanged — and keep the original diagnosis intact.
+    """
+    message = str(exc)
+    if "patch context not found" not in message or "remote_exec_command" in message:
+        return exc
+    hint = "read this file again with remote_exec_command"
+    if message.endswith((".", "!", "?")):
+        return ValueError(f"{message} You should {hint} and retry with the exact context.")
+    return ValueError(f"{message}, you should {hint}!")
+
+
 def _apply_codex_patch(remote: str, patch_text: str) -> list:
     ops = _parse_codex_patch(patch_text)
     c = _client()
@@ -1173,7 +1189,10 @@ def _apply_codex_patch(remote: str, patch_text: str) -> list:
         elif kind == "update":
             res = c.file_read(remote=remote, path=path, timeout=180.0)
             orig = _file_bytes(res).decode("utf-8", "replace")
-            new = _apply_hunks(orig, op["hunks"])
+            try:
+                new = _apply_hunks(orig, op["hunks"])
+            except ValueError as exc:
+                raise _patch_context_error(exc) from None
             _write_verified(c, remote=remote, path=path, data=new.encode("utf-8"))
             results.append(f"updated: {path}")
     return results
@@ -1453,6 +1472,7 @@ CLASSIC_TOOLS = [
             "`-` lines are removed; `+` lines are inserted. "
             "Rules: (1) one edit site per `@@` hunk — never bundle multiple distant locations into one giant hunk; "
             "(2) context lines are matched strictly — do not add or omit leading/trailing spaces (an extra or missing space raises 'patch context not found'); "
+            "if that happens, read the file again with remote_exec_command and rebuild the hunk from what is actually there instead of retrying the same patch; "
             "(3) prefer a few small hunks over one big one. "
             "remote_apply_patch uses strict matching — be careful not to add or omit any space."
         ),
