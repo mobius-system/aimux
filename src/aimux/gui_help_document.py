@@ -236,5 +236,12 @@ remote_gui_look   确认生效
 remote_gui_ 是MCP工具，用Python驱动非常麻烦（需要套MCP的开销）
 fast_ooda_gui_ 可以绕开MCP，一步到位
 
+### 快速截图（只要图像）
+
+`fast_ooda_gui_look_fast_screenshot(root_ref, max_dimension=1024, save_path=...)`
+
+只截图：不做无障碍遍历，helper 直接把 PNG 写到 `save_path`（不传则用系统临时目录），返回 `image_path` / `width` / `height` / `lookId` / `timings`。
+适合「看图 → 点坐标 → 再看图」的高频回环；需要元素树时仍用 `fast_ooda_gui_look`。
+
 
 """

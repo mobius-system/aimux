@@ -23,6 +23,7 @@ from aimux.local_alignment import (
     fast_ooda_gui_focus_window,
     fast_ooda_gui_list_windows,
     fast_ooda_gui_look,
+    fast_ooda_gui_look_fast_screenshot,
     fast_ooda_gui_read_text,
     fast_ooda_gui_record_window_mp4,
     fast_ooda_gui_wait_for,
@@ -70,6 +71,21 @@ for line in sys.stdin:
                    "outline": [{"ref": "@e1", "role": "button", "name": "OK"}],
                    "timings": {"totalMs": 1},
                    "image": {"jpegBase64": image, "width": 10, "height": 10}})
+    elif cmd == "lookFastScreenshot":
+        if args.get("windowId") == 999:
+            resp = fail("unknown command 'lookFastScreenshot'", "unsupported_command")
+        else:
+            path = pathlib.Path(args["savePath"])
+            path.write_bytes(b"\x89PNG\r\n\x1a\nfast")
+            result = {"lookId": "look_fast_1", "imagePath": str(path),
+                      "width": 10, "height": 10, "strategy": "screen",
+                      "warnings": [],
+                      "timings": {"captureMs": 1, "convertMs": 1, "encodeMs": 1}}
+            if args.get("includeBase64"):
+                result["image"] = {"jpegBase64": base64.b64encode(b"png").decode(),
+                                   "mimeType": "image/png",
+                                   "width": 10, "height": 10}
+            resp = ok(result)
     elif cmd == "act":
         resp = ok({"outcome": "worked",
                    "performed": {"grounding": "description", "delivery": "ax"}})
@@ -194,6 +210,64 @@ def test_look_outline_budget_is_opt_in(mock_helper) -> None:
 def test_look_requires_target(mock_helper) -> None:
     with pytest.raises(LocalGuiError) as excinfo:
         fast_ooda_gui_look()
+    assert excinfo.value.code == "invalid_request"
+
+
+def test_fast_screenshot_asks_only_for_pixels(mock_helper) -> None:
+    target = mock_helper.tmp / "shots" / "fast.png"
+    result = fast_ooda_gui_look_fast_screenshot(
+        "@w1", max_dimension=512, save_path=target
+    )
+    request = _last(mock_helper.log)
+    assert request["cmd"] == "lookFastScreenshot"
+    assert request["args"] == {
+        "rootRef": "@w1",
+        "maxDimension": 512,
+        "savePath": str(target),
+        "includeBase64": False,
+    }
+    assert result["image_path"] == str(target)
+    assert result["lookId"] == "look_fast_1"
+    assert result["strategy"] == "screen"
+    assert result["timings"]["captureMs"] == 1
+    assert "outline" not in result
+    assert "image" not in result
+    assert target.read_bytes() == b"\x89PNG\r\n\x1a\nfast"
+
+
+def test_fast_screenshot_uses_a_temp_path_by_default(mock_helper) -> None:
+    result = fast_ooda_gui_look_fast_screenshot("@w1")
+    request = _last(mock_helper.log)
+    assert request["args"]["savePath"] == result["image_path"]
+    assert Path(result["image_path"]).is_file()
+    assert Path(result["image_path"]).parent.name == "aimux-fast-screenshots"
+
+
+def test_fast_screenshot_can_return_base64(mock_helper) -> None:
+    target = mock_helper.tmp / "fast-b64.png"
+    result = fast_ooda_gui_look_fast_screenshot(
+        "@w1", save_path=target, include_base64=True
+    )
+    assert _last(mock_helper.log)["args"]["includeBase64"] is True
+    assert result["image"]["mimeType"] == "image/png"
+
+
+def test_fast_screenshot_falls_back_on_old_helpers(mock_helper) -> None:
+    target = mock_helper.tmp / "fast-fallback.png"
+    result = fast_ooda_gui_look_fast_screenshot(
+        window_id=999, save_path=target
+    )
+    commands = [entry["cmd"] for entry in _requests(mock_helper.log)]
+    assert commands[-2:] == ["lookFastScreenshot", "look"]
+    assert result["fallback"] == "look"
+    assert result["lookId"] == "look_1"
+    assert result["image_path"] == str(target)
+    assert target.is_file()
+
+
+def test_fast_screenshot_requires_target(mock_helper) -> None:
+    with pytest.raises(LocalGuiError) as excinfo:
+        fast_ooda_gui_look_fast_screenshot()
     assert excinfo.value.code == "invalid_request"
 
 

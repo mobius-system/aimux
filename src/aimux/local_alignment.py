@@ -15,7 +15,8 @@ overhead. Importing this module and calling ``fast_ooda_gui_*`` reaches the
 same helper commands in one local process hop, which is what a rule-based
 script needs: observe, compute, act, with millisecond latency.
 
-The eight functions mirror the eight MCP tools one-to-one:
+Most functions mirror the MCP tools one-to-one; the fast screenshot command is
+local-only and has no MCP counterpart:
 
 ========================================  =============================
 local function                            helper command
@@ -23,6 +24,7 @@ local function                            helper command
 ``fast_ooda_gui_diagnostics``             ``diagnostics``
 ``fast_ooda_gui_list_windows``            ``listRoots``
 ``fast_ooda_gui_look``                    ``look``
+``fast_ooda_gui_look_fast_screenshot``    ``lookFastScreenshot``
 ``fast_ooda_gui_act``                     ``act``
 ``fast_ooda_gui_read_text``               ``axReadText``
 ``fast_ooda_gui_wait_for``                ``axWaitFor``
@@ -75,11 +77,13 @@ from __future__ import annotations
 
 import atexit
 import base64
+import itertools
 import json
 import os
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -93,6 +97,7 @@ __all__ = [
     "fast_ooda_gui_diagnostics",
     "fast_ooda_gui_list_windows",
     "fast_ooda_gui_look",
+    "fast_ooda_gui_look_fast_screenshot",
     "fast_ooda_gui_act",
     "fast_ooda_gui_read_text",
     "fast_ooda_gui_wait_for",
@@ -113,6 +118,7 @@ REQUEST_TIMEOUTS: dict[str, float] = {
     "listRoots": 30.0,
     "listWindows": 30.0,
     "look": 45.0,
+    "lookFastScreenshot": 30.0,
     "screenshot": 45.0,
     "act": 75.0,
     "actBatch": 90.0,
@@ -476,6 +482,119 @@ def fast_ooda_gui_look(
         result["image_path"] = str(path)
     if max_output_tokens is not None:
         result.update(_budget_outline(result.get("outline"), int(max_output_tokens)))
+    return result
+
+
+_FAST_SHOT_SEQUENCE = itertools.count(1)
+
+
+def _fast_screenshot_target() -> Path:
+    """A fresh path under the system temp directory for one fast screenshot."""
+    directory = Path(tempfile.gettempdir()) / "aimux-fast-screenshots"
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    serial = next(_FAST_SHOT_SEQUENCE)
+    return directory / f"shot-{stamp}-{os.getpid()}-{serial:04d}.png"
+
+
+def _fast_screenshot_fallback(
+    root_ref: str | None,
+    window_id: int | None,
+    max_dimension: int,
+    target: Path,
+    include_base64: bool,
+) -> dict[str, Any]:
+    """Serve the same shape from the normal `look` command.
+
+    Used only when the helper binary predates `lookFastScreenshot`; it is
+    correct but pays the accessibility-tree cost the fast command avoids.
+    """
+    shot = fast_ooda_gui_look(
+        root_ref,
+        window_id=window_id,
+        include_image=True,
+        max_dimension=max_dimension,
+        save_image=target,
+    )
+    image = shot.get("image") if isinstance(shot.get("image"), dict) else {}
+    result: dict[str, Any] = {
+        "lookId": shot.get("lookId"),
+        "width": image.get("width"),
+        "height": image.get("height"),
+        "image_path": shot.get("image_path", str(target)),
+        "timings": shot.get("timings"),
+        "warnings": shot.get("warnings") or [],
+    }
+    if include_base64 and image.get("jpegBase64"):
+        result["image"] = image
+    return result
+
+
+def fast_ooda_gui_look_fast_screenshot(
+    root_ref: str | None = None,
+    *,
+    window_id: int | None = None,
+    max_dimension: int = 1024,
+    save_path: str | os.PathLike[str] | None = None,
+    include_base64: bool = False,
+) -> dict[str, Any]:
+    """Capture a window screenshot, and do nothing else.
+
+    This is the low-latency sibling of :func:`fast_ooda_gui_look`. It skips the
+    accessibility tree entirely, writes the PNG from the helper straight to
+    ``save_path`` (no base64 round trip by default), and returns only:
+
+    ``lookId``, ``image_path``, ``width``, ``height``, ``strategy``,
+    ``warnings`` and ``timings`` (``captureMs``, ``convertMs``, ``encodeMs``,
+    ``writeMs``, ``base64Ms``, ``totalMs``).
+
+    The empty ``outline`` / element records are the point: on a large Chromium
+    window the UIA subtree walk costs far more than the pixels themselves.
+    The returned ``lookId`` still carries the image geometry, so
+    :func:`fast_ooda_gui_act` can target image coordinates from this shot.
+
+    When ``save_path`` is omitted a unique file under the system temp directory
+    is used. Pass ``include_base64=True`` only when the caller cannot read the
+    local file; it adds the PNG as ``image.jpegBase64`` (the historical field
+    name; the bytes are PNG).
+
+    If the helper is older than this command, the call transparently falls back
+    to :func:`fast_ooda_gui_look` and marks the result ``fallback: "look"``.
+    """
+    if not root_ref and window_id is None:
+        raise LocalGuiError(
+            "fast screenshot requires root_ref or window_id", code="invalid_request"
+        )
+
+    target = (
+        Path(save_path).expanduser()
+        if save_path is not None
+        else _fast_screenshot_target()
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    args: dict[str, Any] = {
+        "maxDimension": int(max_dimension),
+        "savePath": str(target),
+        "includeBase64": bool(include_base64),
+    }
+    if root_ref:
+        args["rootRef"] = root_ref
+    if window_id is not None:
+        args["windowId"] = int(window_id)
+
+    try:
+        result = _call("lookFastScreenshot", args)
+    except LocalGuiError as exc:
+        if exc.code != "unsupported_command":
+            raise
+        result = _fast_screenshot_fallback(
+            root_ref, window_id, max_dimension, target, include_base64
+        )
+        result["fallback"] = "look"
+
+    image_path = result.pop("imagePath", None) or str(target)
+    result["image_path"] = str(image_path)
     return result
 
 
