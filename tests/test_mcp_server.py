@@ -923,6 +923,32 @@ def test_toolsets_select_tools():
         mcp_server.tools_for("gui")
 
 
+def test_gui_display_help_document_returns_the_bundled_document():
+    from aimux import mcp_server
+
+    result = mcp_server._gui_display_help_document("box", "cmd", {})
+
+    assert "remote_gui_list_windows" in result["document"]
+    assert "remote_gui_display_help_document" in result["document"]
+    assert result["path"].endswith("gui_help_document.py")
+
+
+def test_dispatch_serves_the_gui_help_document(monkeypatch):
+    from aimux import mcp_server
+
+    results: list[dict] = []
+    monkeypatch.setattr(mcp_server, "_send", lambda obj: results.append(obj))
+    monkeypatch.setattr(mcp_server, "_ACTIVE_TOOLSET", "classic-and-gui")
+
+    mcp_server._dispatch("box", "cmd", {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "remote_gui_display_help_document", "arguments": {}},
+    })
+
+    payload = json.loads(results[-1]["result"]["content"][0]["text"])
+    assert "remote_gui_list_windows" in payload["document"]
+
+
 def test_dispatch_hides_gui_tools_under_classic_toolset(monkeypatch):
     from aimux import mcp_server
 

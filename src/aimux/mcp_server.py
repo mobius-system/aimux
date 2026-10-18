@@ -33,6 +33,7 @@ from pathlib import Path
 
 from . import __version__
 from . import bridge
+from .gui_help_document import HELP_DOCUMENT
 from .gui_helper import REQUEST_TIMEOUTS as _GUI_TIMEOUTS
 
 # ---------------------------------------------------------------------------
@@ -1554,6 +1555,12 @@ def gui_skill_path() -> str | None:
     return str(path) if path.is_file() else None
 
 
+def _gui_display_help_document(remote: str, profile: str, args: dict) -> dict:
+    """Return the bundled GUI guide; nothing is sent to the remote."""
+    path = pathlib.Path(__file__).with_name("gui_help_document.py")
+    return {"document": HELP_DOCUMENT, "path": str(path)}
+
+
 def _gui_diagnostics(remote: str, profile: str, args: dict) -> dict:
     res = _gui_call(remote, "diagnostics", {})
     skill = gui_skill_path()
@@ -1949,6 +1956,15 @@ GUI_TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "remote_gui_display_help_document",
+        "description": "Return the bundled GUI help document: prerequisites, the full remote_gui_* tool table, "
+        "the recommended list_windows -> look -> act workflow, and the common pitfalls. Read it before starting "
+        "GUI work. The document is local; no remote call is made. It complements the SKILL.md at `skill_path`: "
+        "the SKILL.md covers the two working methods, this document is the tool-by-tool reference."
+        + _GUI_COMMON,
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "remote_gui_list_windows",
         "description": "List top-level windows on the remote desktop (pid, title, kind, rootRef, focus state). "
         "rootRef is the handle for remote_gui_look. Windows owned by elevated processes cannot be driven "
@@ -2108,6 +2124,7 @@ GUI_TOOLS = [
 ]
 
 _GUI_TOOL_FUNCS = {
+    "remote_gui_display_help_document": _gui_display_help_document,
     "remote_gui_diagnostics": _gui_diagnostics,
     "remote_gui_list_windows": _gui_list_windows,
     "remote_gui_look": _gui_look,
