@@ -1055,6 +1055,12 @@ def test_gui_look_spools_screenshot_even_when_the_outline_is_truncated(monkeypat
 
     assert out["outline_truncated"] is True and "outline" not in out
     assert out["image_path"].endswith(".png") and "image_url" not in out
+    # Omitting the outline is the documented screenshot-only usage. Calling it
+    # an `error` made agents retry a call that had already done its job.
+    assert "error" not in out
+    assert out["outline_omitted"] is True
+    assert out["outline_omitted_reason"] == "max_output_tokens"
+    assert "max_output_tokens" in out["outline_hint"]
 
 
 def test_gui_look_omits_image_path_when_the_helper_sends_no_image(monkeypatch, tmp_path):
@@ -1068,6 +1074,132 @@ def test_gui_look_omits_image_path_when_the_helper_sends_no_image(monkeypatch, t
 
     assert "image_path" not in out and "image_url" not in out
     assert list(tmp_path.glob("*.png")) == []
+
+
+def test_gui_act_missing_keys_lists_the_received_params(monkeypatch):
+    from aimux import mcp_server
+
+    with pytest.raises(ValueError) as excinfo:
+        mcp_server._gui_act("box", "cmd", {
+            "look_id": "look_1", "action": "keypress", "policy": "foreground", "x": 1, "y": 2,
+        })
+
+    # The old one-liner ("keypress requires keys") read as a server bug to an
+    # agent that believed it had passed keys. Echo what actually arrived.
+    message = str(excinfo.value)
+    assert "missing required param 'keys'" in message
+    assert "received:" in message and "policy" in message and "look_id" in message
+    assert "F2" in message  # a fix the caller can copy verbatim
+
+
+def _engine_look_context(look_id: str = "look_9") -> None:
+    from aimux import mcp_server
+
+    mcp_server._GUI_LOOK_CONTEXT.clear()
+    mcp_server._GUI_LOOK_CONTEXT[look_id] = {
+        "rect": {"x": 0, "y": 0, "w": 1280, "h": 720},
+        "className": "UnityWndClass",
+    }
+
+
+def test_gui_act_defaults_pressdown_for_foreground_keypress(monkeypatch):
+    from aimux import mcp_server
+
+    _engine_look_context()
+    seen: dict = {}
+    monkeypatch.setattr(mcp_server, "_gui_call",
+                        lambda remote, cmd, args, **kw: seen.update(args) or {"outcome": "unknown"})
+
+    out = mcp_server._gui_act("box", "cmd", {
+        "look_id": "look_9", "action": "keypress", "policy": "foreground", "keys": ["F2"],
+    })
+
+    # A frame-polled window never samples a key released inside one batch, so
+    # the safe hold has to be the default rather than something the model must
+    # remember to pass.
+    assert seen["params"]["keepPressdownMs"] == 100
+    assert out["defaults_applied"] == {"keep_pressdown_ms": 100}
+    assert out["params_echo"]["keepPressdownMs"] == 100
+    assert out["warnings"] and "engine window" in out["warnings"][0]
+
+
+def test_gui_act_explicit_zero_pressdown_warns_on_engine_window(monkeypatch):
+    from aimux import mcp_server
+
+    _engine_look_context()
+    seen: dict = {}
+    monkeypatch.setattr(mcp_server, "_gui_call",
+                        lambda remote, cmd, args, **kw: seen.update(args) or {"outcome": "unknown"})
+
+    out = mcp_server._gui_act("box", "cmd", {
+        "look_id": "look_9", "action": "keypress", "policy": "foreground",
+        "keys": ["F2"], "keep_pressdown_ms": 0,
+    })
+
+    assert seen["params"]["keepPressdownMs"] == 0  # explicit value is respected
+    assert "keep_pressdown_ms=0" in out["warnings"][0]
+    assert "retry" in out["warnings"][0]
+    assert "defaults_applied" not in out
+
+
+def test_gui_act_keypress_can_omit_the_target(monkeypatch):
+    from aimux import mcp_server
+
+    _engine_look_context()
+    seen: dict = {}
+    monkeypatch.setattr(mcp_server, "_gui_call",
+                        lambda remote, cmd, args, **kw: seen.update(args) or {"outcome": "unknown"})
+
+    out = mcp_server._gui_act("box", "cmd", {
+        "look_id": "look_9", "action": "keypress", "policy": "foreground", "keys": ["F2"],
+        "keep_pressdown_ms": 100,
+    })
+
+    # Raw keys land on the foreground window, so the look's window center is a
+    # harmless placeholder — no need to invent coordinates.
+    assert seen["target"] == {"x": 640.0, "y": 360.0}
+    assert out["target_used"] == {"auto_window_center": {"x": 640.0, "y": 360.0}}
+
+
+def test_gui_act_reports_ignored_coordinates_when_ref_wins(monkeypatch):
+    from aimux import mcp_server
+
+    seen: dict = {}
+    monkeypatch.setattr(mcp_server, "_gui_call",
+                        lambda remote, cmd, args, **kw: seen.update(args) or {"outcome": "unknown"})
+
+    out = mcp_server._gui_act("box", "cmd", {
+        "look_id": "look_1", "action": "click", "policy": "foreground",
+        "ref": "win:look_1:@e1", "x": 10, "y": 20,
+    })
+
+    assert seen["target"] == {"ref": "win:look_1:@e1"}
+    assert out["target_used"] == {"ref": "win:look_1:@e1"}
+    assert out["target_ignored"] == ["x", "y"]
+
+
+def test_gui_act_requires_both_coordinates(monkeypatch):
+    from aimux import mcp_server
+
+    with pytest.raises(ValueError) as excinfo:
+        mcp_server._gui_act("box", "cmd", {
+            "look_id": "look_1", "action": "click", "policy": "foreground", "x": 10,
+        })
+
+    message = str(excinfo.value)
+    assert "x and y must be given together" in message and "received only x" in message
+
+
+def test_act_description_states_the_frame_polled_requirement():
+    from aimux import mcp_server
+
+    tool = next(t for t in mcp_server.GUI_TOOLS if t["name"] == "remote_gui_act")
+    description = tool["description"]
+    # The fatal parameter lived at position 12 of the schema; agents read the
+    # tool description first.
+    assert "frame-polled" in description
+    assert "keep_pressdown_ms=50-150" in description
+    assert "auto_window_center" not in description  # keep it human-readable
 
 
 def test_prune_gui_shots_keeps_the_newest_and_drops_expired(monkeypatch, tmp_path):

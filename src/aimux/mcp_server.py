@@ -1670,6 +1670,71 @@ def _spool_gui_shot(remote: str, look_id: str, b64: str) -> str:
     return str(path)
 
 
+# lookId -> {"rect": root rect in image pixels, "className": window class}.
+# keypress/typeText do not need a real target (raw keys go to the foreground
+# window), so remembering the look's window lets those calls work without
+# inventing coordinates the model never measured.
+_GUI_LOOK_CONTEXT: dict[str, dict] = {}
+_GUI_LOOK_CONTEXT_LIMIT = 64
+
+# Window classes that redraw from a game loop. A key released inside one
+# SendInput batch is never sampled as "down" by such a loop, and the helper
+# still answers outcome=unknown, so the act result has to say so.
+_ENGINE_WINDOW_HINTS = ("unity", "unreal", "sdl", "glfw", "godot", "cryengine")
+
+# Actions where a target is decoration rather than a destination: raw keys and
+# typed text always land on the foreground window.
+_TARGET_OPTIONAL_ACTIONS = ("keypress", "typeText")
+
+
+def _remember_look(look_id, window, outline) -> None:
+    if not isinstance(look_id, str) or not look_id:
+        return
+    rect = outline.get("rect") if isinstance(outline, dict) else None
+    if not isinstance(rect, dict):
+        rect = window.get("framePoints") if isinstance(window, dict) else None
+    class_name = ""
+    if isinstance(window, dict) and isinstance(window.get("metadata"), dict):
+        class_name = str(window["metadata"].get("className") or "")
+    _GUI_LOOK_CONTEXT[look_id] = {"rect": rect, "className": class_name}
+    for stale in list(_GUI_LOOK_CONTEXT)[:-_GUI_LOOK_CONTEXT_LIMIT]:
+        _GUI_LOOK_CONTEXT.pop(stale, None)
+
+
+def _look_context(look_id) -> dict:
+    return _GUI_LOOK_CONTEXT.get(look_id) or {}
+
+
+def _is_engine_window(class_name) -> bool:
+    name = str(class_name or "").lower()
+    return any(hint in name for hint in _ENGINE_WINDOW_HINTS)
+
+
+def _received_args(args: dict) -> list[str]:
+    """Parameter names the caller actually sent, for self-explaining errors."""
+    return sorted(key for key, value in args.items() if value is not None)
+
+
+def _missing_param(name: str, args: dict, *, hint: str) -> ValueError:
+    action = args.get("action") or "unknown"
+    return ValueError(
+        f"missing required param '{name}' for action={action}; "
+        f"received: {_received_args(args)}; fix: {hint}")
+
+
+def _rect_center(rect) -> dict | None:
+    if not isinstance(rect, dict):
+        return None
+    try:
+        x, y = float(rect["x"]), float(rect["y"])
+        w, h = float(rect["w"]), float(rect["h"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return {"x": x + w / 2.0, "y": y + h / 2.0}
+
+
 def _gui_look(remote: str, profile: str, args: dict) -> dict:
     root_ref = args.get("root_ref") or args.get("rootRef")
     if not isinstance(root_ref, str) or not root_ref:
@@ -1693,15 +1758,20 @@ def _gui_look(remote: str, profile: str, args: dict) -> dict:
     }
     if image_path:
         out["image_path"] = image_path
+    _remember_look(res.get("lookId"), res.get("window"), res.get("outline"))
     # The token budget guards the OUTLINE. The screenshot no longer competes
     # with it: it is spooled to a file, so the outline is the only text here.
     budget = int(args.get("max_output_tokens", 20000))
     outline_text, est = _truncate_output(json.dumps(res.get("outline"), ensure_ascii=False), budget)
     if est >= budget:
+        # Omitting the outline is the documented "screenshot only" usage, not a
+        # failure: naming it `error` sent agents off to fix a working call.
         return {"lookId": res.get("lookId"), "window": res.get("window"), "timings": res.get("timings"),
                 "image_path": image_path,
                 "outline_truncated": True,
-                "error": "outline exceeded max_output_tokens; re-run with a higher budget"}
+                "outline_omitted": True,
+                "outline_omitted_reason": "max_output_tokens",
+                "outline_hint": "raise max_output_tokens to read the element tree"}
     out["estimated_tokens"] = est
     return out
 
@@ -1709,22 +1779,51 @@ def _gui_look(remote: str, profile: str, args: dict) -> dict:
 def _gui_act(remote: str, profile: str, args: dict) -> dict:
     look_id = args.get("look_id")
     if not isinstance(look_id, str) or not look_id:
-        raise ValueError("look_id is required (from a previous remote_gui_look)")
+        raise _missing_param("look_id", args, hint="call remote_gui_look first")
     action = args.get("action")
     if not isinstance(action, str) or not action:
-        raise ValueError("action is required (press, click, setText, scroll, ...)")
+        raise _missing_param("action", args, hint="press, click, setText, scroll, typeText, keypress, drag, moveMouse")
     policy = args.get("policy") or "ax_only"
     if policy not in ("ax_only", "default", "foreground"):
-        raise ValueError("policy must be ax_only, default, or foreground")
+        raise ValueError(f"policy must be ax_only, default, or foreground; received policy={policy!r}")
     ref = args.get("ref")
     x = args.get("x")
     y = args.get("y")
+    notes: dict = {}
     if isinstance(ref, str) and ref:
         target: dict = {"ref": ref}
+        ignored = [name for name in ("x", "y") if args.get(name) is not None]
+        if ignored:
+            # Silently dropping one of two targets is how an agent loses track
+            # of what it actually asked for.
+            notes["target_used"] = {"ref": ref}
+            notes["target_ignored"] = ignored
     elif x is not None and y is not None:
         target = {"x": float(x), "y": float(y)}
+    elif x is not None or y is not None:
+        provided = "x" if x is not None else "y"
+        raise ValueError(
+            f"x and y must be given together for action={action}: received only {provided}; "
+            f"fix: pass both image coordinates or a ref from the look outline")
+    elif action in _TARGET_OPTIONAL_ACTIONS:
+        center = _rect_center(_look_context(look_id).get("rect"))
+        if center is None:
+            raise _missing_param("ref or x/y", args,
+                                 hint=f"{action} accepts a missing target, but look {look_id} has no cached "
+                                      "window rect; pass a ref, or x/y from the look image")
+        target = center
+        notes["target_used"] = {"auto_window_center": center}
     else:
-        raise ValueError("target needs ref (preferred, from the look outline) or x/y image coordinates")
+        raise _missing_param("ref or x/y", args,
+                             hint="pass a ref from the remote_gui_look outline (preferred) or x/y image coordinates")
+
+    if action == "keypress" and not (isinstance(args.get("keys"), list) and args["keys"]):
+        raise _missing_param("keys", args, hint='keypress needs at least one key name, e.g. "keys": ["F2"]')
+    if action in ("setText", "typeText") and args.get("text") is None:
+        raise _missing_param("text", args, hint='send the text to type, e.g. "text": "hello"')
+    if action == "drag" and not (isinstance(args.get("path"), list) and len(args["path"]) >= 2):
+        raise _missing_param("path", args, hint="drag needs at least two waypoints, e.g. [{x,y},{x,y}]")
+
     params: dict = {}
     for src_key, dst_key in (
         ("text", "text"),
@@ -1736,6 +1835,29 @@ def _gui_act(remote: str, profile: str, args: dict) -> dict:
     ):
         if args.get(src_key) is not None:
             params[dst_key] = args[src_key]
+
+    warnings: list[str] = []
+    defaults_applied: dict = {}
+    if action == "keypress" and policy == "foreground":
+        context = _look_context(look_id)
+        engine = _is_engine_window(context.get("className"))
+        hold = args.get("keep_pressdown_ms")
+        if hold is None:
+            # Engine windows poll input per frame. A key released inside one
+            # SendInput batch is never observed as pressed, so default to a
+            # hold long enough for the next frame instead of returning a
+            # success-looking answer.
+            params["keepPressdownMs"] = 100
+            defaults_applied["keep_pressdown_ms"] = 100
+            if engine:
+                warnings.append(
+                    "keep_pressdown_ms was omitted on an engine window "
+                    f"({context.get('className')}); defaulted to 100ms so a frame-polled app can sample the key.")
+        elif int(hold) == 0 and engine:
+            warnings.append(
+                f"keep_pressdown_ms=0 on {context.get('className')}: down+up are batched into one SendInput, "
+                "so a frame-polled app never samples the key as pressed. Pass keep_pressdown_ms=100 and retry "
+                "before concluding the action failed.")
     if args.get("preserve_focus") is not None:
         params["preserveFocus"] = bool(args["preserve_focus"])
     call_args = {
@@ -1747,7 +1869,23 @@ def _gui_act(remote: str, profile: str, args: dict) -> dict:
     }
     if args.get("defer_root_delta") is not None:
         call_args["deferRootDelta"] = bool(args["defer_root_delta"])
-    return _gui_call(remote, "act", call_args)
+    result = _gui_call(remote, "act", call_args)
+    if not isinstance(result, dict):
+        return result
+    result.update(notes)
+    if defaults_applied:
+        result["defaults_applied"] = defaults_applied
+    if warnings:
+        result["warnings"] = warnings
+    # Echo what was actually sent: the helper's outcome is the same for
+    # "nothing to observe" and "silently ignored", so the request is the only
+    # part of the answer the caller can check.
+    echo = {"action": action, "policy": policy,
+            "keepPressdownMs": params.get("keepPressdownMs", 0)}
+    if "keys" in params:
+        echo["keys"] = params["keys"]
+    result.setdefault("params_echo", echo)
+    return result
 
 
 def _gui_read_text(remote: str, profile: str, args: dict) -> dict:
@@ -2017,7 +2155,11 @@ GUI_TOOLS = [
     },
     {
         "name": "remote_gui_act",
-        "description": "Act on a UI element from a previous look. Prefer ref targets: press/click drive UIA patterns "
+        "description": "Act on a UI element from a previous look. Games and other frame-polled windows "
+        "(Unity/Unreal/SDL/GLFW classes) need policy=foreground plus keep_pressdown_ms=50-150 for raw "
+        "keypress/click: with 0 the app never samples the key as pressed and the call still returns "
+        "outcome=unknown — indistinguishable from success. Foreground keypress now defaults to 100ms when "
+        "the parameter is omitted. Prefer ref targets: press/click drive UIA patterns "
         "(Invoke/Toggle/SelectionItem/ExpandCollapse) and setText writes through ValuePattern — semantic delivery, "
         "no real mouse/keyboard. Coordinates and typeText/keypress/drag are raw input and need policy=foreground. "
         "Returns outcome (worked/didnt/unknown), performed.delivery (ax=semantic, hid=raw input), evidence, and a "
@@ -2037,13 +2179,15 @@ GUI_TOOLS = [
                 "text": {"type": "string", "description": "Text for setText/typeText."},
                 "keys": {"type": "array", "items": {"type": "string"},
                           "description": "Key names for keypress, pressed in order (e.g. ['F1'], ['ctrl','c']). "
-                                         "Raw input: needs policy=foreground."},
-                "keep_pressdown_ms": {"type": "number", "default": 0,
+                                         "Raw input: needs policy=foreground. ref/x/y are optional for keypress "
+                                         "and typeText — raw keys go to the foreground window, so the look's "
+                                         "window center is used when no target is given."},
+                "keep_pressdown_ms": {"type": "number",
                                        "description": "Hold the key down this many milliseconds before releasing it "
                                                       "(keypress only, capped at 5000). 0 releases inside one input batch, "
                                                       "which per-frame pollers such as games never observe — pass 50-150 "
-                                                      "there. Costs that much latency per press. Raw input: needs "
-                                                      "policy=foreground."},
+                                                      "there. Omitted with policy=foreground defaults to 100. Costs that "
+                                                      "much latency per press. Raw input: needs policy=foreground."},
                 "path": {"type": "array", "items": {"type": "object"},
                           "description": "Waypoints for drag in image coordinates ([{x, y}, ...], at least two). "
                                          "Raw input: needs policy=foreground."},

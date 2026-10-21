@@ -167,17 +167,17 @@ HELP_DOCUMENT = """
 
 | 要素 | 值 | 缺了会怎样 |
 |---|---|---|
-| `keys` | 键名数组，如 `["F1"]`、`["ctrl","c"]` | `keypress requires keys` |
-| target | `ref`，或 `x`+`y`（截图坐标） | `target needs ref (preferred, from the look outline) or x/y image coordinates` |
+| `keys` | 键名数组，如 `["F1"]`、`["ctrl","c"]` | 报错会回显你实际传了哪些参数，照着补即可 |
+| target | `ref`，或 `x`+`y`（截图坐标）；**keypress / typeText 可省略**，自动用 look 窗口中心 | 其它 action 缺 target 会报错并列出已收到的参数 |
 | `policy` | `"foreground"` | 默认的 `ax_only` 会拦掉原始输入 |
 | 前台 | 见下 | 键打给了别的窗口，`outcome` 照样是 `unknown` |
-| `keep_pressdown_ms` | 游戏/引擎类窗口给 `50~150` | 普通软件无妨；**游戏里毫无反应**（见下一节）|
+| `keep_pressdown_ms` | 游戏/引擎类窗口给 `50~150`；**foreground 下省略时默认 100** | 显式传 0 时游戏里毫无反应，结果会带 `warnings`（见下一节）|
 
 示例：
 
 ```
 remote_gui_look   root_ref="@w3", include_image=true, max_output_tokens=1  → 取回 look_id
-remote_gui_act    look_id=…, action="keypress", x=512, y=288, policy="foreground", keys=["F1"]
+remote_gui_act    look_id=…, action="keypress", policy="foreground", keys=["F1"], keep_pressdown_ms=100
 remote_gui_look   确认生效
 ```
 
@@ -209,7 +209,8 @@ remote_gui_look   确认生效
 
 | 值 | 结果 |
 |---|---|
-| `0`（默认） | 普通软件正常；**游戏 / 引擎类窗口毫无反应** |
+| 省略（`policy=foreground`） | 自动按 `100` 发送，结果里带 `defaults_applied` |
+| `0`（显式传） | 普通软件正常；**游戏 / 引擎类窗口毫无反应**，结果里带 `warnings` |
 | `50 ~ 150` | 横跨 3~9 帧，游戏能采到。**游戏里就用这个区间** |
 
 实测（绝区零，同一个扫描码、同一个游戏状态、同一个 `remote_gui_act` 调用）：

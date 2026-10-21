@@ -16,6 +16,12 @@ description: AIMUX操作远程设备的图形界面。两种方法：① 模拟�
 优点：万能，通用
 缺点：速度慢，开销大，需要模型有原生多模态能力；如果是纯文本模型 + 外挂多模态分析工具，理论上也可以，但需要注意【坐标矫正】（见下面的案例）
 
+## 三个容易踩的坑（先读这段）
+
+- **游戏 / 引擎类窗口**（Unity、Unreal、SDL、GLFW）：`keypress` 必须 `policy="foreground"`，并且显式给 `keep_pressdown_ms=50~150`。不给时工具会自动按 100 发并在结果里写 `defaults_applied`；显式传 0 会"按了等于没按"，但返回仍是 `outcome=unknown`，此时结果里带 `warnings`，照它说的重试即可。
+- **`keypress` / `typeText` 的 target 可以省略**：原始输入的落点永远是当前前台窗口，所以不给 `ref`/`x,y` 时工具会用该 look 的窗口中心占位。其它 action（press、click、scroll…）仍然需要 ref 或坐标。
+- **参数报错会回显你实际传了什么**（`received: [...]`），看到 `missing required param` 先对照自己的参数，不要判定成服务端 Bug。
+
 ## 案例
 
 目的：发送钉钉消息
