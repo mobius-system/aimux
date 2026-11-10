@@ -194,19 +194,76 @@ def test_parse_rejects_unknown_marker():
 
 # ---- tools ----
 
-def test_view_image(fake):
-    fake.files["/x.png"] = b"\x89PNG\r\n fake image bytes"
+def test_view_image_returns_native_image_content(fake):
+    fake.files["/x.png"] = b"\x89PNG\r\n\x1a\n fake image bytes"
     r = mcp_server._remote_view_image("r", "p", {"path": "/x.png"})
-    assert r["detail"] == "high"
-    assert r["image_url"].startswith("data:image/png;base64,")
-    assert base64.b64decode(r["image_url"].split(",", 1)[1]) == fake.files["/x.png"]
+    blocks = r["__mcp_content__"]
+    # A data-URL string made the model read base64; the image block makes the
+    # client show the pixels.
+    assert blocks[0]["type"] == "image"
+    assert blocks[0]["mimeType"] == "image/png"
+    assert base64.b64decode(blocks[0]["data"]) == fake.files["/x.png"]
+    assert blocks[1]["type"] == "text"
+    assert "x.png" in blocks[1]["text"] and "detail=high" in blocks[1]["text"]
 
 
-def test_view_image_jpeg_and_detail(fake):
-    fake.files["/y.JPG"] = b"jpeg bytes"
+def test_view_image_sniffs_the_type_from_bytes(fake):
+    fake.files["/y.JPG"] = b"\xff\xd8\xff\xe0 jpeg bytes"
     r = mcp_server._remote_view_image("r", "p", {"path": "/y.JPG", "detail": "original"})
-    assert r["detail"] == "original"
-    assert r["image_url"].startswith("data:image/jpeg;base64,")
+    blocks = r["__mcp_content__"]
+    assert blocks[0]["mimeType"] == "image/jpeg"
+    assert "detail=original" in blocks[1]["text"]
+
+
+def test_view_image_rejects_a_non_image(fake):
+    fake.files["/notes.png"] = b"just text"
+    with pytest.raises(ValueError, match="not a recognised image"):
+        mcp_server._remote_view_image("r", "p", {"path": "/notes.png"})
+
+
+def test_view_image_spools_oversized_images_to_a_real_file(monkeypatch, tmp_path, fake):
+    fake.files["/big.png"] = b"\x89PNG\r\n\x1a\n" + b"x" * 100
+    monkeypatch.setattr(mcp_server, "_IMAGE_INLINE_MAX_BYTES", 50)
+    monkeypatch.setattr(mcp_server, "_image_spool_dir", lambda: tmp_path)
+
+    r = mcp_server._remote_view_image("r", "p", {"path": "/big.png"})
+
+    blocks = r["__mcp_content__"]
+    assert len(blocks) == 1 and blocks[0]["type"] == "text"
+    saved = list(tmp_path.glob("*.png"))
+    # A real file the caller can open — not a .txt full of base64.
+    assert len(saved) == 1 and saved[0].read_bytes() == fake.files["/big.png"]
+    assert str(saved[0]) in blocks[0]["text"]
+
+
+def test_dispatch_returns_image_blocks_for_view_image(monkeypatch, fake):
+    fake.files["/x.png"] = b"\x89PNG\r\n\x1a\nabc"
+    results: list[dict] = []
+    monkeypatch.setattr(mcp_server, "_send", lambda obj: results.append(obj))
+    monkeypatch.setattr(mcp_server, "_ACTIVE_TOOLSET", "classic")
+
+    mcp_server._dispatch("box", "cmd", {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "remote_view_image", "arguments": {"path": "/x.png"}},
+    })
+
+    content = results[-1]["result"]["content"]
+    assert content[0]["type"] == "image" and content[0]["mimeType"] == "image/png"
+
+
+def test_dispatch_keeps_json_text_for_ordinary_tools(monkeypatch, fake):
+    results: list[dict] = []
+    monkeypatch.setattr(mcp_server, "_send", lambda obj: results.append(obj))
+    monkeypatch.setattr(mcp_server, "_ACTIVE_TOOLSET", "classic")
+
+    mcp_server._dispatch("box", "cmd", {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "remote_ping", "arguments": {}},
+    })
+
+    content = results[-1]["result"]["content"]
+    assert len(content) == 1 and content[0]["type"] == "text"
+    assert json.loads(content[0]["text"])["ok"] is True
 
 
 def test_ping(fake):

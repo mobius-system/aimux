@@ -940,6 +940,42 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# An image block is not counted against a client's text budget, but keep a
+# ceiling so a huge file cannot stall the transport. Beyond it the bytes are
+# spooled to a local file and reported by path instead of being inlined.
+_IMAGE_INLINE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _mcp_content(*blocks: dict) -> dict:
+    """A tool result made of MCP content blocks instead of one JSON blob."""
+    return {"__mcp_content__": list(blocks)}
+
+
+def _image_spool_dir() -> Path:
+    directory = Path(tempfile.gettempdir()) / "aimux-images"
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    return directory
+
+
+def _sniff_image_mime(raw: bytes) -> str | None:
+    """Identify the format from the bytes: an extension can lie, magic cannot."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    if raw[:2] == b"BM":
+        return "bmp"
+    return None
+
+
 def _remote_view_image(remote: str, profile: str, args: dict) -> dict:
     path = args.get("path")
     if not isinstance(path, str) or not path:
@@ -950,10 +986,29 @@ def _remote_view_image(remote: str, profile: str, args: dict) -> dict:
     res = _client().file_read(remote=remote, path=path, timeout=180.0)
     raw = _file_bytes(res)
     ext = os.path.splitext(path)[1].lstrip(".").lower()
-    mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif",
-            "webp": "webp", "bmp": "bmp"}.get(ext, ext or "octet-stream")
+    mime = _sniff_image_mime(raw)
+    if mime is None:
+        raise ValueError(
+            f"{path} is not a recognised image (got {len(raw)} bytes, extension {ext or 'none'}); "
+            "supported: png, jpeg, gif, webp, bmp — convert the file first")
+    name = os.path.basename(path) or "image"
+    meta = f"{name} · {len(raw)} bytes · image/{mime} · detail={detail}"
+    if len(raw) > _IMAGE_INLINE_MAX_BYTES:
+        # Inlining this would blow any client's result limit. A real file is
+        # something the caller can open; a base64 .txt never was.
+        directory = _image_spool_dir()
+        stem = os.path.splitext(re.sub(r"[^A-Za-z0-9_.-]", "_", name))[0][:80] or "image"
+        target = directory / f"{stem}-{os.getpid()}.{mime}"
+        target.write_bytes(raw)
+        return _mcp_content({"type": "text", "text": (
+            f"{meta} · too large to inline (limit {_IMAGE_INLINE_MAX_BYTES} bytes); "
+            f"saved to {target}. Open that path with your image reader, or capture a "
+            f"smaller region and call again.")})
     b64 = base64.b64encode(raw).decode("ascii")
-    return {"detail": detail, "image_url": f"data:image/{mime};base64,{b64}"}
+    return _mcp_content(
+        {"type": "image", "data": b64, "mimeType": f"image/{mime}"},
+        {"type": "text", "text": meta},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1486,7 +1541,10 @@ CLASSIC_TOOLS = [
     },
     {
         "name": "remote_view_image",
-        "description": "Read an image file from the remote machine and return it as a data URL for visual inspection.",
+        "description": "Read an image from the remote machine and return it as native image content, "
+        "so the model sees the pixels rather than base64 text. Images above "
+        f"{_IMAGE_INLINE_MAX_BYTES // (1024 * 1024)} MB are written to a local file and reported "
+        "by path instead of being inlined. Accepted formats: png, jpeg, gif, webp, bmp.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2362,7 +2420,14 @@ def _dispatch(remote: str, profile: str, req: dict) -> None:
             return
         try:
             res = func(remote, profile, args)
-            _result(req_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]})
+            # Most tools answer with a JSON document; image-returning tools
+            # hand back MCP content blocks so the client renders the pixels
+            # instead of showing the model a wall of base64.
+            blocks = res.get("__mcp_content__") if isinstance(res, dict) else None
+            if blocks is not None:
+                _result(req_id, {"content": blocks})
+            else:
+                _result(req_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]})
         except Exception as e:  # tool execution error → MCP-level error result
             _result(req_id, {"isError": True, "content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}]})
         return
