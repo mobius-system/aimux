@@ -1381,9 +1381,9 @@ def _patch_context_error(exc: ValueError) -> ValueError:
     retry the same patch unchanged — and keep the original diagnosis intact.
     """
     message = str(exc)
-    if "patch context not found" not in message or "remote_exec_command" in message:
+    if "patch context not found" not in message or "remote_read" in message:
         return exc
-    hint = "read this file again with remote_exec_command"
+    hint = "read this file again with remote_read"
     if message.endswith((".", "!", "?")):
         return ValueError(f"{message} You should {hint} and retry with the exact context.")
     return ValueError(f"{message}, you should {hint}!")
