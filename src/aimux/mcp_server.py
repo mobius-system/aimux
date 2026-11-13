@@ -489,10 +489,23 @@ def _remote_is_windows(profile: str) -> bool:
 
 
 def _decode_text(data: bytes) -> str:
-    """Decode remote file bytes, tolerating what Windows shells actually write."""
+    """Decode remote file bytes, tolerating what Windows shells actually write.
+
+    cmd writes its output in the console code page (cp936 on a Chinese system,
+    cp1252 elsewhere). Decoding those bytes as UTF-8 with "replace" produced the
+    "�" soup users saw, so fall back to the code pages before giving up.
+    """
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return data.decode("utf-16", "replace")
-    return data.decode("utf-8-sig", "replace")  # utf-8-sig drops a BOM
+    try:
+        return data.decode("utf-8-sig")  # utf-8-sig drops a BOM
+    except UnicodeDecodeError:
+        for encoding in ("cp936", "cp1252"):
+            try:
+                return data.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return data.decode("utf-8-sig", "replace")
 
 
 def _exec_temp_base() -> str:
@@ -551,7 +564,11 @@ def _exec_plan(*, cmd: str, profile: str, shell_bin: str | None, windows: bool) 
                          f"{runner} {script} > {outfile} 2>&1; echo $? > {codefile}")
 
     if family == "cmd":
-        body = f"@echo off\r\n{cmd}\r\necho %errorlevel% > \"{_win_path(codefile)}\"\r\n"
+        # UTF-8 console so the script body (UTF-8 on disk) and the program
+        # output are both read/written as UTF-8 instead of the system code page,
+        # which is what turned Chinese text into mojibake.
+        body = (f"@echo off\r\nchcp 65001 >nul\r\n{cmd}\r\n"
+                f"echo %errorlevel% > \"{_win_path(codefile)}\"\r\n")
         return _ExecPlan(script, outfile, codefile, body,
                          f"\"{_win_path(script)}\" > \"{_win_path(outfile)}\" 2>&1")
 
@@ -773,10 +790,15 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
         _sessions[sid].update(tmp_script=plan.script, tmp_out=plan.out, tmp_code=plan.code)
         try:
             # 1) command verbatim -> temp script (no send_keys mangling).
+            # Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so non-ASCII
+            # text in the command would arrive as mojibake.
+            body_bytes = plan.body.encode("utf-8")
+            if plan.script.endswith(".ps1"):
+                body_bytes = b"\xef\xbb\xbf" + body_bytes
             c.file_write(
                 remote=remote,
                 path=plan.script,
-                content_b64=base64.b64encode(plan.body.encode("utf-8")).decode("ascii"),
+                content_b64=base64.b64encode(body_bytes).decode("ascii"),
                 timeout=60.0,
             )
             # 2) trivial launch line -> redirect output + exit code to files.

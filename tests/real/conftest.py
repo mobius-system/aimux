@@ -260,14 +260,22 @@ class McpClient:
             raise RuntimeError(f"MCP error calling {tool}: {r['error']}")
         result = r["result"]
         content = result.get("content") or []
-        text = content[0]["text"] if content else ""
+        text = next((b.get("text", "") for b in content if b.get("type") == "text"), "")
+        images = [b for b in content if b.get("type") == "image"]
         if result.get("isError"):
             raise RuntimeError(f"{tool} returned isError: {text}")
-        # Tool handlers return json.dumps(res) as the content text.
+        # Tool handlers return json.dumps(res) as the content text; image tools
+        # return an image block plus a human-readable summary instead.
         try:
-            return json.loads(text)
+            payload = json.loads(text)
         except json.JSONDecodeError:
-            return {"_raw": text}
+            payload = {"_raw": text}
+        if images:
+            image = images[0]
+            payload["image_url"] = f"data:{image['mimeType']};base64,{image['data']}"
+            payload["mimeType"] = image["mimeType"]
+            payload["text"] = text
+        return payload
 
     def close(self) -> None:
         try:

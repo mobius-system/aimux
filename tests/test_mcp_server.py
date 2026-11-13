@@ -736,7 +736,9 @@ def test_exec_plan_posix_unchanged():
 def test_exec_plan_windows_cmd_writes_exit_code_inside_the_batch_file():
     plan = mcp_server._exec_plan(cmd="whoami", profile="cmd", shell_bin=None, windows=True)
     assert plan.script.startswith("~/AppData/Local/Temp/aimux_tmp/") and plan.script.endswith(".cmd")
-    assert plan.body.startswith("@echo off\r\nwhoami\r\n")
+    # UTF-8 console first, so the command body and its output are not read as
+    # the system code page (cp936), which produced mojibake.
+    assert plan.body.startswith("@echo off\r\nchcp 65001 >nul\r\nwhoami\r\n")
     assert f'echo %errorlevel% > "{mcp_server._win_path(plan.code)}"' in plan.body
     assert plan.launch == f'"{mcp_server._win_path(plan.script)}" > "{mcp_server._win_path(plan.out)}" 2>&1'
 
@@ -810,6 +812,40 @@ def test_decode_text_tolerates_windows_shell_encodings():
     assert mcp_server._decode_text("﻿hi".encode("utf-8")) == "hi"          # UTF-8 BOM
     assert mcp_server._decode_text("hi".encode("utf-16")) == "hi"              # UTF-16 BOM
     assert mcp_server._decode_text("保留".encode("utf-8")) == "保留"
+
+
+def test_decode_text_falls_back_to_the_console_code_page():
+    # cmd writes cp936 on a Chinese Windows box; decoding it as UTF-8 with
+    # "replace" is what produced the "�" soup.
+    assert mcp_server._decode_text("保留".encode("cp936")) == "保留"
+    assert mcp_server._decode_text("café".encode("cp1252")) == "café"
+    assert mcp_server._decode_text(b"plain ascii") == "plain ascii"
+
+
+def test_powershell_script_is_uploaded_with_a_utf8_bom(monkeypatch):
+    # Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI; Chinese in the
+    # command would arrive as mojibake.
+    written: dict = {}
+
+    class C:
+        def file_write(self, *, remote, path, content_b64, timeout=60.0):
+            written[path] = base64.b64decode(content_b64)
+            return {"ok": True}
+
+        def send_keys(self, **kw):
+            return {"ok": True}
+
+    monkeypatch.setattr(mcp_server, "_client", lambda: C())
+    monkeypatch.setattr(mcp_server, "_create_exec_session", lambda *a, **k: "sid")
+    monkeypatch.setattr(mcp_server, "_wait_exec_done",
+                        lambda *a, **k: ("", 0, True, 0.1, False))
+    monkeypatch.setattr(mcp_server, "_sessions", {"sid": {"name": "s", "remote": "r"}})
+
+    mcp_server._remote_exec_command("r", "powershell", {"cmd": "Write-Output 保留", "yield_time_ms": 500})
+
+    script = next(path for path in written if path.endswith(".ps1"))
+    assert written[script].startswith(b"\xef\xbb\xbf")
+    assert "保留".encode("utf-8") in written[script]
 
 
 def test_read_code_file_ignores_noise_around_the_number(monkeypatch):

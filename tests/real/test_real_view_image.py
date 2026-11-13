@@ -25,10 +25,11 @@ def test_view_image_png(mcp, tmp_path):
     p = tmp_path / "red.png"
     p.write_bytes(PNG_1x1_RED)
     res = mcp.call("remote_view_image", path=str(p))
-    assert res["detail"] == "high"
+    # The tool answers with an MCP image block, so the model sees pixels.
     url = res["image_url"]
     assert url.startswith("data:image/png;base64,")
     assert base64.b64decode(url.split(",", 1)[1]) == PNG_1x1_RED
+    assert "detail=high" in res["text"]
 
 
 def test_view_image_jpeg(mcp, tmp_path):
@@ -42,15 +43,17 @@ def test_view_image_detail_original(mcp, tmp_path):
     p = tmp_path / "x.png"
     p.write_bytes(PNG_1x1_RED)
     res = mcp.call("remote_view_image", path=str(p), detail="original")
-    assert res["detail"] == "original"
+    assert res["mimeType"] == "image/png"
+    assert "detail=original" in res["text"]
 
 
 def test_view_image_unknown_ext_fallthrough(mcp, tmp_path):
     p = tmp_path / "blob.xyz"
     p.write_bytes(b"\x00\x01\x02\x03")
-    res = mcp.call("remote_view_image", path=str(p))
-    # Unknown extension → mime equals the ext ("xyz"); data URL carries it.
-    assert res["image_url"].startswith("data:image/xyz;base64,"), res["image_url"]
+    # The bytes are not an image and the extension is no help: refuse instead
+    # of claiming a data URL nothing can decode.
+    with pytest.raises(RuntimeError, match="not a recognised image"):
+        mcp.call("remote_view_image", path=str(p))
 
 
 def test_view_image_empty_path_raises(mcp):
