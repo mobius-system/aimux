@@ -615,13 +615,14 @@ class BridgeControlClient:
         remote: str,
         path: str,
         recursive: bool = True,
+        digest: bool = True,
         timeout: float = 60.0,
     ) -> dict[str, Any]:
         return _request_json(
             "POST",
             f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/list",
             self.runtime.token,
-            {"path": path, "recursive": recursive},
+            {"path": path, "recursive": recursive, "digest": bool(digest)},
             timeout=timeout,
         )
 

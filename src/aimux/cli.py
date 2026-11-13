@@ -1670,12 +1670,18 @@ def cmd_file_list(
     remote: Annotated[str, typer.Argument(help="SSH host or bridge remote name.")],
     path: Annotated[str, typer.Option("--path", help="Directory path.")] = ".",
     recursive: Annotated[bool, typer.Option("--recursive", help="Recurse into subdirectories.")] = False,
+    digest: Annotated[bool, typer.Option(
+        "--digest/--no-digest",
+        help="Compute each file's sha256. Skip it when browsing: hashing reads whole files.",
+    )] = True,
     json_out: Annotated[bool, typer.Option("--json", help="Output as JSON.")] = False,
 ):
     client, info = _bridge_remote(remote)
     if client is not None and info is not None:
         try:
-            payload = client.file_list(remote=remote, path=path, recursive=recursive)
+            payload = client.file_list(
+                remote=remote, path=path, recursive=recursive, digest=digest
+            )
         except bridge.BridgeError as e:
             _exit_bridge_error(e, json_mode=json_out)
     else:

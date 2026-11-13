@@ -252,6 +252,24 @@ def test_cli_file_list_dispatches_to_ssh_and_prints_entries(monkeypatch):
     assert "a.txt" in result.output
 
 
+def test_cli_file_list_passes_no_digest_to_bridge(monkeypatch):
+    from typer.testing import CliRunner
+
+    from aimux import cli
+
+    calls = []
+
+    class _Client:
+        def file_list(self, **kwargs):
+            calls.append(kwargs)
+            return {"entries": []}
+
+    monkeypatch.setattr(cli, "_bridge_remote", lambda remote: (_Client(), {"name": remote}))
+    result = CliRunner().invoke(cli.app, ["file", "list", "dev", "--path", "/x", "--no-digest"])
+    assert result.exit_code == 0
+    assert calls == [{"remote": "dev", "path": "/x", "recursive": False, "digest": False}]
+
+
 def test_cli_file_list_unknown_remote_exits_user_error(monkeypatch):
     from typer.testing import CliRunner
 

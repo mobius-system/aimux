@@ -1294,8 +1294,9 @@ class ReverseClientRuntime:
         path = self._file_path(payload)
         if not path.exists():
             raise BridgeError(f"path does not exist: {path}", kind="not_found")
+        digest = bool(payload.get("digest", True))
         if path.is_file():
-            return {"entries": [self._file_entry(path)]}
+            return {"entries": [self._file_entry(path, digest=digest)]}
         if not path.is_dir():
             raise BridgeError(f"not a directory: {path}", kind="bad_request")
         recursive = bool(payload.get("recursive", True))
@@ -1309,29 +1310,33 @@ class ReverseClientRuntime:
                 entries.append({"path": str(child), "type": "symlink", "size": 0})
                 continue
             if child.is_file():
-                entries.append(self._file_entry(child))
+                entries.append(self._file_entry(child, digest=digest))
             elif child.is_dir():
                 entries.append({"path": str(child), "type": "dir", "size": 0})
         return {"entries": entries}
 
     @staticmethod
-    def _file_entry(path: Path) -> dict[str, Any]:
+    def _file_entry(path: Path, *, digest: bool = True) -> dict[str, Any]:
         """One ``file list`` entry, with a best-effort digest.
 
         Without this a single unreadable file (``/etc/.pwd.lock``, anything
         under a root-owned directory) failed the entire listing. The digest is
         optional: sync-dir falls back to reading the file when it is absent,
-        which is the right place for that cost to land.
+        which is the right place for that cost to land. Callers that browse
+        (list one directory at a time) pass ``digest=False`` so a directory
+        full of multi-gigabyte files does not get read end to end just to be
+        displayed.
         """
         try:
             size = path.stat().st_size
         except OSError:
             size = 0
         entry: dict[str, Any] = {"path": str(path), "type": "file", "size": size}
-        try:
-            entry["sha256"] = _sha256_file(path)
-        except OSError:
-            pass
+        if digest:
+            try:
+                entry["sha256"] = _sha256_file(path)
+            except OSError:
+                pass
         return entry
 
     def _file_archive(self, payload: dict[str, Any]) -> dict[str, Any]:

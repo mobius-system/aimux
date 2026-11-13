@@ -371,7 +371,7 @@ class FakeBridgeControlClient:
             "size": len(self.remote_files[path]),
         }
 
-    def file_list(self, *, remote: str, path: str, recursive: bool = True, timeout: float = 60.0):
+    def file_list(self, *, remote: str, path: str, recursive: bool = True, digest: bool = True, timeout: float = 60.0):
         self.list_called.append(path)
         entries: list[dict[str, Any]] = []
         prefix = _remote_key(path).rstrip("/") + "/"
@@ -976,6 +976,20 @@ def test_file_list_still_digests_when_everything_is_readable(tmp_path):
     result = runtime.handle("file.list", {"path": str(tmp_path), "recursive": False})
 
     assert [e["sha256"] for e in result["entries"]][0]
+
+
+def test_file_list_can_skip_digests(tmp_path):
+    """Browsing passes digest=False: hashing reads every file end to end."""
+    runtime = _runtime()
+    (tmp_path / "a.txt").write_text("a")
+    (tmp_path / "b.txt").write_text("bb")
+
+    result = runtime.handle(
+        "file.list", {"path": str(tmp_path), "recursive": False, "digest": False}
+    )
+
+    assert [e["size"] for e in result["entries"]] == [1, 2]
+    assert all("sha256" not in e for e in result["entries"])
 
 
 def test_file_list_entry_names_fall_back_to_the_path():
