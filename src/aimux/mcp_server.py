@@ -98,6 +98,14 @@ _EXEC_PROBE_EVERY_S = 5.0
 
 # Set from --mobius-session; '' when mobius did not pass one (unit tests, manual use).
 _mobius_session = ""
+# The read ledger still needs a key when no Mobius session was passed: the
+# edit gate must never be skipped, and a process-scoped id keeps that ledger
+# private to this MCP server instead of leaking into another session's.
+_LEDGER_SESSION_FALLBACK = f"mcp-{uuid.uuid4().hex[:12]}"
+
+
+def _ledger_session() -> str:
+    return _mobius_session or _LEDGER_SESSION_FALLBACK
 # In-process default, used when there is no session id to key the store with.
 _workdir_default = ""
 
@@ -1209,6 +1217,121 @@ def _remote_apply_patch(remote: str, profile: str, args: dict) -> dict:
     return {"applied": applied}
 
 
+# ---------------------------------------------------------------------------
+# remote_read / remote_edit / remote_write
+# ---------------------------------------------------------------------------
+
+_READ_DEFAULT_LIMIT = 2000
+
+
+def _require_absolute_path(path: str, *, tool: str = "file_path") -> str:
+    if path.startswith(("/", "\\")):
+        return path
+    if len(path) >= 3 and path[1] == ":" and path[2] in ("/", "\\"):
+        return path
+    raise ValueError(f"{tool} {path!r} must be absolute")
+
+
+def _remote_read(remote: str, profile: str, args: dict) -> dict:
+    path = args.get("file_path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("file_path is required")
+    _require_absolute_path(path)
+    start = 1
+    if args.get("offset") is not None:
+        start = int(args["offset"])
+        if start < 1:
+            raise ValueError("offset must be a 1-based line number")
+    count = _READ_DEFAULT_LIMIT
+    if args.get("limit") is not None:
+        count = int(args["limit"])
+        if count < 1:
+            raise ValueError("limit must be a positive number of lines")
+    try:
+        # Only this explicit read may create reading rights on the client.
+        res = _client().file_read(
+            remote=remote, path=path, timeout=180.0,
+            session=_ledger_session(), read_policy="record",
+        )
+    except bridge.BridgeError as exc:
+        raise ValueError(str(exc)) from None
+    text = _decode_text(_file_bytes(res))
+    lines = text.splitlines()
+    total = len(lines)
+    if total == 0:
+        raise ValueError(f"{path} is empty")
+    selected = lines[start - 1:start - 1 + count]
+    numbered = "\n".join(f"{start + index:>6}\t{line}" for index, line in enumerate(selected))
+    return {
+        "path": path,
+        "total_lines": total,
+        "returned_lines": len(selected),
+        "offset": start,
+        "truncated": start - 1 + len(selected) < total,
+        "content": numbered,
+    }
+
+
+def _remote_edit(remote: str, profile: str, args: dict) -> dict:
+    path = args.get("file_path")
+    old = args.get("old_string")
+    new = args.get("new_string")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("file_path is required")
+    if not isinstance(old, str) or old == "":
+        raise ValueError("old_string is required and must not be empty")
+    if not isinstance(new, str):
+        raise ValueError("new_string is required")
+    _require_absolute_path(path)
+    if old == new:
+        raise ValueError("new_string must differ from old_string")
+    replace_all = bool(args.get("replace_all", False))
+    client = _client()
+    try:
+        # Internal read: computing the replacement must not grant reading rights.
+        res = client.file_read(remote=remote, path=path, timeout=180.0, read_policy="internal")
+    except bridge.BridgeError as exc:
+        raise ValueError(str(exc)) from None
+    text, encoding, bom = _decode_with_encoding(_file_bytes(res))
+    occurrences = text.count(old)
+    if occurrences == 0:
+        raise ValueError(
+            f"edit context not found in {path}; read the file again with remote_read "
+            f"and copy the exact text (including indentation)")
+    if occurrences > 1 and not replace_all:
+        raise ValueError(
+            f"old_string matches {occurrences} times in {path}; add surrounding context "
+            f"or pass replace_all=true")
+    updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+    try:
+        _write_verified(
+            client, remote=remote, path=path, data=bom + updated.encode(encoding),
+            session=_ledger_session(), read_policy="require",
+        )
+    except bridge.BridgeError as exc:
+        raise ValueError(str(exc)) from None
+    return {"path": path, "replacements": occurrences if replace_all else 1}
+
+
+def _remote_write(remote: str, profile: str, args: dict) -> dict:
+    path = args.get("file_path")
+    content = args.get("content")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("file_path is required")
+    if not isinstance(content, str):
+        raise ValueError("content is required")
+    _require_absolute_path(path)
+    data = content.encode("utf-8")
+    try:
+        _write_verified(
+            _client(), remote=remote, path=path, data=data,
+            session=_ledger_session(), read_policy="require",
+        )
+    except bridge.BridgeError as exc:
+        raise ValueError(str(exc)) from None
+    return {"path": path, "bytes": len(data)}
+
+
 def _resolve_patch_path(path: str, workdir: str | None = None) -> str:
     """Patch paths must be absolute.
 
@@ -1223,14 +1346,31 @@ def _resolve_patch_path(path: str, workdir: str | None = None) -> str:
     raise ValueError(f"patch path {path!r} must be absolute")
 
 
-def _write_verified(client, *, remote: str, path: str, data: bytes) -> None:
+def _write_verified(client, *, remote: str, path: str, data: bytes,
+                    session: str = "", read_policy: str = "") -> None:
     client.file_write(
         remote=remote, path=path,
         content_b64=base64.b64encode(data).decode("ascii"),
+        session=session, read_policy=read_policy,
     )
+    # Verification is an internal read: it must not create reading rights.
     written = _file_bytes(client.file_read(remote=remote, path=path, timeout=180.0))
     if written != data:
         raise ValueError(f"remote write verification failed for {path!r}")
+
+
+def _decode_with_encoding(data: bytes) -> tuple[str, str, bytes]:
+    """Return (text, encoding, bom) so an edit can write the file back as-is."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16"), "utf-16", b""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig"), "utf-8", b"\xef\xbb\xbf"
+    for encoding in ("utf-8", "cp936", "cp1252"):
+        try:
+            return data.decode(encoding), encoding, b""
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("file is not text; use remote_view_image for images")
 
 
 def _patch_context_error(exc: ValueError) -> ValueError:
@@ -1256,22 +1396,34 @@ def _apply_codex_patch(remote: str, patch_text: str) -> list:
     for op in ops:
         kind = op["kind"]
         path = _resolve_patch_path(op["path"])
-        if kind == "add":
-            content = op["content"]
-            _write_verified(c, remote=remote, path=path, data=content.encode("utf-8"))
-            results.append(f"added: {path}")
-        elif kind == "delete":
-            c.file_delete(remote=remote, path=path, recursive=False)
-            results.append(f"deleted: {path}")
-        elif kind == "update":
-            res = c.file_read(remote=remote, path=path, timeout=180.0)
-            orig = _file_bytes(res).decode("utf-8", "replace")
-            try:
-                new = _apply_hunks(orig, op["hunks"])
-            except ValueError as exc:
-                raise _patch_context_error(exc) from None
-            _write_verified(c, remote=remote, path=path, data=new.encode("utf-8"))
-            results.append(f"updated: {path}")
+        try:
+            if kind == "add":
+                content = op["content"]
+                _write_verified(c, remote=remote, path=path, data=content.encode("utf-8"),
+                                session=_ledger_session(), read_policy="require")
+                results.append(f"added: {path}")
+            elif kind == "delete":
+                c.file_delete(remote=remote, path=path, recursive=False,
+                              session=_ledger_session(), read_policy="require")
+                results.append(f"deleted: {path}")
+            elif kind == "update":
+                # Patch computation is an internal read: it must not establish
+                # reading rights. The remote_read gate is what authorizes this.
+                res = c.file_read(remote=remote, path=path, timeout=180.0,
+                                  read_policy="internal")
+                orig = _file_bytes(res).decode("utf-8", "replace")
+                try:
+                    new = _apply_hunks(orig, op["hunks"])
+                except ValueError as exc:
+                    raise _patch_context_error(exc) from None
+                _write_verified(c, remote=remote, path=path, data=new.encode("utf-8"),
+                                session=_ledger_session(), read_policy="require")
+                results.append(f"updated: {path}")
+        except bridge.BridgeError as exc:
+            # Ops are applied one file at a time; say what already landed so the
+            # caller never assumes a failed patch was all-or-nothing.
+            done = f"; already applied: {', '.join(results)}" if results else ""
+            raise ValueError(f"{exc}{done}") from None
     return results
 
 
@@ -1538,6 +1690,64 @@ CLASSIC_TOOLS = [
         },
     },
     {
+        "name": "remote_read",
+        "description": "Reads a file from the remote filesystem.\n\n"
+        "- `file_path` must be an absolute path.\n"
+        "- Reads up to 2000 lines by default.\n"
+        "- You can optionally specify a line offset and limit (especially handy for long files), "
+        "but it's recommended to read the whole file by not providing these parameters\n"
+        "- Results are returned using cat -n format, with line numbers starting at 1\n"
+        "- This tool is unable to read non-text files such as image, pdf, etc (use remote_view_image for images). "
+        "Reading a directory, a missing file, or an empty file returns an error rather than content.\n"
+        "- Do NOT re-read a file you just edited to verify — remote_edit/remote_write would have errored if the change failed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The absolute path to the file to read"},
+                "offset": {"type": "integer", "minimum": 0,
+                           "description": "The line number to start reading from. Only provide if the file is too large to read at once"},
+                "limit": {"type": "integer", "exclusiveMinimum": 0,
+                          "description": "The number of lines to read. Only provide if the file is too large to read at once."},
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "remote_edit",
+        "description": "Performs exact string replacement in a file on the remote machine.\n\n"
+        "- You must Read the file with remote_read before editing, or the call will fail.\n"
+        "- `old_string` must match the file exactly, including indentation, and be unique — the edit fails otherwise. "
+        "Strip the remote_read line prefix (line number + tab) before matching.\n"
+        "- `replace_all: true` replaces every occurrence instead.\n"
+        "- remote_edit is an alternative to remote_apply_patch, you must only use one of them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The absolute path on the remote to the file to modify"},
+                "old_string": {"type": "string", "description": "The text to replace"},
+                "new_string": {"type": "string", "description": "The text to replace it with (must be different from old_string)"},
+                "replace_all": {"type": "boolean", "default": False,
+                                "description": "Replace all occurrences of old_string (default false)"},
+            },
+            "required": ["file_path", "old_string", "new_string"],
+        },
+    },
+    {
+        "name": "remote_write",
+        "description": "Writes a file to the remote filesystem, overwriting if one exists.\n\n"
+        "When to use: creating a new file, or fully replacing one you've already Read. "
+        "Overwriting an existing file you haven't Read will fail. For partial changes, use remote_edit instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string",
+                              "description": "The absolute path on the remote to the file to write (must be absolute, not relative)"},
+                "content": {"type": "string", "description": "The content to write to the file"},
+            },
+            "required": ["file_path", "content"],
+        },
+    },
+    {
         "name": "remote_apply_patch",
         "description": (
             "The ONLY way to create or modify files on the remote — never write file content via remote_exec_command. Deleting files with remote_exec_command is allowed. "
@@ -1549,8 +1759,9 @@ CLASSIC_TOOLS = [
             "`-` lines are removed; `+` lines are inserted. "
             "Rules: (1) one edit site per `@@` hunk — never bundle multiple distant locations into one giant hunk; "
             "(2) context lines are matched strictly — do not add or omit leading/trailing spaces (an extra or missing space raises 'patch context not found'); "
-            "if that happens, read the file again with remote_exec_command and rebuild the hunk from what is actually there instead of retrying the same patch; "
-            "(3) prefer a few small hunks over one big one. "
+            "if that happens, read the file again with remote_read and rebuild the hunk from what is actually there instead of retrying the same patch; "
+            "(3) prefer a few small hunks over one big one; "
+            "(4) every `*** Update File:` and `*** Delete File:` path must have been read with remote_read in this session — `*** Add File:` does not need a prior read. "
             "remote_apply_patch uses strict matching — be careful not to add or omit any space."
         ),
         "inputSchema": {
@@ -1605,6 +1816,9 @@ _TOOL_FUNCS = {
     "remote_exec_command": _remote_exec_command,
     "remote_set_remote_workdir": _remote_set_remote_workdir,
     "remote_write_stdin": _remote_write_stdin,
+    "remote_read": _remote_read,
+    "remote_edit": _remote_edit,
+    "remote_write": _remote_write,
     "remote_apply_patch": _remote_apply_patch,
     "remote_view_image": _remote_view_image,
     "remote_download_file": _remote_download_file,

@@ -416,12 +416,25 @@ class BridgeControlClient:
             timeout=timeout,
         )
 
-    def file_read(self, *, remote: str, path: str, timeout: float = 180.0) -> dict[str, Any]:
+    def file_read(
+        self,
+        *,
+        remote: str,
+        path: str,
+        timeout: float = 180.0,
+        session: str = "",
+        read_policy: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"path": path}
+        if session:
+            payload["session"] = session
+        if read_policy:
+            payload["read_policy"] = read_policy
         return _request_json(
             "POST",
             f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/read",
             self.runtime.token,
-            {"path": path},
+            payload,
             timeout=timeout,
         )
 
@@ -528,12 +541,18 @@ class BridgeControlClient:
         mode: int | None = None,
         max_size: int | None = None,
         timeout: float = 180.0,
+        session: str = "",
+        read_policy: str = "",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"path": path, "content_b64": content_b64}
         if mode is not None:
             payload["mode"] = int(mode)
         if max_size is not None:
             payload["max_size"] = int(max_size)
+        if session:
+            payload["session"] = session
+        if read_policy:
+            payload["read_policy"] = read_policy
         return _request_json(
             "POST",
             f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/write",
@@ -558,12 +577,19 @@ class BridgeControlClient:
         path: str,
         recursive: bool = False,
         timeout: float = 60.0,
+        session: str = "",
+        read_policy: str = "",
     ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"path": path, "recursive": bool(recursive)}
+        if session:
+            payload["session"] = session
+        if read_policy:
+            payload["read_policy"] = read_policy
         return _request_json(
             "POST",
             f"{self.runtime.url}/api/remotes/{_quote(remote)}/files/delete",
             self.runtime.token,
-            {"path": path, "recursive": bool(recursive)},
+            payload,
             timeout=timeout,
         )
 

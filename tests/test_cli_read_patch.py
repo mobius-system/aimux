@@ -20,16 +20,16 @@ class FakeClient:
     def __init__(self):
         self.files: dict[str, bytes] = {}
 
-    def file_read(self, *, remote, path, timeout=180.0):
+    def file_read(self, *, remote, path, timeout=180.0, **kwargs):
         if path not in self.files:
             raise RuntimeError(f"not a regular file: {path}")
         return {"content_b64": base64.b64encode(self.files[path]).decode("ascii")}
 
-    def file_write(self, *, remote, path, content_b64, mode=None, max_size=None, timeout=180.0):
+    def file_write(self, *, remote, path, content_b64, mode=None, max_size=None, timeout=180.0, **kwargs):
         self.files[path] = base64.b64decode(content_b64)
         return {"ok": True}
 
-    def file_delete(self, *, remote, path, recursive=False, timeout=60.0):
+    def file_delete(self, *, remote, path, recursive=False, timeout=60.0, **kwargs):
         self.files.pop(path, None)
         return {"ok": True}
 

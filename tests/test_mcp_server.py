@@ -88,16 +88,16 @@ class FakeClient:
             "internal_bookkeeping": "drop me",
         }
 
-    def file_read(self, *, remote, path, timeout=180.0):
+    def file_read(self, *, remote, path, timeout=180.0, **kwargs):
         if path not in self.files:
             raise RuntimeError(f"not found: {path}")
         return {"content_b64": base64.b64encode(self.files[path]).decode()}
 
-    def file_write(self, *, remote, path, content_b64, mode=None, max_size=None, timeout=180.0):
+    def file_write(self, *, remote, path, content_b64, mode=None, max_size=None, timeout=180.0, **kwargs):
         self.files[path] = base64.b64decode(content_b64)
         return {"ok": True}
 
-    def file_delete(self, *, remote, path, recursive=False, timeout=60.0):
+    def file_delete(self, *, remote, path, recursive=False, timeout=60.0, **kwargs):
         self.files.pop(path, None)
         return {"ok": True}
 
@@ -463,7 +463,8 @@ def test_jsonrpc_tools_list(monkeypatch):
     mcp_server._dispatch("rem", "prof", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = [t["name"] for t in sent[0]["result"]["tools"]]
     assert names == ["remote_exec_command", "remote_set_remote_workdir", "remote_write_stdin",
-                    "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping"]
+                     "remote_read", "remote_edit", "remote_write",
+                     "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping"]
 
 
 def test_jsonrpc_tools_call_ping(monkeypatch, fake):
@@ -563,7 +564,7 @@ class ExecTempClient:
         self.files[out] = self.files.get(script, b"") + b"\n"
         return {"ok": True}
 
-    def file_write(self, *, remote, path, content_b64, mode=None, max_size=None, timeout=180.0):
+    def file_write(self, *, remote, path, content_b64, mode=None, max_size=None, timeout=180.0, **kwargs):
         data = base64.b64decode(content_b64)
         self.files[path] = data
         self.writes.append((path, data))
@@ -574,10 +575,10 @@ class ExecTempClient:
             return {"exists": True, "type": "file", "size": len(self.files[path])}
         return {"exists": False, "type": "none", "size": 0}
 
-    def file_read(self, *, remote, path, timeout=180.0):
+    def file_read(self, *, remote, path, timeout=180.0, **kwargs):
         return {"content_b64": base64.b64encode(self.files[path]).decode()}
 
-    def file_delete(self, *, remote, path, recursive=False, timeout=60.0):
+    def file_delete(self, *, remote, path, recursive=False, timeout=60.0, **kwargs):
         self.files.pop(path, None)
         return {"ok": True}
 
@@ -828,7 +829,7 @@ def test_powershell_script_is_uploaded_with_a_utf8_bom(monkeypatch):
     written: dict = {}
 
     class C:
-        def file_write(self, *, remote, path, content_b64, timeout=60.0):
+        def file_write(self, *, remote, path, content_b64, timeout=60.0, **kwargs):
             written[path] = base64.b64decode(content_b64)
             return {"ok": True}
 
@@ -1326,7 +1327,7 @@ class _RecordingClient:
     def file_stat(self, *, remote, path, timeout=60.0):
         return {"size": self.size, "path": path}
 
-    def file_read(self, *, remote, path, timeout=180.0):
+    def file_read(self, *, remote, path, timeout=180.0, **kwargs):
         self.read_paths.append(path)
         return {"content_b64": base64.b64encode(self.payload).decode("ascii")}
 

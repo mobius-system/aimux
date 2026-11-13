@@ -810,6 +810,165 @@ def _safe_user() -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# read ledger
+#
+# remote_edit / remote_write / remote_apply_patch may only modify a file that
+# was explicitly read with remote_read first. The ledger lives on THIS machine
+# (~/.aimux/read-ledger/<mobius-session>.json) and never leaves it: the bridge
+# carries only a session id and a read policy per request, never ledger data.
+#
+# Internal reads (patch computation, write verification, shell output) must not
+# create or refresh a record, or the gate would let itself through.
+# ---------------------------------------------------------------------------
+
+READ_LEDGER_DIRNAME = "read-ledger"
+READ_LEDGER_TTL_SECONDS = 86400
+# Strictly fewer than 128 entries.
+READ_LEDGER_MAX_ENTRIES = 127
+_READ_LEDGER_LOCK = threading.Lock()
+
+
+def _ledger_session_key(session: str) -> str:
+    """The session id becomes a file name; refuse anything unsafe there."""
+    key = (session or "").strip()
+    if not key or len(key) > 128 or not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+        raise BridgeError(
+            f"invalid mobius session id for the read ledger: {session!r}", kind="bad_request"
+        )
+    return key
+
+
+def _ledger_dir() -> Path:
+    return Path("~/.aimux").expanduser() / READ_LEDGER_DIRNAME
+
+
+def _ledger_path(session: str) -> Path:
+    return _ledger_dir() / f"{_ledger_session_key(session)}.json"
+
+
+def _ledger_file_fp(path: Path) -> str:
+    """Canonical key for one file on this machine (case-insensitive on Windows)."""
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path
+    text = str(resolved).replace("\\", "/")
+    return text.lower() if os.name == "nt" else text
+
+
+def _ledger_load(session: str) -> list[dict[str, Any]]:
+    path = _ledger_path(session)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception:
+        # A corrupt ledger must not silently unlock writes.
+        return []
+    entries = raw.get("reads") if isinstance(raw, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _ledger_prune(entries: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    fresh = [
+        entry for entry in entries
+        if isinstance(entry.get("read_at"), (int, float))
+        and now - float(entry["read_at"]) <= READ_LEDGER_TTL_SECONDS
+    ]
+    fresh.sort(key=lambda entry: float(entry["read_at"]))
+    return fresh[-READ_LEDGER_MAX_ENTRIES:]
+
+
+def _ledger_save(session: str, entries: list[dict[str, Any]]) -> None:
+    path = _ledger_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps({"version": 1, "reads": entries}, ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _ledger_cleanup_sessions(now: float) -> None:
+    """Drop whole session ledgers nobody touched for a day."""
+    directory = _ledger_dir()
+    try:
+        children = list(directory.glob("*.json"))
+    except OSError:
+        return
+    for child in children:
+        try:
+            if now - child.stat().st_mtime > READ_LEDGER_TTL_SECONDS:
+                child.unlink()
+        except OSError:
+            continue
+
+
+def _ledger_record(session: str, path: Path, stat_result: os.stat_result) -> None:
+    """Mark one file as read by this session (and refresh it after a write)."""
+    now = time.time()
+    fp = _ledger_file_fp(path)
+    with _READ_LEDGER_LOCK:
+        _ledger_cleanup_sessions(now)
+        entries = [entry for entry in _ledger_prune(_ledger_load(session), now)
+                   if entry.get("file_fp") != fp]
+        entries.append({
+            "file_fp": fp,
+            "read_at": now,
+            "mtime_when_read_ns": int(stat_result.st_mtime_ns),
+            "size_when_read": int(stat_result.st_size),
+        })
+        _ledger_save(session, _ledger_prune(entries, now))
+
+
+def _ledger_require(session: str, path: Path, stat_result: os.stat_result) -> None:
+    """Fail unless this exact file state was read by this session."""
+    fp = _ledger_file_fp(path)
+    now = time.time()
+    with _READ_LEDGER_LOCK:
+        entries = _ledger_prune(_ledger_load(session), now)
+    entry = next((entry for entry in entries if entry.get("file_fp") == fp), None)
+    if entry is None:
+        raise BridgeError(
+            f"{path} has not been read in this session; call remote_read first, then edit it",
+            kind="read_required",
+        )
+    if (
+        int(entry.get("mtime_when_read_ns", -1)) != int(stat_result.st_mtime_ns)
+        or int(entry.get("size_when_read", -1)) != int(stat_result.st_size)
+    ):
+        raise BridgeError(
+            f"{path} changed after it was read; call remote_read again before editing",
+            kind="stale_read",
+        )
+
+
+def _ledger_forget(session: str, path: Path) -> None:
+    fp = _ledger_file_fp(path)
+    now = time.time()
+    with _READ_LEDGER_LOCK:
+        entries = [entry for entry in _ledger_prune(_ledger_load(session), now)
+                   if entry.get("file_fp") != fp]
+        _ledger_save(session, entries)
+
+
+def _looks_like_text(data: bytes) -> bool:
+    """Best effort: NUL bytes mean binary; otherwise any known code page decodes."""
+    if b"\x00" in data:
+        return False
+    for encoding in ("utf-8", "cp936", "cp1252"):
+        try:
+            data.decode(encoding)
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
 class ReverseClientRuntime:
     def __init__(
         self,
@@ -1066,7 +1225,29 @@ class ReverseClientRuntime:
         path = self._file_path(payload)
         if not path.is_file():
             raise BridgeError(f"not a regular file: {path}", kind="not_found")
+        session = str(payload.get("session") or "")
+        policy = str(payload.get("read_policy") or "")
         data = path.read_bytes()
+        if policy == "record":
+            # Only an explicit remote_read may create reading rights.
+            if not session:
+                raise BridgeError("read_policy=record requires a session", kind="bad_request")
+            # Re-read when the file changes under us, so the recorded state and
+            # the bytes the caller received describe the same content.
+            for _ in range(2):
+                before = path.stat()
+                data = path.read_bytes()
+                after = path.stat()
+                if (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size):
+                    break
+            else:
+                raise BridgeError(f"{path} kept changing while reading; retry", kind="stale_read")
+            if not _looks_like_text(data):
+                raise BridgeError(
+                    f"{path} is not a text file; use remote_view_image for images",
+                    kind="not_text",
+                )
+            _ledger_record(session, path, after)
         return {
             "content_b64": base64.b64encode(data).decode("ascii"),
             "size": len(data),
@@ -1084,6 +1265,13 @@ class ReverseClientRuntime:
             raise BridgeError(
                 f"file size {len(data)} exceeds bridge limit {max_size}", kind="too_large"
             )
+        session = str(payload.get("session") or "")
+        policy = str(payload.get("read_policy") or "")
+        require_read = policy == "require" and bool(session)
+        # Last moment before the file changes: a write over an existing file
+        # needs a remote_read of that exact state. New files need none.
+        if require_read and path.exists() and path.is_file():
+            _ledger_require(session, path, path.stat())
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         mode_value = payload.get("mode")
@@ -1092,6 +1280,9 @@ class ReverseClientRuntime:
                 os.chmod(path, mode_value)
             except OSError:
                 pass
+        if require_read:
+            # Keep editing the same file working without another remote_read.
+            _ledger_record(session, path, path.stat())
         return {"size": len(data)}
 
     def _file_mkdir(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1180,8 +1371,15 @@ class ReverseClientRuntime:
     def _file_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
         path = self._file_path(payload)
         recursive = bool(payload.get("recursive", False))
+        session = str(payload.get("session") or "")
+        policy = str(payload.get("read_policy") or "")
+        require_read = policy == "require" and bool(session)
+        if require_read and path.exists() and path.is_file():
+            _ledger_require(session, path, path.stat())
         if not path.exists():
             # Idempotent: a missing target is already "deleted" (mirrors `rm -f`).
+            if require_read:
+                _ledger_forget(session, path)
             return {"ok": True, "existed": False}
         if path.is_symlink():
             path.unlink()
@@ -1194,6 +1392,8 @@ class ReverseClientRuntime:
             shutil.rmtree(path)
         else:
             path.unlink()
+        if require_read:
+            _ledger_forget(session, path)
         return {"ok": True, "existed": True}
 
     def _file_rename(self, payload: dict[str, Any]) -> dict[str, Any]:
