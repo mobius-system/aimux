@@ -57,6 +57,7 @@ def test_tools_list_classic_tools_in_order(mcp):
     names = [t["name"] for t in tools]
     assert names == [
         "remote_exec_command", "remote_set_remote_workdir", "remote_write_stdin",
+        "remote_read", "remote_edit", "remote_write",
         "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping",
     ]
 

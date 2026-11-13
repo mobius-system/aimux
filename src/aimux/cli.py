@@ -1969,7 +1969,9 @@ def cmd_apply_patch(
                 for line in results:
                     print(line)
                 return
-            applied = mcp_server._remote_apply_patch(remote, "", {"input": patch_text})
+            # No Mobius session here: the CLI keeps the pre-gate behaviour.
+            applied = mcp_server._remote_apply_patch(
+                remote, "", {"input": patch_text}, session="")
             for line in applied["applied"]:
                 print(line)
             return

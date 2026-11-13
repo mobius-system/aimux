@@ -1204,7 +1204,8 @@ def _remote_ping(remote: str, profile: str, args: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _remote_apply_patch(remote: str, profile: str, args: dict) -> dict:
+def _remote_apply_patch(remote: str, profile: str, args: dict,
+                        *, session: str | None = None) -> dict:
     if isinstance(args, dict):
         patch_text = args.get("input")
         if patch_text is None:
@@ -1213,7 +1214,12 @@ def _remote_apply_patch(remote: str, profile: str, args: dict) -> dict:
         patch_text = str(args or "")
     if not isinstance(patch_text, str) or not patch_text.strip():
         raise ValueError("input (raw patch text) is required")
-    applied = _apply_codex_patch(remote, patch_text)
+    # MCP calls leave session=None and get the per-session read gate; the CLI
+    # passes "" because it has no Mobius session and keeps its old behaviour.
+    applied = _apply_codex_patch(
+        remote, patch_text,
+        session=_ledger_session() if session is None else session,
+    )
     return {"applied": applied}
 
 
@@ -1256,6 +1262,7 @@ def _remote_read(remote: str, profile: str, args: dict) -> dict:
     except bridge.BridgeError as exc:
         raise ValueError(str(exc)) from None
     text = _decode_text(_file_bytes(res))
+    _reject_crlf(path, text)
     lines = text.splitlines()
     total = len(lines)
     if total == 0:
@@ -1293,6 +1300,7 @@ def _remote_edit(remote: str, profile: str, args: dict) -> dict:
     except bridge.BridgeError as exc:
         raise ValueError(str(exc)) from None
     text, encoding, bom = _decode_with_encoding(_file_bytes(res))
+    _reject_crlf(path, text)
     occurrences = text.count(old)
     if occurrences == 0:
         raise ValueError(
@@ -1321,6 +1329,8 @@ def _remote_write(remote: str, profile: str, args: dict) -> dict:
     if not isinstance(content, str):
         raise ValueError("content is required")
     _require_absolute_path(path)
+    # Keep repositories uniformly LF: refuse to create a CRLF file here too.
+    _reject_crlf(path, content)
     data = content.encode("utf-8")
     try:
         _write_verified(
@@ -1373,6 +1383,15 @@ def _decode_with_encoding(data: bytes) -> tuple[str, str, bytes]:
     raise ValueError("file is not text; use remote_view_image for images")
 
 
+_CRLF_MESSAGE = "疑似CRLF文件。请立即批量将仓库中CRLF文件转化为LF文件"
+
+
+def _reject_crlf(path: str, text: str) -> None:
+    """Refuse CRLF text: context matching is byte-exact, so it would never work."""
+    if "\r\n" in text:
+        raise ValueError(f"{path}: {_CRLF_MESSAGE}")
+
+
 def _patch_context_error(exc: ValueError) -> ValueError:
     """Add the recovery step to a context-mismatch error.
 
@@ -1389,9 +1408,10 @@ def _patch_context_error(exc: ValueError) -> ValueError:
     return ValueError(f"{message}, you should {hint}!")
 
 
-def _apply_codex_patch(remote: str, patch_text: str) -> list:
+def _apply_codex_patch(remote: str, patch_text: str, *, session: str = "") -> list:
     ops = _parse_codex_patch(patch_text)
     c = _client()
+    require_policy = "require" if session else ""
     results = []
     for op in ops:
         kind = op["kind"]
@@ -1399,12 +1419,13 @@ def _apply_codex_patch(remote: str, patch_text: str) -> list:
         try:
             if kind == "add":
                 content = op["content"]
+                _reject_crlf(path, content)
                 _write_verified(c, remote=remote, path=path, data=content.encode("utf-8"),
-                                session=_ledger_session(), read_policy="require")
+                                session=session, read_policy=require_policy)
                 results.append(f"added: {path}")
             elif kind == "delete":
                 c.file_delete(remote=remote, path=path, recursive=False,
-                              session=_ledger_session(), read_policy="require")
+                              session=session, read_policy=require_policy)
                 results.append(f"deleted: {path}")
             elif kind == "update":
                 # Patch computation is an internal read: it must not establish
@@ -1412,12 +1433,13 @@ def _apply_codex_patch(remote: str, patch_text: str) -> list:
                 res = c.file_read(remote=remote, path=path, timeout=180.0,
                                   read_policy="internal")
                 orig = _file_bytes(res).decode("utf-8", "replace")
+                _reject_crlf(path, orig)
                 try:
                     new = _apply_hunks(orig, op["hunks"])
                 except ValueError as exc:
                     raise _patch_context_error(exc) from None
                 _write_verified(c, remote=remote, path=path, data=new.encode("utf-8"),
-                                session=_ledger_session(), read_policy="require")
+                                session=session, read_policy=require_policy)
                 results.append(f"updated: {path}")
         except bridge.BridgeError as exc:
             # Ops are applied one file at a time; say what already landed so the
@@ -1699,6 +1721,7 @@ CLASSIC_TOOLS = [
         "- Results are returned using cat -n format, with line numbers starting at 1\n"
         "- This tool is unable to read non-text files such as image, pdf, etc (use remote_view_image for images). "
         "Reading a directory, a missing file, or an empty file returns an error rather than content.\n"
+        "- CRLF files are rejected: convert the repository to LF before reading or editing.\n"
         "- Do NOT re-read a file you just edited to verify — remote_edit/remote_write would have errored if the change failed.",
         "inputSchema": {
             "type": "object",
@@ -1719,7 +1742,8 @@ CLASSIC_TOOLS = [
         "- `old_string` must match the file exactly, including indentation, and be unique — the edit fails otherwise. "
         "Strip the remote_read line prefix (line number + tab) before matching.\n"
         "- `replace_all: true` replaces every occurrence instead.\n"
-        "- remote_edit is an alternative to remote_apply_patch, you must only use one of them.",
+        "- remote_edit is an alternative to remote_apply_patch, you must only use one of them.\n"
+        "- CRLF files are rejected: convert the repository to LF before reading or editing.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1736,7 +1760,8 @@ CLASSIC_TOOLS = [
         "name": "remote_write",
         "description": "Writes a file to the remote filesystem, overwriting if one exists.\n\n"
         "When to use: creating a new file, or fully replacing one you've already Read. "
-        "Overwriting an existing file you haven't Read will fail. For partial changes, use remote_edit instead.",
+        "Overwriting an existing file you haven't Read will fail. For partial changes, use remote_edit instead. "
+        "CRLF content is rejected: write LF only — convert the repository to LF first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1761,7 +1786,8 @@ CLASSIC_TOOLS = [
             "(2) context lines are matched strictly — do not add or omit leading/trailing spaces (an extra or missing space raises 'patch context not found'); "
             "if that happens, read the file again with remote_read and rebuild the hunk from what is actually there instead of retrying the same patch; "
             "(3) prefer a few small hunks over one big one; "
-            "(4) every `*** Update File:` and `*** Delete File:` path must have been read with remote_read in this session — `*** Add File:` does not need a prior read. "
+            "(4) every `*** Update File:` and `*** Delete File:` path must have been read with remote_read in this session — `*** Add File:` does not need a prior read; "
+            "(5) CRLF files are rejected — convert the repository to LF before patching. "
             "remote_apply_patch uses strict matching — be careful not to add or omit any space."
         ),
         "inputSchema": {

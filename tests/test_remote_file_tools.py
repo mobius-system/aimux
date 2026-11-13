@@ -201,6 +201,60 @@ def test_apply_patch_delete_is_gated(spy):
             {"session": mcp_server._ledger_session(), "read_policy": "require"}) in spy.calls
 
 
+CRLF_HINT = "疑似CRLF文件"
+
+
+def test_remote_read_rejects_crlf_files(spy):
+    spy.files["/win.py"] = b"one\r\ntwo\r\n"
+
+    with pytest.raises(ValueError, match=CRLF_HINT):
+        mcp_server._remote_read("r", "p", {"file_path": "/win.py"})
+
+
+def test_remote_edit_rejects_crlf_files(spy):
+    spy.files["/win.py"] = b"one\r\ntwo\r\n"
+
+    with pytest.raises(ValueError, match=CRLF_HINT):
+        mcp_server._remote_edit("r", "p", {
+            "file_path": "/win.py", "old_string": "one", "new_string": "1",
+        })
+    assert spy.files["/win.py"] == b"one\r\ntwo\r\n"
+
+
+def test_apply_patch_rejects_crlf_updates(spy):
+    spy.files["/win.py"] = b"one\r\ntwo\r\n"
+
+    with pytest.raises(ValueError, match=CRLF_HINT):
+        mcp_server._remote_apply_patch("r", "p", {
+            "input": "*** Begin Patch\n*** Update File: /win.py\n@@\n-one\n+1\n*** End Patch",
+        })
+    assert spy.files["/win.py"] == b"one\r\ntwo\r\n"
+
+
+def test_remote_write_rejects_crlf_content(spy):
+    with pytest.raises(ValueError, match=CRLF_HINT):
+        mcp_server._remote_write("r", "p", {"file_path": "/new.py", "content": "one\r\ntwo\r\n"})
+    assert "/new.py" not in spy.files
+
+
+def test_apply_patch_add_writes_lf_even_from_crlf_input(spy):
+    mcp_server._remote_apply_patch("r", "p", {
+        "input": "*** Begin Patch\n*** Add File: /new.py\n+one\r\n+two\r\n*** End Patch",
+    })
+
+    # The parser splits on line boundaries, so CRLF input never lands as CRLF.
+    assert b"\r" not in spy.files["/new.py"]
+    assert spy.files["/new.py"].splitlines() == [b"one", b"two"]
+
+
+def test_lf_files_are_still_accepted(spy):
+    spy.files["/unix.py"] = b"one\ntwo\n"
+
+    out = mcp_server._remote_read("r", "p", {"file_path": "/unix.py"})
+
+    assert out["total_lines"] == 2
+
+
 def test_apply_patch_reports_files_already_changed_when_a_later_gate_fails(monkeypatch):
     class LaterGateClient(SpyClient):
         def file_write(self, *, remote, path, content_b64, timeout=180.0, **kwargs):

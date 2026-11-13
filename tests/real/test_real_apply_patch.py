@@ -22,6 +22,7 @@ def test_patch_add_file(mcp, tmp_path):
 def test_patch_update_file_with_context(mcp, tmp_path):
     p = tmp_path / "src.txt"
     p.write_text("alpha\nmiddle\nomega\n")
+    mcp.call("remote_read", file_path=str(p))
     res = mcp.call("remote_apply_patch", input=_patch(
         f"*** Update File: {p}\n@@\n-alpha\n+ALPHA\n"
     ))
@@ -32,6 +33,7 @@ def test_patch_update_file_with_context(mcp, tmp_path):
 def test_patch_delete_file(mcp, tmp_path):
     p = tmp_path / "victim.txt"
     p.write_text("bye")
+    mcp.call("remote_read", file_path=str(p))
     res = mcp.call("remote_apply_patch", input=_patch(
         f"*** Delete File: {p}\n"
     ))
@@ -42,6 +44,7 @@ def test_patch_delete_file(mcp, tmp_path):
 def test_patch_update_missing_context_raises(mcp, tmp_path):
     p = tmp_path / "ctx.txt"
     p.write_text("real-context\n")
+    mcp.call("remote_read", file_path=str(p))
     with pytest.raises(RuntimeError, match="patch context not found"):
         mcp.call("remote_apply_patch", input=_patch(
             f"*** Update File: {p}\n@@\n-this-context-is-not-in-the-file\n+replaced\n"
@@ -53,6 +56,7 @@ def test_patch_update_missing_context_raises(mcp, tmp_path):
 def test_patch_multi_hunk_one_file(mcp, tmp_path):
     p = tmp_path / "multi.txt"
     p.write_text("one\ntwo\nthree\nfour\nfive\n")
+    mcp.call("remote_read", file_path=str(p))
     res = mcp.call("remote_apply_patch", input=_patch(
         f"*** Update File: {p}\n"
         f"@@\n-one\n+ONE\n"
