@@ -6,12 +6,14 @@ connection for every call. Against a broker reached through a public gateway
 that is ~180 ms per request versus ~60 ms on a reused connection, and one
 ``remote_exec_command`` makes eight of them.
 
-This module keeps one connection per origin and drops it when the peer has
-closed it (nginx closes idle keep-alive sockets after ~75 s, which is shorter
-than the gap between two agent tool calls). A request is never retried after it
-was written: retrying a POST whose response was lost could run a command
-twice. Stale detection happens *before* sending, so the common idle-close case
-reconnects cleanly without that risk.
+Connections are cached **per thread**: the MCP server handles tool calls on
+worker threads and a single shared connection would serialize them behind one
+lock. Each worker keeps its own socket, so concurrent calls stay concurrent.
+
+A request is never retried after it was written: retrying a POST whose response
+was lost could run a command twice. Stale detection happens *before* sending, so
+the common idle-close case (nginx drops keep-alive after ~75 s) reconnects
+cleanly without that risk.
 
 Requests that must go through a proxy fall back to ``urllib`` so environment
 and registry proxy settings keep working.
@@ -26,8 +28,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-_LOCK = threading.RLock()
-_CONNS: dict[tuple[str, str, int], http.client.HTTPConnection] = {}
+_LOCAL = threading.local()
+# Every connection any thread opened, so close_all() can reach them.
+_REGISTRY_LOCK = threading.Lock()
+_REGISTRY: set[http.client.HTTPConnection] = set()
+
+
+def _thread_conns() -> dict[tuple[str, str, int], http.client.HTTPConnection]:
+    conns = getattr(_LOCAL, "conns", None)
+    if conns is None:
+        conns = {}
+        _LOCAL.conns = conns
+    return conns
 
 
 def _needs_proxy(scheme: str, host: str) -> bool:
@@ -69,19 +81,28 @@ def _stale(conn: http.client.HTTPConnection) -> bool:
 
 
 def _drop(key: tuple[str, str, int]) -> None:
-    conn = _CONNS.pop(key, None)
-    if conn is not None:
+    conn = _thread_conns().pop(key, None)
+    if conn is None:
+        return
+    with _REGISTRY_LOCK:
+        _REGISTRY.discard(conn)
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def close_all() -> None:
+    """Close every cached connection across all threads (tests / shutdown)."""
+    with _REGISTRY_LOCK:
+        conns = list(_REGISTRY)
+        _REGISTRY.clear()
+    for conn in conns:
         try:
             conn.close()
         except Exception:
             pass
-
-
-def close_all() -> None:
-    """Close every cached connection (tests and process shutdown)."""
-    with _LOCK:
-        for key in list(_CONNS):
-            _drop(key)
+    _LOCAL.conns = {}
 
 
 def _urllib_request(method: str, url: str, headers: dict[str, str],
@@ -108,30 +129,32 @@ def request(method: str, url: str, headers: dict[str, str],
         return _urllib_request(method, url, headers, body, timeout)
 
     key = (scheme, host, port)
-    with _LOCK:
-        conn = _CONNS.get(key)
-        if conn is not None and _stale(conn):
-            _drop(key)
-            conn = None
-        if conn is None:
-            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-            conn = cls(host, port, timeout=timeout)
-            _CONNS[key] = conn
-        # The socket was created with the first timeout; later calls may use a
-        # different one, so update the connection and the live socket.
-        conn.timeout = timeout
-        if conn.sock is not None:
-            try:
-                conn.sock.settimeout(timeout)
-            except OSError:
-                pass
+    conns = _thread_conns()
+    conn = conns.get(key)
+    if conn is not None and _stale(conn):
+        _drop(key)
+        conn = None
+    if conn is None:
+        cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        conn = cls(host, port, timeout=timeout)
+        conns[key] = conn
+        with _REGISTRY_LOCK:
+            _REGISTRY.add(conn)
+    # The socket was created with the first timeout; later calls may use a
+    # different one, so update the connection and the live socket.
+    conn.timeout = timeout
+    if conn.sock is not None:
         try:
-            conn.request(method, path, body=body, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            if resp.will_close:
-                _drop(key)
-            return resp.status, resp.headers, data
-        except (http.client.HTTPException, OSError):
+            conn.sock.settimeout(timeout)
+        except OSError:
+            pass
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.will_close:
             _drop(key)
-            raise
+        return resp.status, resp.headers, data
+    except (http.client.HTTPException, OSError):
+        _drop(key)
+        raise

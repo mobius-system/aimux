@@ -1,8 +1,11 @@
 """Unit tests for aimux.mcp_server (stdio MCP server, codex-facing tools)."""
 import base64
+import io
 import json
 import os
 import re
+import sys
+import threading
 import time
 
 import pytest
@@ -525,6 +528,74 @@ def test_jsonrpc_apply_patch_context_mismatch_is_actionable(monkeypatch, fake):
         "ValueError: patch context not found, "
         "you should read this file again with remote_read!"
     )
+
+
+def test_tool_calls_run_concurrently_and_do_not_head_block(monkeypatch):
+    """A long tool call must not delay the next call in the same MCP server."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_ping(remote, profile, args):
+        if args.get("slug") == "slow":
+            started.set()
+            release.wait(10)
+        return {"ok": True, "slug": args.get("slug")}
+
+    monkeypatch.setitem(mcp_server._TOOL_FUNCS, "remote_ping", fake_ping)
+    sent: list[dict] = []
+    sent_lock = threading.Lock()
+
+    def capture(obj):
+        with sent_lock:
+            sent.append(obj)
+
+    monkeypatch.setattr(mcp_server, "_send", capture)
+    lines = [
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "remote_ping", "arguments": {"slug": "slow"}}}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "remote_ping", "arguments": {"slug": "fast"}}}),
+    ]
+
+    serving = threading.Thread(
+        target=mcp_server._serve_requests, args=("r", "posix-pty", lines), daemon=True)
+    serving.start()
+    try:
+        assert started.wait(5), "the slow call never started"
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with sent_lock:
+                if any(obj.get("id") == 2 for obj in sent):
+                    break
+            time.sleep(0.02)
+        with sent_lock:
+            ids = [obj.get("id") for obj in sent]
+        assert 2 in ids, "the fast call must return while the slow one is still running"
+        assert 1 not in ids
+    finally:
+        release.set()
+        serving.join(timeout=10)
+
+    with sent_lock:
+        assert {obj.get("id") for obj in sent} == {1, 2}
+
+
+def test_concurrent_send_writes_whole_lines(monkeypatch):
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+
+    def writer(index: int):
+        mcp_server._send({"id": index, "pad": "x" * 2000})
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    lines = buffer.getvalue().strip().splitlines()
+    assert len(lines) == 16
+    assert {json.loads(line)["id"] for line in lines} == set(range(16))
 
 
 def test_jsonrpc_initialized_notification_no_response(monkeypatch):

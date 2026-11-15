@@ -138,6 +138,13 @@ instead of `cmd` and runs it with the remote's own Python (`python3` then
 uploaded verbatim to a temp file, so no shell quoting applies, and the file is
 deleted afterwards. Every other parameter matches `remote_exec_command`.
 
+**Concurrency:** tool calls are served by a small worker pool, so a
+long-running command no longer blocks the next call in the same session. It
+still occupies one worker until its `yield_time_ms` expires; for
+multi-minute jobs pass a short yield (10-30 s), take the returned
+`session_id`, and poll it with `remote_write_stdin`, or start the job detached
+and tail its log.
+
 **Editing rule:** create or modify files only with the file tools
 (`remote_read` → `remote_edit` / `remote_write` / `remote_apply_patch`), never
 by writing content through `remote_exec_command` — including redirection,

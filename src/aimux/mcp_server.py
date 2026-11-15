@@ -22,10 +22,12 @@ import importlib.resources
 import pathlib
 import json
 import os
+import queue
 import re
 import signal
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -65,6 +67,23 @@ def _file_bytes(res: dict) -> bytes:
 
 _session_counter = 0
 _sessions: dict[int, dict] = {}
+# Tool calls run on worker threads (see _serve_requests), so the registry, the
+# counter and the workdir store need one lock. Network calls are never made
+# while it is held.
+_SESSIONS_LOCK = threading.RLock()
+_WORKDIR_LOCK = threading.RLock()
+
+
+def _session_snapshot(sid: int) -> dict:
+    with _SESSIONS_LOCK:
+        return dict(_sessions.get(sid) or {})
+
+
+def _session_update(sid: int, **values: Any) -> None:
+    with _SESSIONS_LOCK:
+        sess = _sessions.get(sid)
+        if sess is not None:
+            sess.update(values)
 
 # Bridge control client, stashed at startup so the SIGTERM handler can reach it
 # without closure tricks. Set in run_stdio() after remote/profile validation.
@@ -129,6 +148,12 @@ def _workdir_key(remote: str) -> str:
 def _load_workdir_store() -> dict[str, dict]:
     """Read the persisted map, dropping malformed and stale entries."""
     global _WORKDIR_CACHE
+    with _WORKDIR_LOCK:
+        return _load_workdir_store_locked()
+
+
+def _load_workdir_store_locked() -> dict[str, dict]:
+    global _WORKDIR_CACHE
     if _WORKDIR_CACHE is not None:
         return _WORKDIR_CACHE
     data: dict[str, dict] = {}
@@ -155,6 +180,11 @@ def _load_workdir_store() -> dict[str, dict]:
 
 def _save_workdir_store() -> None:
     """Write the map atomically (tmp + rename), owner-readable only."""
+    with _WORKDIR_LOCK:
+        _save_workdir_store_locked()
+
+
+def _save_workdir_store_locked() -> None:
     if _WORKDIR_CACHE is None:
         return
     try:
@@ -169,10 +199,11 @@ def _save_workdir_store() -> None:
 
 def _session_workdir_default(remote: str) -> str:
     """The default set for (this mobius session × this bridge client), if any."""
-    if not _mobius_session:
-        return _workdir_default
-    entry = _load_workdir_store().get(_workdir_key(remote)) or {}
-    return str(entry.get("workdir") or "")
+    with _WORKDIR_LOCK:
+        if not _mobius_session:
+            return _workdir_default
+        entry = _load_workdir_store_locked().get(_workdir_key(remote)) or {}
+        return str(entry.get("workdir") or "")
 
 
 def _effective_workdir(args: dict, remote: str) -> tuple[str | None, str]:
@@ -219,9 +250,10 @@ def _create_exec_session(remote: str, profile: str, cmd: str, cwd: str | None) -
         remote=remote, name=name, profile=profile, cmd=cmd, cwd=cwd,
         created_at=bridge.utc_now(), created_by="aimux-mcp",
     )
-    _session_counter += 1
-    sid = _session_counter
-    _sessions[sid] = {"remote": remote, "name": name, "profile": profile}
+    with _SESSIONS_LOCK:
+        _session_counter += 1
+        sid = _session_counter
+        _sessions[sid] = {"remote": remote, "name": name, "profile": profile}
     return sid
 
 
@@ -231,7 +263,8 @@ def _close_exec_session(sid: int, c, *, timeout: float | None = None) -> None:
     ``timeout`` bounds each bridge call, for callers that must not block on a
     dead client (process exit); ``None`` lets each call use its own default.
     """
-    sess = _sessions.pop(sid, None)
+    with _SESSIONS_LOCK:
+        sess = _sessions.pop(sid, None)
     if not sess:
         return
     kw: dict = {} if timeout is None else {"timeout": timeout}
@@ -268,8 +301,12 @@ def _reap_all_sessions(c, *, timeout: float = 5.0) -> int:
     timeout bounds exit latency if the client is down.
     """
     reaped = 0
-    for sid in list(_sessions.keys()):
-        if sid not in _sessions:
+    with _SESSIONS_LOCK:
+        sids = list(_sessions)
+    for sid in sids:
+        with _SESSIONS_LOCK:
+            exists = sid in _sessions
+        if not exists:
             continue
         _close_exec_session(sid, c, timeout=timeout)
         reaped += 1
@@ -428,7 +465,7 @@ def _decorate_output(output: str, *, finished: bool, timeout_ms: int | None = No
 
 def _exec_result(sid: int, c, output: str, original_tokens: int, exit_code, finished: bool, wall: float,
                  *, note: str | None = None, timeout_ms: int | None = None, dead: bool = False) -> dict:
-    sess = _sessions.get(sid) or {}
+    sess = _session_snapshot(sid)
     res = {
         "output": _decorate_output(output, finished=finished, timeout_ms=timeout_ms, dead=dead),
         "original_token_count": original_tokens,
@@ -769,10 +806,10 @@ def _run_pty(remote: str, profile: str, args: dict, *, command: str,
 
     for attempt in range(max_retries + 1):
         sid = _create_exec_session(remote, profile, shell_cmd, workdir)
-        name = _sessions[sid]["name"]
-        _sessions[sid].update(workdir=workdir or "", workdir_source=workdir_source)
+        name = _session_snapshot(sid).get("name", "")
+        _session_update(sid, workdir=workdir or "", workdir_source=workdir_source)
         marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
-        _sessions[sid]["marker"] = marker
+        _session_update(sid, marker=marker)
         try:
             if pre_send is not None:
                 pre_send(sid, c)
@@ -825,12 +862,12 @@ def _run_temp_script(remote: str, profile: str, args: dict, *, build_plan) -> di
 
     for attempt in range(max_retries + 1):
         sid = _create_exec_session(remote, profile, shell_bin, workdir)
-        name = _sessions[sid]["name"]
-        _sessions[sid].update(workdir=workdir or "", workdir_source=workdir_source)
+        name = _session_snapshot(sid).get("name", "")
+        _session_update(sid, workdir=workdir or "", workdir_source=workdir_source)
         try:
             plan, uploads, extra = build_plan(family, windows, shell_bin)
-            _sessions[sid].update(
-                tmp_script=plan.script, tmp_out=plan.out, tmp_code=plan.code, **extra)
+            _session_update(
+                sid, tmp_script=plan.script, tmp_out=plan.out, tmp_code=plan.code, **extra)
             # 0) caller-owned inputs (the Python script file) land first.
             for path, data in uploads:
                 c.file_write(
@@ -1008,7 +1045,7 @@ def _remote_exec_python_interactive(remote: str, profile: str, args: dict,
     data = content.encode("utf-8")
 
     def pre_send(sid: int, c) -> None:
-        _sessions[sid]["tmp_py"] = upload
+        _session_update(sid, tmp_py=upload)
         c.file_write(
             remote=remote,
             path=upload,
@@ -1047,11 +1084,12 @@ def _remote_set_remote_workdir(remote: str, profile: str, args: dict) -> dict:
     c = _client()
 
     if not workdir:
-        if _mobius_session:
-            store = _load_workdir_store()
-            if store.pop(_workdir_key(remote), None) is not None:
-                _save_workdir_store()
-        _workdir_default = ""
+        with _WORKDIR_LOCK:
+            if _mobius_session:
+                store = _load_workdir_store_locked()
+                if store.pop(_workdir_key(remote), None) is not None:
+                    _save_workdir_store_locked()
+            _workdir_default = ""
         return {
             "ok": True, "scope": _workdir_scope(), "remote": remote,
             "workdir": None, "verified": "cleared",
@@ -1076,12 +1114,13 @@ def _remote_set_remote_workdir(remote: str, profile: str, args: dict) -> dict:
             f"workdir does not exist on {remote}: {workdir} (pass create=true to create it)"
         )
 
-    if _mobius_session:
-        store = _load_workdir_store()
-        store[_workdir_key(remote)] = {"workdir": workdir, "updated_at": time.time()}
-        _save_workdir_store()
-    else:
-        _workdir_default = workdir
+    with _WORKDIR_LOCK:
+        if _mobius_session:
+            store = _load_workdir_store_locked()
+            store[_workdir_key(remote)] = {"workdir": workdir, "updated_at": time.time()}
+            _save_workdir_store_locked()
+        else:
+            _workdir_default = workdir
     return {
         "ok": True, "scope": _workdir_scope(), "remote": remote,
         "workdir": workdir, "verified": verified,
@@ -1098,7 +1137,7 @@ def _remote_write_stdin(remote: str, profile: str, args: dict) -> dict:
         sid = int(args.get("session_id"))
     except Exception:
         raise ValueError("session_id is required")
-    sess = _sessions.get(sid)
+    sess = _session_snapshot(sid)
     if not sess:
         raise ValueError(f"unknown or expired session_id: {sid}")
     chars = args.get("chars") or ""
@@ -2855,9 +2894,16 @@ def tools_for(toolset: str) -> list[dict]:
 PROTOCOL_VERSION = "2024-11-05"
 
 
+# Tool calls run on a worker pool, so stdout is written from several threads.
+# One lock per line keeps a response from interleaving with another.
+_SEND_LOCK = threading.Lock()
+
+
 def _send(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(obj, ensure_ascii=False) + "\n"
+    with _SEND_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def _result(req_id, result):
@@ -2912,6 +2958,102 @@ def _dispatch(remote: str, profile: str, req: dict) -> None:
     _error(req_id, -32601, f"method not found: {method}")
 
 
+class _InFlight:
+    """Counts queued + running tool calls so shutdown can wait a bounded time."""
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._cond = threading.Condition()
+
+    def add(self) -> None:
+        with self._cond:
+            self._count += 1
+
+    def done(self) -> None:
+        with self._cond:
+            self._count -= 1
+            if self._count <= 0:
+                self._cond.notify_all()
+
+    def wait(self, timeout: float) -> bool:
+        with self._cond:
+            if self._count <= 0:
+                return True
+            self._cond.wait_for(lambda: self._count <= 0, timeout=timeout)
+            return self._count <= 0
+
+
+def _max_tool_concurrency() -> int:
+    raw = os.environ.get("AIMUX_MCP_MAX_CONCURRENCY", "")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 8
+    return max(1, min(value, 32))
+
+
+_MCP_SHUTDOWN_GRACE_S = 5.0
+
+
+def _serve_requests(remote: str, profile: str, lines) -> None:
+    """Read JSON-RPC requests; run ``tools/call`` on a small worker pool.
+
+    Only tool calls are threaded. ``initialize`` / ``tools/list`` /
+    notifications are instantaneous, and answering them inline keeps the
+    handshake ordered. A long-running command therefore no longer blocks the
+    next tool call in the same agent session.
+
+    The pool threads are persistent (and daemons): keeping them alive is what
+    lets each worker keep its thread-local keep-alive connection, and being
+    daemons means a call that never returns cannot keep the process alive
+    after the agent closes stdin.
+    """
+    limit = _max_tool_concurrency()
+    work: "queue.Queue[dict]" = queue.Queue(maxsize=max(limit * 2, 1))
+    inflight = _InFlight()
+
+    def worker() -> None:
+        while True:
+            req = work.get()
+            try:
+                _dispatch(remote, profile, req)
+            except BrokenPipeError:
+                return  # agent's stdout is gone; the stdin loop will see EOF
+            except Exception as e:
+                print(f"aimux-mcp: tool call error: {e}", file=sys.stderr)
+                try:
+                    _error(req.get("id"), -32603, f"internal error: {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+            finally:
+                inflight.done()
+
+    for index in range(limit):
+        threading.Thread(target=worker, daemon=True, name=f"aimux-mcp-call-{index}").start()
+
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            req = json.loads(raw)
+        except json.JSONDecodeError:
+            _error(None, -32700, "parse error")
+            continue
+        if not isinstance(req, dict):
+            _error(None, -32600, "invalid request")
+            continue
+        if req.get("method") != "tools/call":
+            _dispatch(remote, profile, req)
+            continue
+        inflight.add()
+        work.put(req)  # bounded: backpressure instead of unbounded threads
+
+    # Give in-flight work a short grace to deliver its responses; the caller
+    # then reaps sessions. Anything still running dies with the process.
+    inflight.wait(_MCP_SHUTDOWN_GRACE_S)
+
+
 def run_stdio(*, remote: str, profile: str | None = None, toolset: str = "classic",
                mobius_session: str = "") -> None:
     """Run the MCP stdio server bound to one bridge remote.
@@ -2954,21 +3096,7 @@ def run_stdio(*, remote: str, profile: str | None = None, toolset: str = "classi
     signal.signal(signal.SIGTERM, _on_sigterm)
 
     try:
-        for raw in sys.stdin:
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                req = json.loads(raw)
-            except json.JSONDecodeError:
-                _error(None, -32700, "parse error")
-                continue
-            try:
-                _dispatch(remote, prof, req)
-            except BrokenPipeError:
-                raise  # agent closed stdout pipe mid-write; fall through to reap
-            except Exception as e:
-                print(f"aimux-mcp: dispatch error: {e}", file=sys.stderr)
+        _serve_requests(remote, prof, sys.stdin)
     except BrokenPipeError:
         pass  # agent gone; let the finally reap and exit
     finally:
