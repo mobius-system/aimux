@@ -180,7 +180,7 @@ rewritten in between.
 6. Expose a remote to an MCP agent — optionally with computer use.
 
 ```bash
-# classic tools only (remote_exec_command, remote_write_stdin, remote_ping, ...)
+# classic tools only (remote_exec_command, remote_exec_python_script, remote_write_stdin, remote_ping, ...)
 aimux mcp serve --remote=winbox
 
 # classic + computer-use tools (remote_gui_diagnostics, remote_gui_list_windows,

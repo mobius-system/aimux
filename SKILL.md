@@ -123,7 +123,8 @@ command stays quiet. Set `AIMUX_LOG_LEVEL=DEBUG` to see every command it runs.
 ## Driving a remote through MCP
 
 `aimux mcp serve --remote <device>` exposes one remote as MCP tools
-(`remote_exec_command`, `remote_write_stdin`, `remote_apply_patch`,
+(`remote_exec_command`, `remote_exec_python_script`, `remote_write_stdin`,
+`remote_read`, `remote_edit`, `remote_write`, `remote_apply_patch`,
 `remote_view_image`, `remote_ping`, ...). Start with **`remote_ping`**: it is
 not just a health check — it reports where your commands actually land. You get
 the remote's OS and architecture, the shell profile they run in with the syntax
@@ -131,11 +132,19 @@ it expects, the directory they start from, and the encoding its output comes
 back in. Write commands for that answer instead of probing with `hostname` /
 `uname`, and check it again after the user switches devices.
 
-**Editing rule:** create or modify files only with `remote_apply_patch`, never
+**Running Python:** `remote_exec_python_script` takes `python_script_content`
+instead of `cmd` and runs it with the remote's own Python (`python3` then
+`python` on POSIX, `python` then the `py` launcher on Windows). The source is
+uploaded verbatim to a temp file, so no shell quoting applies, and the file is
+deleted afterwards. Every other parameter matches `remote_exec_command`.
+
+**Editing rule:** create or modify files only with the file tools
+(`remote_read` → `remote_edit` / `remote_write` / `remote_apply_patch`), never
 by writing content through `remote_exec_command` — including redirection,
-heredocs, `python -c`, `tee`, and base64/gzip/hex payloads. Long content is not
-an exception: split the hunks or use `Delete File` + `Add File`. Reading and
-deleting files through `remote_exec_command` is allowed.
+heredocs, `tee`, and base64/gzip/hex payloads. Overwriting an existing file,
+`remote_edit`, and patch `Update File` / `Delete File` require a prior
+`remote_read` in the same session; CRLF files and CRLF content are rejected.
+Reading and deleting files through `remote_exec_command` is allowed.
 
 ## Computer use (Windows x64)
 

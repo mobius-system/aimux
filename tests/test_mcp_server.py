@@ -462,7 +462,8 @@ def test_jsonrpc_tools_list(monkeypatch):
     monkeypatch.setattr(mcp_server, "_send", lambda obj: sent.append(obj))
     mcp_server._dispatch("rem", "prof", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = [t["name"] for t in sent[0]["result"]["tools"]]
-    assert names == ["remote_exec_command", "remote_set_remote_workdir", "remote_write_stdin",
+    assert names == ["remote_exec_command", "remote_exec_python_script",
+                     "remote_set_remote_workdir", "remote_write_stdin",
                      "remote_read", "remote_edit", "remote_write",
                      "remote_apply_patch", "remote_view_image", "remote_download_file", "remote_ping"]
 
@@ -767,6 +768,105 @@ def test_exec_temp_paths_windows_extensions():
     assert s.endswith(".cmd") and o.endswith(".out") and c.endswith(".code")
     assert s[:-4] == o[:-4] == c[:-5]
     assert s.startswith("~/AppData/Local/Temp/aimux_tmp/")
+
+
+# ---- remote_exec_python_script ----
+
+
+def test_python_plan_posix_uploads_beside_wrapper_and_prefers_python3():
+    paths, upload, ref = mcp_server._python_script_paths("posix", windows=False)
+    assert upload == paths[0].rsplit(".", 1)[0] + ".py"
+    body = mcp_server._python_oneshot_body("posix", ref)
+    assert "command -v python3 || command -v python" in body
+    assert f'"{ref}"' in body
+
+
+def test_python_plan_windows_spells_the_path_per_shell():
+    _, upload, cmd_ref = mcp_server._python_script_paths("cmd", windows=True)
+    assert upload.startswith("~/AppData/Local/Temp/aimux_tmp/") and upload.endswith(".py")
+    assert cmd_ref.startswith("%USERPROFILE%\\AppData\\Local\\Temp\\aimux_tmp\\")
+    body = mcp_server._python_oneshot_body("cmd", cmd_ref)
+    assert "where python >nul 2>nul" in body and "%PY%" in body
+
+    _, _, ps_ref = mcp_server._python_script_paths("powershell", windows=True)
+    assert ps_ref.startswith("$env:USERPROFILE\\")
+    assert "Get-Command python" in mcp_server._python_oneshot_body("powershell", ps_ref)
+
+    # A quoted '~' does not expand in bash; $HOME inside the quotes does.
+    _, _, msys_ref = mcp_server._python_script_paths("mingw64", windows=True)
+    assert msys_ref.startswith("$HOME/AppData/")
+
+
+def test_python_script_runs_writes_and_cleans_up(monkeypatch):
+    c = ExecTempClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    source = "print('hi')\n"
+    r = mcp_server._remote_exec_python_script(
+        "r", "posix-pty", {"python_script_content": source, "yield_time_ms": 1000}
+    )
+
+    assert r["exit_code"] == 0
+    py_writes = [(p, d) for p, d in c.writes if p.endswith(".py")]
+    assert py_writes and py_writes[0][1] == source.encode("utf-8")
+    wrapper = [(p, d) for p, d in c.writes if p.endswith(".sh")][0]
+    assert b"command -v python3" in wrapper[1]
+    assert py_writes[0][0].encode() in wrapper[1]
+    # finished -> session killed and the script file removed too
+    assert c.killed and c.files == {}
+
+
+def test_python_script_windows_uses_cmd_launcher(monkeypatch):
+    c = WindowsExecClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_python_script(
+        "r", "cmd", {"python_script_content": "print(1)", "yield_time_ms": 1000}
+    )
+
+    assert r["exit_code"] == 3
+    body = [d for p, d in c.writes if p.endswith(".cmd")][0]
+    assert b"where python" in body and b"%PY%" in body
+    assert c.killed and c.files == {}
+
+
+def test_python_script_interactive_keeps_the_pty(monkeypatch):
+    class PtyFileClient(ExecClient):
+        def __init__(self):
+            super().__init__()
+            self.files: dict[str, bytes] = {}
+
+        def file_write(self, *, remote, path, content_b64, mode=None, max_size=None,
+                       timeout=180.0, **kwargs):
+            self.files[path] = base64.b64decode(content_b64)
+            return {"ok": True}
+
+        def file_delete(self, *, remote, path, recursive=False, timeout=60.0, **kwargs):
+            self.files.pop(path, None)
+            return {"ok": True}
+
+    c = PtyFileClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+    c.captures = [{"content": ""}]
+
+    mcp_server._remote_exec_python_script(
+        "r", "posix-pty",
+        {"python_script_content": "print(1)", "interactive": True, "yield_time_ms": 250},
+    )
+
+    keys = c.sent[0]["keys"][0]
+    assert "python3" in keys and " -i " in keys and "__AIMUX_EXIT_" in keys
+    assert not keys.startswith("bash /tmp/aimux_tmp")
+    assert any(path.endswith(".py") for path in c.files)
+    assert any(s.get("tmp_py", "").endswith(".py") for s in mcp_server._sessions.values())
+
+
+def test_python_script_requires_content():
+    with pytest.raises(ValueError, match="python_script_content"):
+        mcp_server._remote_exec_python_script("r", "posix-pty", {"python_script_content": "  "})
 
 
 def test_windows_exec_runs_cleans_up_and_reports_exit_code(monkeypatch):

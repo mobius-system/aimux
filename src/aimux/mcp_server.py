@@ -224,7 +224,7 @@ def _close_exec_session(sid: int, c, *, timeout: float | None = None) -> None:
         pass
     # Best-effort cleanup of the temp script/output/code files created by the
     # temp-file exec path. Missing files are a no-op on the remote.
-    for key in ("tmp_script", "tmp_out", "tmp_code"):
+    for key in ("tmp_script", "tmp_out", "tmp_code", "tmp_py"):
         path = sess.get(key)
         if not path:
             continue
@@ -549,7 +549,8 @@ def _win_path(path: str) -> str:
     return path.replace("/", "\\").replace("~", "%USERPROFILE%", 1)
 
 
-def _exec_plan(*, cmd: str, profile: str, shell_bin: str | None, windows: bool) -> _ExecPlan:
+def _exec_plan(*, cmd: str, profile: str, shell_bin: str | None, windows: bool,
+               temp_paths: tuple[str, str, str] | None = None) -> _ExecPlan:
     """Where the temp files live, what the script says, and how to start it.
 
     One mechanism everywhere: the command is uploaded verbatim to a temp script,
@@ -564,7 +565,7 @@ def _exec_plan(*, cmd: str, profile: str, shell_bin: str | None, windows: bool) 
       writes UTF-16, which the reader (UTF-8) would turn into mojibake.
     """
     family = _shell_family(profile)
-    script, outfile, codefile = _exec_temp_paths(family, windows=windows)
+    script, outfile, codefile = temp_paths or _exec_temp_paths(family, windows=windows)
 
     if not windows:
         runner = shell_bin or "bash"
@@ -718,10 +719,13 @@ def _command_with_exit_marker(cmd: str, marker: str, profile: str) -> str:
     return f"{cmd}; {marker_cmd}"
 
 
-def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
-    cmd = args.get("cmd")
-    if not isinstance(cmd, str) or not cmd.strip():
-        raise ValueError("cmd is required")
+def _run_pty(remote: str, profile: str, args: dict, *, command: str,
+             pre_send=None) -> dict:
+    """Live-PTY execution shared by exec_command and exec_python_script.
+
+    ``pre_send`` runs after the session exists and before the command is typed;
+    the Python tool uses it to upload the script file.
+    """
     workdir, workdir_source = _effective_workdir(args, remote)
     shell_bin = args.get("shell") or None
     login = args.get("login")
@@ -747,10 +751,12 @@ def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
         marker = f"__AIMUX_EXIT_{uuid.uuid4().hex[:8]}__"
         _sessions[sid]["marker"] = marker
         try:
+            if pre_send is not None:
+                pre_send(sid, c)
             c.send_keys(
                 remote=remote,
                 name=name,
-                keys=[_command_with_exit_marker(cmd, marker, profile), "Enter"],
+                keys=[_command_with_exit_marker(command, marker, profile), "Enter"],
                 flags=[],
                 timeout=15.0,
             )
@@ -776,10 +782,13 @@ def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
     raise last_error
 
 
-def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict:
-    cmd = args.get("cmd")
-    if not isinstance(cmd, str) or not cmd.strip():
-        raise ValueError("cmd is required")
+def _run_temp_script(remote: str, profile: str, args: dict, *, build_plan) -> dict:
+    """One-shot temp-script execution shared by exec_command and the Python tool.
+
+    ``build_plan(family, windows, shell_bin)`` returns
+    ``(plan, uploads, extra_session_files)``: extra files to upload before the
+    script, and the session keys to clean up afterwards.
+    """
     workdir, workdir_source = _effective_workdir(args, remote)
     shell_bin = args.get("shell") or None
     max_tokens = int(args.get("max_output_tokens") or 10000)
@@ -787,6 +796,7 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
 
     c = _client()
     windows = _remote_is_windows(profile)
+    family = _shell_family(profile)
     max_retries = 2  # 3 total attempts
     last_error: Exception | None = None
 
@@ -794,9 +804,18 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
         sid = _create_exec_session(remote, profile, shell_bin, workdir)
         name = _sessions[sid]["name"]
         _sessions[sid].update(workdir=workdir or "", workdir_source=workdir_source)
-        plan = _exec_plan(cmd=cmd, profile=profile, shell_bin=shell_bin, windows=windows)
-        _sessions[sid].update(tmp_script=plan.script, tmp_out=plan.out, tmp_code=plan.code)
         try:
+            plan, uploads, extra = build_plan(family, windows, shell_bin)
+            _sessions[sid].update(
+                tmp_script=plan.script, tmp_out=plan.out, tmp_code=plan.code, **extra)
+            # 0) caller-owned inputs (the Python script file) land first.
+            for path, data in uploads:
+                c.file_write(
+                    remote=remote,
+                    path=path,
+                    content_b64=base64.b64encode(data).decode("ascii"),
+                    timeout=60.0,
+                )
             # 1) command verbatim -> temp script (no send_keys mangling).
             # Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so non-ASCII
             # text in the command would arrive as mojibake.
@@ -833,6 +852,25 @@ def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict
     raise last_error
 
 
+def _remote_exec_command_pty(remote: str, profile: str, args: dict) -> dict:
+    cmd = args.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        raise ValueError("cmd is required")
+    return _run_pty(remote, profile, args, command=cmd)
+
+
+def _remote_exec_command_tempfile(remote: str, profile: str, args: dict) -> dict:
+    cmd = args.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        raise ValueError("cmd is required")
+
+    def build_plan(family: str, windows: bool, shell_bin: str | None):
+        plan = _exec_plan(cmd=cmd, profile=profile, shell_bin=shell_bin, windows=windows)
+        return plan, [], {}
+
+    return _run_temp_script(remote, profile, args, build_plan=build_plan)
+
+
 def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     # Default is the clean one-shot temp-script path on every platform.
     # Interactive commands (REPL, pager, password prompt, heredoc — anything
@@ -843,6 +881,128 @@ def _remote_exec_command(remote: str, profile: str, args: dict) -> dict:
     if args.get("interactive"):
         return _remote_exec_command_pty(remote, profile, args)
     return _remote_exec_command_tempfile(remote, profile, args)
+
+
+# ---------------------------------------------------------------------------
+# remote_exec_python_script
+# ---------------------------------------------------------------------------
+
+
+def _python_script_paths(family: str, windows: bool) -> tuple[tuple[str, str, str], str, str]:
+    """(wrapper temp paths, upload path of the .py, path spelled for the wrapper).
+
+    The script file sits beside the wrapper with the same base name. The
+    wrapper needs its own spelling of the path: ``%USERPROFILE%`` for cmd,
+    ``$env:USERPROFILE`` for PowerShell, ``$HOME`` for MSYS (a quoted ``~``
+    would not expand there), and the plain POSIX path elsewhere.
+    """
+    paths = _exec_temp_paths(family, windows=windows)
+    upload = paths[0].rsplit(".", 1)[0] + ".py"
+    if not windows:
+        ref = upload
+    elif family == "cmd":
+        ref = _win_path(upload)
+    elif family == "powershell":
+        ref = _ps_path(upload)
+    else:
+        ref = upload.replace("~", "$HOME", 1)
+    return paths, upload, ref
+
+
+def _python_oneshot_body(family: str, ref: str) -> str:
+    """Wrapper body: resolve a local Python, then run the uploaded script.
+
+    POSIX/MSYS prefers python3 and falls back to python; cmd checks
+    ``where python`` and falls back to the py launcher; PowerShell does the
+    same with Get-Command. ``exit 127`` is safe here: this body is the whole
+    temp script, and the existing epilogue still records its exit code.
+    """
+    if family == "cmd":
+        return (
+            'where python >nul 2>nul && set "PY=python" || set "PY=py -3"\r\n'
+            f'%PY% "{ref}"'
+        )
+    if family == "powershell":
+        return (
+            "if (Get-Command python -ErrorAction SilentlyContinue) { "
+            f'python "{ref}"'
+            " } elseif (Get-Command py -ErrorAction SilentlyContinue) { "
+            f'py -3 "{ref}"'
+            " } else { Write-Error 'aimux: no python executable on PATH'; "
+            "$global:LASTEXITCODE = 127 }"
+        )
+    return (
+        'PY_BIN="$(command -v python3 || command -v python)"; '
+        'if [ -z "$PY_BIN" ]; then echo "aimux: no python3 or python on PATH" >&2; '
+        f'exit 127; else "$PY_BIN" "{ref}"; fi'
+    )
+
+
+def _python_pty_body(family: str, ref: str) -> str:
+    """Launch line for interactive=true: python -i, single line, no ``exit``.
+
+    The PTY path appends an exit-marker echo, so the shell must stay alive.
+    cmd cannot cheaply expand a variable set on the same line, so it uses the
+    plain ``python`` name; a missing interpreter surfaces as the shell's error.
+    """
+    if family == "cmd":
+        return f'python -i "{ref}"'
+    if family == "powershell":
+        return (
+            "if (Get-Command python -ErrorAction SilentlyContinue) { "
+            f'python -i "{ref}"'
+            " } elseif (Get-Command py -ErrorAction SilentlyContinue) { "
+            f'py -3 -i "{ref}"'
+            " } else { Write-Error 'aimux: no python executable on PATH'; "
+            "$global:LASTEXITCODE = 127 }"
+        )
+    return (
+        'PY_BIN="$(command -v python3 || command -v python)"; '
+        'if [ -z "$PY_BIN" ]; then echo "aimux: no python3 or python on PATH" >&2; '
+        f'false; else "$PY_BIN" -i "{ref}"; fi'
+    )
+
+
+def _remote_exec_python_tempfile(remote: str, profile: str, args: dict,
+                                 content: str) -> dict:
+    def build_plan(family: str, windows: bool, shell_bin: str | None):
+        paths, upload, ref = _python_script_paths(family, windows)
+        plan = _exec_plan(
+            cmd=_python_oneshot_body(family, ref), profile=profile,
+            shell_bin=shell_bin, windows=windows, temp_paths=paths,
+        )
+        return plan, [(upload, content.encode("utf-8"))], {"tmp_py": upload}
+
+    return _run_temp_script(remote, profile, args, build_plan=build_plan)
+
+
+def _remote_exec_python_interactive(remote: str, profile: str, args: dict,
+                                    content: str) -> dict:
+    family = _shell_family(profile)
+    windows = _remote_is_windows(profile)
+    _, upload, ref = _python_script_paths(family, windows)
+    command = _python_pty_body(family, ref)
+    data = content.encode("utf-8")
+
+    def pre_send(sid: int, c) -> None:
+        _sessions[sid]["tmp_py"] = upload
+        c.file_write(
+            remote=remote,
+            path=upload,
+            content_b64=base64.b64encode(data).decode("ascii"),
+            timeout=60.0,
+        )
+
+    return _run_pty(remote, profile, args, command=command, pre_send=pre_send)
+
+
+def _remote_exec_python_script(remote: str, profile: str, args: dict) -> dict:
+    content = args.get("python_script_content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("python_script_content is required")
+    if args.get("interactive"):
+        return _remote_exec_python_interactive(remote, profile, args, content)
+    return _remote_exec_python_tempfile(remote, profile, args, content)
 
 
 # ---------------------------------------------------------------------------
@@ -1677,6 +1837,38 @@ CLASSIC_TOOLS = [
         },
     },
     {
+        "name": "remote_exec_python_script",
+        "description": (
+            "Runs a Python script on the remote machine with the remote's own Python, returning clean "
+            "output and an exit code. The source is uploaded verbatim to a temp file (outside your "
+            "repository) and deleted afterwards, so no shell quoting is applied. The interpreter is "
+            "resolved from PATH: python3 then python on POSIX, python then the py launcher on Windows. "
+            "Execution otherwise matches remote_exec_command: one-shot by default, the reply carries "
+            "output and exit_code, and a call that outlives yield_time_ms returns a session_id for "
+            "remote_write_stdin. Pass interactive=true to run python -i so the REPL stays attached "
+            "after the script finishes. Use this for Python logic (data processing, API calls, one-off "
+            "scripts); create or modify repository files with the file tools (remote_read / remote_edit "
+            "/ remote_write / remote_apply_patch) so the change stays reviewable. `output` never comes "
+            "back blank: a script that printed nothing yields '<aimux>command output is empty</aimux>', "
+            "and a wait that expired before the script finished reports it: '<aimux>command timeout "
+            "after N seconds</aimux>' when nothing had arrived yet, or '<aimux>get some output, but "
+            "command timeout after N seconds</aimux>' appended to the partial output."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "python_script_content": {"type": "string", "description": "Python source to run on the remote. It is written to a temp file verbatim; no shell quoting is applied."},
+                "interactive": {"type": "boolean", "default": False, "description": "True runs python -i and keeps the REPL attached to a live PTY session for remote_write_stdin. False (default) runs the script one-shot and returns clean output + exit code."},
+                "login": {"type": "boolean", "default": True, "description": "True runs the launching shell with -l/-i semantics; false disables them (uses --norc --noprofile). Defaults to true."},
+                "max_output_tokens": {"type": "number", "default": 10000, "description": "Output token budget (ceil(UTF-8 bytes / 4)). Defaults to 10000."},
+                "shell": {"type": "string", "description": "Shell binary that launches the script. Defaults to the user's default shell."},
+                "workdir": {"type": "string", "description": "Working directory for the script, as an absolute path on the remote. A path that does not exist fails the call instead of falling back. When omitted, the script runs in the default set for this session by remote_set_remote_workdir, or -- if none was set -- wherever the remote's reverse-connect client process happens to be started, which is not knowable in advance. The reply reports both the directory used and where it came from."},
+                "yield_time_ms": {"type": "number", "default": 10000, "description": "Wait before yielding output. Defaults to 10000 ms; effective range 250-300000 ms."},
+            },
+            "required": ["python_script_content"],
+        },
+    },
+    {
         "name": "remote_set_remote_workdir",
         "description": (
             "Sets the working directory that this session's remote_exec_command calls use when they omit "
@@ -1840,6 +2032,7 @@ CLASSIC_TOOLS = [
 
 _TOOL_FUNCS = {
     "remote_exec_command": _remote_exec_command,
+    "remote_exec_python_script": _remote_exec_python_script,
     "remote_set_remote_workdir": _remote_set_remote_workdir,
     "remote_write_stdin": _remote_write_stdin,
     "remote_read": _remote_read,
