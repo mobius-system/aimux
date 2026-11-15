@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from . import _http
 
 RUNTIME_ENV = "AIMUX_BRIDGE_RUNTIME"
 
@@ -174,32 +175,31 @@ def _request_json(
     timeout: float = 5.0,
 ) -> dict[str, Any]:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=body, method=method)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Accept", "application/json")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     if body is not None:
-        req.add_header("Content-Type", "application/json")
+        headers["Content-Type"] = "application/json"
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace")
+        status, _resp_headers, raw_bytes = _http.request(
+            method, url, headers, body, timeout=timeout)
+    except TimeoutError:
+        raise BridgeTimeoutError("bridge broker request timed out")
+    except (http.client.HTTPException, OSError) as e:
+        raise BridgeUnreachableError(f"bridge broker is unreachable: {e}")
+
+    raw = raw_bytes.decode("utf-8", errors="replace")
+    if status >= 400:
         payload_obj = _decode_error(raw)
-        msg = payload_obj.get("message") or payload_obj.get("error") or raw or e.reason
+        msg = payload_obj.get("message") or payload_obj.get("error") or raw or f"HTTP {status}"
         kind = str(payload_obj.get("kind") or "bridge_error")
         try:
             code = int(payload_obj.get("code") or 1)
         except (TypeError, ValueError):
             code = 1
-        if e.code in (401, 403):
+        if status in (401, 403):
             raise BridgeAuthError(str(msg))
-        if e.code == 504 or code == 124:
+        if status == 504 or code == 124:
             raise BridgeTimeoutError(str(msg))
         raise BridgeError(str(msg), kind=kind, exit_code=code)
-    except urllib.error.URLError as e:
-        raise BridgeUnreachableError(f"bridge broker is unreachable: {e.reason}")
-    except TimeoutError:
-        raise BridgeTimeoutError("bridge broker request timed out")
 
     if not raw.strip():
         return {}
@@ -372,12 +372,22 @@ class BridgeControlClient:
             timeout=timeout,
         )
 
-    def kill_session(self, *, remote: str, name: str, timeout: float = 30.0) -> dict[str, Any]:
+    def kill_session(
+        self,
+        *,
+        remote: str,
+        name: str,
+        timeout: float = 30.0,
+        cleanup_paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if cleanup_paths:
+            payload["cleanup_paths"] = [str(p) for p in cleanup_paths]
         return _request_json(
             "POST",
             f"{self.runtime.url}/api/sessions/{_quote(remote)}/{_quote(name)}/kill",
             self.runtime.token,
-            {},
+            payload,
             timeout=timeout,
         )
 

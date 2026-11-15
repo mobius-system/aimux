@@ -1014,6 +1014,46 @@ def test_session_is_gone_only_believes_session_errors():
     assert mcp_server._session_is_gone(C(None), "r", "n") is False
 
 
+def test_poll_interval_backs_off_for_long_commands():
+    assert mcp_server._poll_interval(0.0) == 0.3
+    assert mcp_server._poll_interval(1.9) == 0.3
+    assert mcp_server._poll_interval(2.0) == 0.5
+    assert mcp_server._poll_interval(10.0) == 1.0
+    assert mcp_server._poll_interval(120.0) == 2.0
+
+
+def test_exec_cleanup_is_folded_into_kill(monkeypatch):
+    """A current client cleans its temp files inside session.kill."""
+    class CleanupClient(ExecTempClient):
+        def __init__(self):
+            super().__init__()
+            self.deleted: list[str] = []
+            self.kill_cleanup: list[list[str]] = []
+
+        def kill_session(self, *, remote, name, timeout=30.0, cleanup_paths=None, **kwargs):
+            paths = list(cleanup_paths or [])
+            self.kill_cleanup.append(paths)
+            for path in paths:
+                self.files.pop(path, None)
+            return {"ok": True, "cleaned": paths}
+
+        def file_delete(self, *, remote, path, recursive=False, timeout=60.0, **kwargs):
+            self.deleted.append(path)
+            return {"ok": True}
+
+    c = CleanupClient()
+    monkeypatch.setattr(mcp_server, "_client", lambda: c)
+    mcp_server._sessions.clear()
+
+    r = mcp_server._remote_exec_command(
+        "r", "posix-pty", {"cmd": "echo hi", "yield_time_ms": 1000})
+
+    assert r["exit_code"] == 0
+    assert len(c.kill_cleanup) == 1 and len(c.kill_cleanup[0]) == 3
+    assert c.deleted == [], "a client that cleaned up itself must not get three more deletes"
+    assert c.files == {}
+
+
 def test_exec_reports_dead_session_and_cleans_up(monkeypatch):
     monkeypatch.setattr(mcp_server, "_EXEC_PROBE_EVERY_S", 0.4)
     c = DeadSessionClient()
@@ -1043,7 +1083,13 @@ def test_reap_deletes_temp_files_of_unfinished_sessions(monkeypatch):
 
     assert mcp_server._reap_all_sessions(c, timeout=5.0) == 1
 
-    assert c.killed == [{"remote": "r", "name": "mcp-exec-reap", "timeout": 5.0}]
+    # The kill carries the temp files so a current client cleans them in the
+    # same round trip; this fake predates that and returns no "cleaned", so the
+    # per-file fallback still runs.
+    assert c.killed == [{
+        "remote": "r", "name": "mcp-exec-reap", "timeout": 5.0,
+        "cleanup_paths": ["/tmp/x.cmd", "/tmp/x.out", "/tmp/x.code"],
+    }]
     assert c.files == {}
     assert mcp_server._sessions == {}
 

@@ -195,6 +195,23 @@ def _effective_workdir(args: dict, remote: str) -> tuple[str | None, str]:
 _MAX_YIELD_MS = 300_000  # 5 minutes
 
 
+def _poll_interval(elapsed: float) -> float:
+    """Seconds between polls for a command that is still running.
+
+    0.3s keeps short commands snappy. Long ones back off: a five-minute script
+    polled every 0.3s sends ~1000 extra round trips, and each one occupies the
+    single-threaded reverse client (measurably slowing everything else on that
+    device) for a result that has not changed.
+    """
+    if elapsed < 2.0:
+        return 0.3
+    if elapsed < 10.0:
+        return 0.5
+    if elapsed < 60.0:
+        return 1.0
+    return 2.0
+
+
 def _create_exec_session(remote: str, profile: str, cmd: str, cwd: str | None) -> int:
     global _session_counter
     name = f"mcp-exec-{uuid.uuid4().hex[:10]}"
@@ -218,20 +235,24 @@ def _close_exec_session(sid: int, c, *, timeout: float | None = None) -> None:
     if not sess:
         return
     kw: dict = {} if timeout is None else {"timeout": timeout}
+    paths = [sess[key] for key in ("tmp_script", "tmp_out", "tmp_code", "tmp_py") if sess.get(key)]
+    killed = None
     try:
-        c.kill_session(remote=sess["remote"], name=sess["name"], **kw)
+        # One round trip kills the session and removes its temp files. A client
+        # that predates cleanup_paths ignores it and returns no "cleaned".
+        killed = c.kill_session(
+            remote=sess["remote"], name=sess["name"],
+            cleanup_paths=paths or None, **kw)
     except Exception:
-        pass
-    # Best-effort cleanup of the temp script/output/code files created by the
-    # temp-file exec path. Missing files are a no-op on the remote.
-    for key in ("tmp_script", "tmp_out", "tmp_code", "tmp_py"):
-        path = sess.get(key)
-        if not path:
-            continue
-        try:
-            c.file_delete(remote=sess["remote"], path=path, **kw)
-        except Exception:
-            pass
+        killed = None
+    if not isinstance(killed, dict) or "cleaned" not in killed:
+        # Older client (or the kill failed): fall back to one delete per file.
+        # Missing files are a no-op on the remote.
+        for path in paths:
+            try:
+                c.file_delete(remote=sess["remote"], path=path, **kw)
+            except Exception:
+                pass
 
 
 def _reap_all_sessions(c, *, timeout: float = 5.0) -> int:
@@ -349,7 +370,8 @@ def _drain(c, remote: str, name: str, marker: str, yield_ms: int, expect_marker:
     while True:
         if time.time() >= deadline:
             break
-        time.sleep(0.3)
+        remaining = deadline - time.time()
+        time.sleep(min(_poll_interval(time.time() - started), max(0.0, remaining)))
         try:
             cap = c.capture(remote=remote, name=name, lines=4000, ansi=False, timeout=10.0)
         except bridge.BridgeError as e:
@@ -673,7 +695,8 @@ def _wait_exec_done(c, remote: str, outfile: str, codefile: str, yield_ms: int,
     while True:
         if time.time() >= deadline:
             return _read_out_file(c, remote, outfile), None, False, time.time() - started, False
-        time.sleep(0.3)
+        remaining = deadline - time.time()
+        time.sleep(min(_poll_interval(time.time() - started), max(0.0, remaining)))
         code = _read_code_file(c, remote, codefile)
         if code is not None:
             return _read_out_file(c, remote, outfile), code, True, time.time() - started, False

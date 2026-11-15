@@ -106,6 +106,33 @@ def test_file_list_non_recursive_returns_only_immediate_children(tmp_path):
     assert str(tmp_path / "x" / "sub" / "deep.txt") not in paths
 
 
+def test_session_kill_removes_cleanup_paths(tmp_path):
+    """One round trip kills the session and deletes its temp files."""
+    runtime = _runtime()
+
+    class Session:
+        adapter = None
+
+        def is_running(self):
+            return False
+
+    runtime.sessions["s"] = Session()
+    script = tmp_path / "a.cmd"
+    out = tmp_path / "a.out"
+    code = tmp_path / "a.code"
+    for path in (script, out, code):
+        path.write_text("x")
+
+    result = runtime.handle("session.kill", {
+        "session": "s",
+        "cleanup_paths": [str(script), str(out), str(code), str(tmp_path / "missing")],
+    })
+
+    assert result["ok"] is True
+    assert result["cleaned"] == [str(script), str(out), str(code)]
+    assert not script.exists() and not out.exists() and not code.exists()
+
+
 def test_file_archive_and_apply_archive_round_trip(tmp_path):
     runtime = _runtime()
     source = tmp_path / "source"

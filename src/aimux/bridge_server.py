@@ -609,12 +609,16 @@ class BridgeBrokerState:
                 self._drop_session(remote, name, reason=f"client reports {e.kind}")
             raise
 
-    def kill_session(self, remote: str, name: str, timeout: float) -> dict[str, Any]:
+    def kill_session(self, remote: str, name: str, timeout: float,
+                     cleanup_paths: list[str] | None = None) -> dict[str, Any]:
         with self.lock:
             if (remote, name) not in self.sessions:
                 raise BridgeError(f"session {remote!r}/{name!r} not found", kind="not_found")
+        payload: dict[str, Any] = {"session": name}
+        if cleanup_paths:
+            payload["cleanup_paths"] = list(cleanup_paths)
         try:
-            result = self.submit(remote, "session.kill", {"session": name}, timeout)
+            result = self.submit(remote, "session.kill", payload, timeout)
         except BridgeError as e:
             # Client no longer knows this session — the kill's goal (destroy it)
             # is already met. Drop our stale cache and treat as success so callers
@@ -1016,7 +1020,16 @@ def make_handler(state: BridgeBrokerState) -> type[BaseHTTPRequestHandler]:
                         self._json(HTTPStatus.OK, state.capture(remote, name, payload, timeout))
                         return
                     if action == "kill":
-                        self._json(HTTPStatus.OK, state.kill_session(remote, name, timeout))
+                        cleanup = payload.get("cleanup_paths")
+                        if cleanup is not None and (
+                            not isinstance(cleanup, list)
+                            or not all(isinstance(p, str) and p for p in cleanup)
+                        ):
+                            raise BridgeError(
+                                "cleanup_paths must be a list of non-empty strings",
+                                kind="bad_request")
+                        self._json(HTTPStatus.OK, state.kill_session(
+                            remote, name, timeout, cleanup_paths=cleanup))
                         return
                 if len(parts) == 3 and parts[:2] == ["api", "gui"]:
                     self._require_auth()

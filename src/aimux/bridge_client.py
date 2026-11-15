@@ -6,6 +6,7 @@ from collections import deque
 import getpass
 import hashlib
 import http.client
+import io
 import json
 import locale
 import os
@@ -31,6 +32,7 @@ from typing import Any, Protocol
 from loguru import logger
 
 from . import bridge
+from . import _http
 
 from . import __version__
 from . import port_tunnel
@@ -1194,12 +1196,41 @@ class ReverseClientRuntime:
         # record and freeing adapter resources (pty fd, etc.) — whether the
         # underlying process is still running or already exited.
         session = self.sessions.get(name)
+        cleaned = self._cleanup_temp_files(payload.get("cleanup_paths"))
         if session is None:
             raise BridgeError(f"session {name!r} not found", kind="not_found")
         if session.adapter is not None and session.is_running():
             session.adapter.kill(session)
         self.sessions.pop(name, None)
-        return {"ok": True}
+        # ``cleaned`` also tells a newer MCP server that it can skip the three
+        # follow-up file.delete calls (0.3.83+); older callers ignore the key.
+        return {"ok": True, "cleaned": cleaned}
+
+    def _cleanup_temp_files(self, paths: Any) -> list[str]:
+        """Best-effort removal of the temp files an exec left behind.
+
+        Folded into session.kill so one round trip does what used to take a
+        kill plus three file.delete calls. Failures are ignored: a file that is
+        missing or locked must not fail the kill.
+        """
+        if not isinstance(paths, list):
+            return []
+        cleaned: list[str] = []
+        for raw in paths:
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                path = self._file_path({"path": raw})
+                if path.is_symlink() or path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    continue
+                cleaned.append(str(path))
+            except (BridgeError, OSError):
+                continue
+        return cleaned
 
     def _file_path(self, payload: dict[str, Any]) -> Path:
         raw = str(payload.get("path") or "")
@@ -1413,11 +1444,20 @@ class ReverseClientRuntime:
 
 def _post_json(url: str, token: str, payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        status, resp_headers, raw_bytes = _http.request(
+            "POST", url, headers, data, timeout=timeout)
+    except http.client.HTTPException as e:
+        # urllib wrapped protocol errors in URLError; keep that shape so the
+        # reconnect/register loops keep classifying them as retryable.
+        raise urllib.error.URLError(e) from e
+    if status >= 400:
+        # Keep urllib's exception type: callers branch on HTTPError.code (the
+        # register loop retries 409 and fails fast on 401/403).
+        raise urllib.error.HTTPError(
+            url, status, f"HTTP {status}", resp_headers, io.BytesIO(raw_bytes))
+    raw = raw_bytes.decode("utf-8")
     return json.loads(raw) if raw.strip() else {}
 
 
