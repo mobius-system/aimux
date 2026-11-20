@@ -170,6 +170,27 @@ def _run_connect(monkeypatch, tmp_path, *, stream, stop_grace: float = 5.0):
     return done, outcome
 
 
+def test_daemon_writes_its_own_heartbeat(monkeypatch, tmp_path):
+    """Owners use this field to tell a live daemon from a recycled PID."""
+    done, outcome = _run_connect(monkeypatch, tmp_path, stream=_HangingStream())
+    runtime = tmp_path / "runtime.json"
+    beat = None
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            state = json.loads(runtime.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        beat = state.get("daemon_heartbeat_at")
+        if isinstance(beat, int) and beat > 0:
+            break
+        time.sleep(0.02)
+
+    assert isinstance(beat, int) and beat > 0
+    assert abs(int(time.time() * 1000) - beat) < 5000
+    done.wait(timeout=10)
+
+
 def test_watchdog_expiry_ends_a_healthy_event_stream(monkeypatch, tmp_path):
     """The regression: a healthy stream never ends by itself, so an expiry the
     stream loop cannot see left the daemon running indefinitely."""

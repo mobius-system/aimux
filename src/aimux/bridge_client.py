@@ -2317,7 +2317,13 @@ def connect(
             except OSError as exc:
                 logger.warning("runtime state write failed path={} error={}", runtime_file, exc)
 
-    runtime_update(pid=os.getpid(), launched_at=int(time.time() * 1000), last_feed_watchdog=int(time.time() * 1000), realtime_healthy_display=False, need_external_restart=False)
+    # ``daemon_heartbeat_at`` is written only by this process, on every watchdog
+    # tick. A live PID is not proof that the daemon is still the one the owner
+    # started: the OS recycles PIDs, and a defunct process still answers
+    # kill(pid, 0). Owners treat a stale/missing heartbeat as "gone" (falling
+    # back to the PID only when the field is absent, i.e. an older daemon).
+    now_ms = int(time.time() * 1000)
+    runtime_update(pid=os.getpid(), launched_at=now_ms, last_feed_watchdog=now_ms, daemon_heartbeat_at=now_ms, realtime_healthy_display=False, need_external_restart=False)
 
     def watchdog_loop() -> None:
         path = Path(watchdog_path) if watchdog_path else None
@@ -2339,6 +2345,9 @@ def connect(
                 watchdog_timeout,
             )
         while not watchdog_stop.wait(WATCHDOG_INTERVAL):
+            # Liveness evidence for the owner, independent of the SSE state:
+            # this thread runs for as long as the process itself is executing.
+            runtime_update(daemon_heartbeat_at=int(time.time() * 1000))
             age = _time_since_last_feed(path, watchdog_timeout)
             if age > watchdog_timeout:
                 logger.info("watchdog expired path={} age={:.1f}s, stopping AIMUX", path, age)
