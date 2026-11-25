@@ -290,9 +290,10 @@ def test_serve_event_stream_logs_heartbeat(monkeypatch):
                 raise bridge_client.queue.Empty
             return KeyboardInterrupt()
 
-    times = iter([0.0, 181.0, 182.0])
+    # The first call seeds the idle clock, so the heartbeat window starts after it.
+    times = iter([0.0, 0.0, 181.0, 182.0])
     monkeypatch.setattr(bridge_client, "_EventStreamReader", FakeReader)
-    monkeypatch.setattr(bridge_client.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(bridge_client.time, "monotonic", lambda: next(times, 183.0))
 
     try:
         with pytest.raises(KeyboardInterrupt):
@@ -304,11 +305,73 @@ def test_serve_event_stream_logs_heartbeat(monkeypatch):
                 stop_event=None,
                 poll_interval=0.01,
                 heartbeat_interval=180.0,
+                idle_timeout=0.0,
             )
     finally:
         logger.remove(sink_id)
 
     assert any("bridge client heartbeat identifier=winbox_1" in line for line in logs)
+
+
+def test_serve_event_stream_gives_up_on_a_silent_stream(monkeypatch):
+    """A half-open stream yields neither frames nor EOF.
+
+    Without an idle deadline the reader blocks forever, the client never
+    re-registers, and the owner sees a live daemon whose remote is gone — the
+    remote stays unreachable until someone restarts it by hand.
+    """
+    logs: list[str] = []
+    sink_id = logger.add(lambda message: logs.append(str(message)), format="{message}")
+
+    class FakeRuntime:
+        identifier = "winbox_1"
+        sessions = {}
+        adapters = {"cmd": object()}
+
+    class SilentReader:
+        def __init__(self, response):
+            pass
+
+        def start(self):
+            pass
+
+        def get(self, timeout):
+            raise bridge_client.queue.Empty
+
+    times = iter([0.0, 0.0, 30.0, 61.0])
+    monkeypatch.setattr(bridge_client, "_EventStreamReader", SilentReader)
+    monkeypatch.setattr(bridge_client.time, "monotonic", lambda: next(times, 62.0))
+
+    try:
+        with pytest.raises(TimeoutError):
+            bridge_client._serve_event_stream(
+                object(),
+                runtime=FakeRuntime(),
+                base="http://broker.example",
+                token="secret",
+                stop_event=None,
+                poll_interval=0.01,
+                heartbeat_interval=180.0,
+                idle_timeout=60.0,
+            )
+    finally:
+        logger.remove(sink_id)
+
+    assert any("event stream idle" in line for line in logs)
+
+
+def test_open_events_sets_a_read_timeout(monkeypatch):
+    """The socket itself must time out: without it a blocked read never ends."""
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["timeout"] = timeout
+        return object()
+
+    monkeypatch.setattr(bridge_client.urllib.request, "urlopen", fake_urlopen)
+    bridge_client._open_events("http://broker.example", "token", "box")
+
+    assert captured["timeout"] == bridge_client.EVENT_STREAM_IDLE_TIMEOUT
 
 
 def _patch_register(monkeypatch, *, post_side_effects):

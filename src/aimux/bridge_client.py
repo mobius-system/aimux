@@ -53,6 +53,12 @@ WATCHDOG_INTERVAL = 5.0
 WATCHDOG_TIMEOUT = 30.0
 # How long the graceful stop gets before the watchdog exits unconditionally.
 WATCHDOG_EXIT_GRACE = 5.0
+# The broker writes an SSE heartbeat frame every 15s. Silence far past a few of
+# them means the connection is half-open — a middlebox or gateway dropped it
+# without delivering a FIN, so a blocking read waits forever and the client
+# never re-registers. The owner only sees "daemon alive, stream gone" and the
+# remote stays unreachable indefinitely. Treat the silence as a disconnect.
+EVENT_STREAM_IDLE_TIMEOUT = 60.0
 RUNTIME_WRITE_LOCK = threading.Lock()
 # Streaming file uploads are read/sent in 1 MiB chunks so the reverse client
 # never holds a whole file in memory while it uploads over its own outbound
@@ -1474,7 +1480,10 @@ def _open_events(url: str, token: str, identifier: str):
     req = urllib.request.Request(f"{url.rstrip('/')}/client/events?{query}", method="GET")
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("Accept", "text/event-stream")
-    return urllib.request.urlopen(req, timeout=None)
+    # A read timeout, not just a connect timeout: it is what surfaces a
+    # half-open stream to the reader thread. The broker heartbeats every 15s,
+    # so EVENT_STREAM_IDLE_TIMEOUT (60s) only fires on a dead connection.
+    return urllib.request.urlopen(req, timeout=EVENT_STREAM_IDLE_TIMEOUT)
 
 
 def _time_since_last_feed(path: Path, timeout: float) -> float:
@@ -2150,10 +2159,12 @@ def _serve_event_stream(
     stop_event: threading.Event | None,
     poll_interval: float,
     heartbeat_interval: float = BRIDGE_CLIENT_HEARTBEAT_INTERVAL,
+    idle_timeout: float = EVENT_STREAM_IDLE_TIMEOUT,
 ) -> None:
     reader = _EventStreamReader(response)
     reader.start()
     last_heartbeat = time.monotonic()
+    last_frame = time.monotonic()
     while True:
         if stop_event is not None and stop_event.is_set():
             raise KeyboardInterrupt
@@ -2169,7 +2180,18 @@ def _serve_event_stream(
         try:
             item = reader.get(timeout=poll_interval)
         except queue.Empty:
+            # Second layer over the socket timeout: a middlebox that trickles
+            # bytes without ever completing a frame would keep the socket
+            # alive. No complete event for a full idle window is a dead stream.
+            if idle_timeout > 0 and now - last_frame >= idle_timeout:
+                logger.warning(
+                    "bridge client event stream idle for {:g}s identifier={}, reconnecting",
+                    idle_timeout,
+                    runtime.identifier,
+                )
+                raise TimeoutError("bridge event stream idle")
             continue
+        last_frame = now
         if item is _STREAM_EOF:
             return
         if isinstance(item, BaseException):
