@@ -39,7 +39,6 @@ only-include = [
     "src/aimux",
     "README.md",
     "SKILL.md",
-    "design.md",
     "docs",
     "tests",
 ]
