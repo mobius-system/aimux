@@ -32,7 +32,10 @@ from typing import Any
 
 # The helper protocol is pinned: clients fail closed on older binaries.
 EXPECTED_PROTOCOL_VERSION = 6
-DEFAULT_MANIFEST_URL = "https://serve.nutshellai.cn/publish/auto/aimux-helpers/manifest.json"
+# Use an immutable, helper-versioned manifest path. Some CDN POPs can retain the
+# mutable manifest.json for an hour after publication; a fresh path avoids
+# inheriting that stale cache when the helper binary changes.
+DEFAULT_MANIFEST_URL = "https://serve.nutshellai.cn/publish/auto/aimux-helpers/manifest-aimux9.json"
 
 # Per-command budget for one helper round trip, in seconds. waitFor gets the
 # longest because it polls the live UIA subtree for up to 60s by itself.

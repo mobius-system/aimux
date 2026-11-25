@@ -56,6 +56,10 @@ def test_platform_key_none_on_linux() -> None:
     assert gui_helper._platform_key() is None
 
 
+def test_default_helper_manifest_is_versioned() -> None:
+    assert gui_helper.DEFAULT_MANIFEST_URL.endswith("/manifest-aimux9.json")
+
+
 def test_install_rejects_unsupported_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AIMUX_GUI_HELPER_PATH", raising=False)
     if gui_helper._platform_key() is not None:
