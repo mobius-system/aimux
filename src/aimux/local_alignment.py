@@ -26,6 +26,7 @@ local function                            helper command
 ``fast_ooda_gui_look``                    ``look``
 ``fast_ooda_gui_look_fast_screenshot``    ``lookFastScreenshot``
 ``fast_ooda_gui_act``                     ``act``
+``fast_ooda_gui_act_schedule_future``      ``scheduleFuture``
 ``fast_ooda_gui_read_text``               ``axReadText``
 ``fast_ooda_gui_wait_for``                ``axWaitFor``
 ``fast_ooda_gui_focus_window``            ``focusWindow``
@@ -99,6 +100,7 @@ __all__ = [
     "fast_ooda_gui_look",
     "fast_ooda_gui_look_fast_screenshot",
     "fast_ooda_gui_act",
+    "fast_ooda_gui_act_schedule_future",
     "fast_ooda_gui_read_text",
     "fast_ooda_gui_wait_for",
     "fast_ooda_gui_focus_window",
@@ -667,6 +669,68 @@ def fast_ooda_gui_act(
     if defer_root_delta is not None:
         args["deferRootDelta"] = bool(defer_root_delta)
     return _call("act", args)
+
+
+def fast_ooda_gui_act_schedule_future(
+    operation: str = "schedule",
+    *,
+    task_id: str | None = None,
+    schedule_after_ms: int = 0,
+    look_id: str | None = None,
+    action: str | None = None,
+    x: float | None = None,
+    y: float | None = None,
+    keys: list[str] | None = None,
+    button: str | None = None,
+    keep_pressdown_ms: int | None = None,
+    path: list[dict[str, float]] | None = None,
+    preserve_focus: bool = False,
+) -> dict[str, Any]:
+    """Schedule one foreground GUI act, or query/cancel its task.
+
+    ``schedule_after_ms`` is relative to when the helper accepts this call.
+    The chosen ``look_id`` is retained by the helper so coordinates stay
+    grounded in that observation even while the task waits. Use operation
+    ``status`` or ``cancel`` with ``task_id`` to manage an accepted task.
+    Only queued work can be cancelled; once input starts it always runs its
+    release path before reaching a terminal state.
+    """
+    if operation not in ("schedule", "status", "cancel"):
+        raise LocalGuiError("operation must be schedule, status, or cancel", code="invalid_request")
+    args: dict[str, Any] = {"operation": operation}
+    if operation in ("status", "cancel"):
+        if not task_id:
+            raise LocalGuiError("task_id is required for status/cancel", code="invalid_request")
+        args["taskId"] = task_id
+    else:
+        if not look_id or not action or x is None or y is None:
+            raise LocalGuiError("schedule requires look_id, action, x, and y", code="invalid_request")
+        if not 0 <= int(schedule_after_ms) <= 60_000:
+            raise LocalGuiError("schedule_after_ms must be between 0 and 60000", code="invalid_request")
+        if action not in ("keypress", "mousePress", "moveMouse", "click", "drag"):
+            raise LocalGuiError("unsupported scheduled action", code="invalid_request")
+        params: dict[str, Any] = {"preserveFocus": bool(preserve_focus)}
+        if keys is not None:
+            params["keys"] = keys
+        if button is not None:
+            params["button"] = button
+        if keep_pressdown_ms is not None:
+            if not 1 <= int(keep_pressdown_ms) <= 10_000:
+                raise LocalGuiError("keep_pressdown_ms must be between 1 and 10000", code="invalid_request")
+            params["keepPressdownMs"] = int(keep_pressdown_ms)
+        if path is not None:
+            params["path"] = path
+        args.update({
+            "scheduleAfterMs": int(schedule_after_ms),
+            "act": {
+                "lookId": look_id,
+                "action": action,
+                "policy": "foreground",
+                "target": {"x": float(x), "y": float(y)},
+                "params": params,
+            },
+        })
+    return _call("scheduleFuture", args)
 
 
 def fast_ooda_gui_read_text(

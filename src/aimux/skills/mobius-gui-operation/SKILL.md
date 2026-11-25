@@ -21,6 +21,7 @@ description: AIMUX操作远程设备的图形界面。两种方法：① 模拟�
 - **游戏 / 引擎类窗口**（Unity、Unreal、SDL、GLFW）：`keypress` 必须 `policy="foreground"`，并且显式给 `keep_pressdown_ms=50~150`。不给时工具会自动按 100 发并在结果里写 `defaults_applied`；显式传 0 会"按了等于没按"，但返回仍是 `outcome=unknown`，此时结果里带 `warnings`，照它说的重试即可。
 - **`keypress` / `typeText` 的 target 可以省略**：原始输入的落点永远是当前前台窗口，所以不给 `ref`/`x,y` 时工具会用该 look 的窗口中心占位。其它 action（press、click、scroll…）仍然需要 ref 或坐标。
 - **参数报错会回显你实际传了什么**（`received: [...]`），看到 `missing required param` 先对照自己的参数，不要判定成服务端 Bug。
+- **按时间编排键鼠操作**（例如按钮按住期间还要移动鼠标）使用 `remote_gui_act_schedule_future`。它绑定提交时的 `look_id`，`schedule_after_ms` 是相对 helper 接收调用的延迟；通过 `operation="status"` 查询、`operation="cancel"` 取消尚未开始的 task。调度任务未结束前旧 `remote_gui_act` 会被拒绝，所有输入都继续走 schedule_future。按住时长必须显式为 1–10000ms；运行中的任务不可取消，会尽力释放后结束。
 
 ## 案例
 

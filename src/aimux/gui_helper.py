@@ -30,8 +30,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-# The helper speaks protocol 5 (pi-computer-use windows-bridge v0.5.1 plus the
-# window-recording commands).
+# The helper protocol is pinned: clients fail closed on older binaries.
 EXPECTED_PROTOCOL_VERSION = 6
 DEFAULT_MANIFEST_URL = "https://serve.nutshellai.cn/publish/auto/aimux-helpers/manifest.json"
 
@@ -44,6 +43,7 @@ REQUEST_TIMEOUTS: dict[str, float] = {
     "look": 45.0,
     "screenshot": 45.0,
     "act": 75.0,
+    "scheduleFuture": 10.0,
     "actBatch": 90.0,
     "uiaReadText": 30.0,
     "axReadText": 30.0,

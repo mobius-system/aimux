@@ -2463,6 +2463,52 @@ def _gui_act(remote: str, profile: str, args: dict) -> dict:
     return result
 
 
+def _gui_act_schedule_future(remote: str, profile: str, args: dict) -> dict:
+    operation = args.get("operation") or "schedule"
+    if operation not in ("schedule", "status", "cancel"):
+        raise ValueError("operation must be schedule, status, or cancel")
+    call_args: dict = {"operation": operation}
+    if operation in ("status", "cancel"):
+        task_id = args.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            raise _missing_param("task_id", args)
+        call_args["taskId"] = task_id
+    else:
+        look_id = args.get("look_id")
+        action = args.get("action")
+        x, y = args.get("x"), args.get("y")
+        if not isinstance(look_id, str) or not look_id:
+            raise _missing_param("look_id", args, hint="call remote_gui_look first")
+        if not isinstance(action, str) or not action:
+            raise _missing_param("action", args)
+        if x is None or y is None:
+            raise _missing_param("x and y", args, hint="scheduled actions require image coordinates from look_id")
+        delay = int(args.get("schedule_after_ms", 0))
+        if not 0 <= delay <= 60_000:
+            raise ValueError("schedule_after_ms must be between 0 and 60000")
+        if action not in ("keypress", "mousePress", "moveMouse", "click", "drag"):
+            raise ValueError("action must be keypress, mousePress, moveMouse, click, or drag")
+        params: dict = {"preserveFocus": bool(args.get("preserve_focus", False))}
+        for source, dest in (("keys", "keys"), ("button", "button"),
+                             ("keep_pressdown_ms", "keepPressdownMs"), ("path", "path")):
+            if args.get(source) is not None:
+                params[dest] = args[source]
+        hold = params.get("keepPressdownMs")
+        if action in ("keypress", "mousePress") and (hold is None or not 1 <= int(hold) <= 10_000):
+            raise ValueError("keypress and mousePress require keep_pressdown_ms between 1 and 10000")
+        if action == "keypress" and not (isinstance(params.get("keys"), list) and params["keys"]):
+            raise _missing_param("keys", args, hint='keypress needs e.g. ["F2"]')
+        if action == "mousePress" and params.get("button", "left") not in ("left", "right", "middle"):
+            raise ValueError("button must be left, right, or middle")
+        if action == "drag" and not (isinstance(params.get("path"), list) and len(params["path"]) >= 2):
+            raise _missing_param("path", args, hint="drag needs at least two image-coordinate waypoints")
+        call_args.update({"scheduleAfterMs": delay, "act": {
+            "lookId": look_id, "action": action, "policy": "foreground",
+            "target": {"x": float(x), "y": float(y)}, "params": params,
+        }})
+    return _gui_call(remote, "scheduleFuture", call_args, timeout=10.0)
+
+
 def _gui_read_text(remote: str, profile: str, args: dict) -> dict:
     look_id = args.get("look_id")
     ref = args.get("ref")
@@ -2759,7 +2805,7 @@ GUI_TOOLS = [
                                          "window center is used when no target is given."},
                 "keep_pressdown_ms": {"type": "number",
                                        "description": "Hold the key down this many milliseconds before releasing it "
-                                                      "(keypress only, capped at 5000). 0 releases inside one input batch, "
+                                                      "(keypress only, maximum 10000). 0 releases inside one input batch, "
                                                       "which per-frame pollers such as games never observe — pass 50-150 "
                                                       "there. Omitted with policy=foreground defaults to 100. Costs that "
                                                       "much latency per press. Raw input: needs policy=foreground."},
@@ -2771,6 +2817,29 @@ GUI_TOOLS = [
                 "preserve_focus": {"type": "boolean", "description": "Raw-input acts: do not force the window to foreground first."},
             },
             "required": ["look_id", "action"],
+        },
+    },
+    {
+        "name": "remote_gui_act_schedule_future",
+        "description": "Schedule foreground raw GUI input against a specific recent look. This API is mutually exclusive with remote_gui_act while any scheduled task is pending or running: route all input through this tool until its tasks finish. schedule_after_ms is relative to helper acceptance (0 means now, max 60000); the helper returns task_id immediately. Due input starts are dispatched in timestamp order (same-time ties use acceptance order); a hold task yields after its down event so later actions can overlap the hold. Use operation=status/cancel with task_id to inspect or cancel queued work. Running work cannot be cancelled and attempts release before becoming terminal. Coordinates and drag waypoints use image pixels from look_id; that snapshot is retained at acceptance and execution fails stale if its window moves/resizes. preserve_focus=false brings its exact observed window forward at execution; true refuses to inject if that window is no longer foreground. Mouse holds use action=mousePress with button=left/right/middle. Keyboard/mouse keep_pressdown_ms is 1-10000. Actions: keypress, mousePress, moveMouse, click, drag. Results report task state; mousePress result includes buttonReleaseSent and actualDurationMs."
+        + _GUI_COMMON,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["schedule", "status", "cancel"], "default": "schedule"},
+                "task_id": {"type": "string", "description": "Task returned by operation=schedule; required for status/cancel."},
+                "schedule_after_ms": {"type": "integer", "minimum": 0, "maximum": 60000, "default": 0, "description": "Relative delay from helper acceptance, not an absolute wall-clock timestamp."},
+                "look_id": {"type": "string", "description": "Recent look that grounds the target window and all image-pixel coordinates."},
+                "action": {"type": "string", "enum": ["keypress", "mousePress", "moveMouse", "click", "drag"]},
+                "x": {"type": "number", "description": "Image x coordinate from look_id."},
+                "y": {"type": "number", "description": "Image y coordinate from look_id."},
+                "keys": {"type": "array", "items": {"type": "string"}, "description": "Ordered key names for keypress, e.g. [\"F2\"]."},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left", "description": "Mouse button for mousePress/click."},
+                "keep_pressdown_ms": {"type": "integer", "minimum": 1, "maximum": 10000, "description": "How long keypress/mousePress remains down before its guaranteed best-effort release."},
+                "path": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}, "description": "At least two image-coordinate waypoints for drag."},
+                "preserve_focus": {"type": "boolean", "default": False, "description": "If true, require the observed window to still be foreground; otherwise focus that exact window immediately before input."},
+            },
+            "required": ["operation"],
         },
     },
     {
@@ -2868,6 +2937,7 @@ _GUI_TOOL_FUNCS = {
     "remote_gui_list_windows": _gui_list_windows,
     "remote_gui_look": _gui_look,
     "remote_gui_act": _gui_act,
+    "remote_gui_act_schedule_future": _gui_act_schedule_future,
     "remote_gui_read_text": _gui_read_text,
     "remote_gui_wait_for": _gui_wait_for,
     "remote_gui_focus_window": _gui_focus_window,

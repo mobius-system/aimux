@@ -19,6 +19,7 @@ from aimux import local_alignment
 from aimux.local_alignment import (
     LocalGuiError,
     fast_ooda_gui_act,
+    fast_ooda_gui_act_schedule_future,
     fast_ooda_gui_diagnostics,
     fast_ooda_gui_focus_window,
     fast_ooda_gui_list_windows,
@@ -300,6 +301,34 @@ def test_act_requires_target(mock_helper) -> None:
     with pytest.raises(LocalGuiError) as excinfo:
         fast_ooda_gui_act("look_1", "press")
     assert excinfo.value.code == "invalid_request"
+
+
+def test_schedule_future_mouse_hold_and_status(mock_helper) -> None:
+    fast_ooda_gui_act_schedule_future(
+        look_id="look_1", action="mousePress", x=12, y=34,
+        button="right", keep_pressdown_ms=250, schedule_after_ms=35,
+        preserve_focus=True,
+    )
+    sent = _last(mock_helper.log)
+    assert sent["cmd"] == "scheduleFuture"
+    assert sent["args"] == {
+        "operation": "schedule", "scheduleAfterMs": 35,
+        "act": {
+            "lookId": "look_1", "action": "mousePress", "policy": "foreground",
+            "target": {"x": 12.0, "y": 34.0},
+            "params": {"preserveFocus": True, "button": "right", "keepPressdownMs": 250},
+        },
+    }
+    fast_ooda_gui_act_schedule_future("status", task_id="gui-task-1")
+    assert _last(mock_helper.log)["args"] == {"operation": "status", "taskId": "gui-task-1"}
+
+
+def test_schedule_future_rejects_overlong_pressdown(mock_helper) -> None:
+    with pytest.raises(LocalGuiError, match="10000"):
+        fast_ooda_gui_act_schedule_future(
+            look_id="look_1", action="keypress", x=1, y=2,
+            keys=["F2"], keep_pressdown_ms=10_001,
+        )
 
 
 def test_read_text_defaults(mock_helper) -> None:

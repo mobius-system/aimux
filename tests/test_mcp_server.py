@@ -1403,6 +1403,35 @@ def test_gui_act_missing_keys_lists_the_received_params(monkeypatch):
     assert "F2" in message  # a fix the caller can copy verbatim
 
 
+def test_gui_act_schedule_future_serializes_mouse_hold(monkeypatch):
+    from aimux import mcp_server
+
+    calls = []
+    monkeypatch.setattr(mcp_server, "_gui_call", lambda remote, cmd, args, **kw: calls.append((cmd, args)) or {"taskId": "t1"})
+    result = mcp_server._gui_act_schedule_future("box", "cmd", {
+        "operation": "schedule", "look_id": "look_1", "action": "mousePress",
+        "x": 100, "y": 200, "button": "right", "keep_pressdown_ms": 300,
+        "schedule_after_ms": 20, "preserve_focus": True,
+    })
+    assert result == {"taskId": "t1"}
+    assert calls == [("scheduleFuture", {
+        "operation": "schedule", "scheduleAfterMs": 20,
+        "act": {"lookId": "look_1", "action": "mousePress", "policy": "foreground",
+                "target": {"x": 100.0, "y": 200.0},
+                "params": {"preserveFocus": True, "button": "right", "keepPressdownMs": 300}},
+    })]
+
+
+def test_gui_act_schedule_future_enforces_ten_second_limit(monkeypatch):
+    from aimux import mcp_server
+
+    with pytest.raises(ValueError, match="10000"):
+        mcp_server._gui_act_schedule_future("box", "cmd", {
+            "look_id": "look_1", "action": "keypress", "x": 1, "y": 2,
+            "keys": ["F2"], "keep_pressdown_ms": 10_001,
+        })
+
+
 def _engine_look_context(look_id: str = "look_9") -> None:
     from aimux import mcp_server
 

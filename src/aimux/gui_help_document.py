@@ -19,6 +19,7 @@ HELP_DOCUMENT = """
 | `remote_gui_focus_window` | 把指定窗口带到前台 |
 | `remote_gui_look` | 观察一个窗口：无障碍元素树（ref / role / name / rect）+ 截图 |
 | `remote_gui_act` | 操作元素：press / click / setText / scroll / typeText / keypress / drag / moveMouse |
+| `remote_gui_act_schedule_future` | 异步排队输入；立即返回 task_id，可查询/取消尚未开始的任务 |
 | `remote_gui_read_text` | 读元素的实时文本，比重做一次 look 更快 |
 | `remote_gui_wait_for` | 等文本 / 角色 / 值出现；`gone=true` 时等它消失 |
 | `remote_gui_record_window_mp4` | 把窗口录成 MP4 并传回本机（仅 Windows） |
@@ -26,9 +27,23 @@ HELP_DOCUMENT = """
 ## 基本流程
 1. `remote_gui_list_windows` 找到目标窗口的 `rootRef`（形如 `@w2`）。
 2. `remote_gui_look(root_ref)` 拿到 `lookId`、元素树和 `image_path`；元素矩形是**截图像素**。
-3. `remote_gui_act(look_id, action, ref=...)` 优先用 ref 走 UIA 语义；坐标 / 打字 / 按键需 `policy="foreground"`。
+3. `remote_gui_act(look_id, action, ref=...)` 优先用 ref 走 UIA 语义；坐标 / 打字 / 按键需 `policy="foreground"`。连续编排、按住期间还要插入其它输入时，改用 `remote_gui_act_schedule_future`，并在任务结束前不要混用旧 `remote_gui_act`。
 4. 每次 act 后用 `look` 或 `read_text` 确认；没生效就换 action 或换路径，不要原样重试。
 5. 菜单、弹窗、下拉框常是**新的 root**：重新 `list_windows`，对新的 root 再 look。
+
+### 异步输入与任务管理
+
+当输入需要按时间编排（例如右键按住期间移动鼠标，或在按键按住期间送出其它按键），使用 `remote_gui_act_schedule_future`：
+
+```json
+{"operation":"schedule","look_id":"look_42","action":"mousePress","x":450,"y":320,"button":"right","keep_pressdown_ms":220,"schedule_after_ms":0,"preserve_focus":true}
+```
+
+调用立即返回 `task_id`。`schedule_after_ms` 是相对 helper 接受该调用的延迟，范围 0–60000 ms；多条命令各自相对其提交时刻计时，helper 按计划触发时间顺序送出第一条输入，同一时刻按接受顺序。按住动作发出 down 后会让出调度器，因此后续事件能在按住期间执行。例如 mousePress 延迟 0 ms 按右键并按住 90 ms，再提交 `moveMouse` 延迟 40 ms：按下会先送达，移动会在右键仍按住时发生，两项任务可重叠运行。按住时间 `keep_pressdown_ms` 必须为 1–10000 ms，不能假设精确到毫秒的执行时刻，查询结果含实际持续时间。任务状态用 `{"operation":"status","task_id":"..."}` 查询；只允许取消尚未开始的任务（`operation="cancel"`），运行中的任务不可取消，会执行释放后结束。
+
+helper 在接受任务时保留 look 对应的窗口和坐标映射。执行前若窗口移动或改尺寸会以 stale look 失败，避免把旧截图坐标投到新位置。执行时默认把该窗口切到前台；`preserve_focus=true` 则不抢焦点，而是在目标窗口不再前台时拒绝注入。任务可能返回 `failed`，例如窗口失焦或失效；必须检查状态与 `result`。鼠标按住结果含 `buttonReleaseSent`、`requestedDurationMs`、`actualDurationMs`。系统输入调用异常时会尝试 best-effort 释放。
+
+**互斥约定：**只要有排队或运行中的 schedule_future 任务，旧 `remote_gui_act` 的输入会被拒绝。这个期间所有键鼠动作都必须继续通过 schedule_future 提交；等待任务进入 `completed` / `failed` / `cancelled` 后再恢复旧 API。
 
 细节见下文【铁律】、GUI操作方法1（模拟人类）、GUI操作方法2（图形转文本结构）与三个附录。
 
@@ -37,7 +52,7 @@ HELP_DOCUMENT = """
 
 **这是最高优先级的约束，高于下面任何方法的便利性考量。**
 
-- 允许使用的接口只有：`remote_gui_diagnostics`、`remote_gui_list_windows`、`remote_gui_focus_window`、`remote_gui_look`、`remote_gui_act`、`remote_gui_read_text`、`remote_gui_wait_for`。
+- 允许使用的接口只有：`remote_gui_diagnostics`、`remote_gui_list_windows`、`remote_gui_focus_window`、`remote_gui_look`、`remote_gui_act`、`remote_gui_act_schedule_future`、`remote_gui_read_text`、`remote_gui_wait_for`。
 - **绝对禁止**用 PowerShell / cmd / BAT / 任何系统命令去控制界面、注入键鼠。具体禁例：`SendKeys`、`keybd_event`、`mouse_event`、`SetForegroundWindow`、`-EncodedCommand`、AutoHotkey、nircmd、`wshell.SendKeys` 等等。
 - 若某个 `action` 报错，**先查附录三**：`keypress requires keys` 属于「参数没传对」而不是「用不了」，照附录三传 `keys` 就能用。**绝不降级去调系统命令绕道**。确实用不了时，才改用其它 `action` —— `click` / `moveMouse` / `drag` / `scroll` / `typeText` / `press`；或者改变操作路径，走界面上的别的按钮、别的入口。
 - **禁止**用 Base64 / `-EncodedCommand` 这类形式执行命令。执行的东西必须一眼看得清，藏起来本身就是错的。
